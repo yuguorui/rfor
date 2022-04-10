@@ -1,0 +1,31 @@
+[package]
+name = "rfor"
+version = "0.2.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+nix = "0.23.1"
+futures = "0.3.19"
+sniffglue = "0.14.0"
+pktparse = { version = "0.7", features = [] }
+config = "0.11"
+serde = "1"
+iprange = "0.6.6"
+ipnet = "2.3.1"
+url = "2.2.2"
+itertools = "0.10.3"
+fast-socks5 = { git = "https://github.com/yuguorui/fast-socks5.git", rev = "168c1da" }
+boomphf = "0.5.9"
+maxminddb = "0.17"
+lazy_static = "1.4.0"
+tuple = "0.5.1"
+clap = { version = "3.0.14", features = ["derive"] }
+anyhow = "1.0"
+thiserror = "1.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+iptables = "*"
+rtnetlink = "0.9.0"
