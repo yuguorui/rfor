@@ -32,15 +32,15 @@ pub struct Outbound {
 }
 
 #[derive(Debug)]
-pub struct Rule {
+pub struct Condition {
     pub maxmind_regions: Vec<String>,
     pub dst_ip_range: IpRange<Ipv6Net>,
     pub domains: Option<BoomHashSet<String>>,
     pub suffix_domains: Option<BoomHashSet<String>>,
 }
 
-impl Rule {
-    pub fn new() -> Self {
+impl Condition {
+    pub fn default() -> Self {
         Self {
             maxmind_regions: Vec::new(),
             dst_ip_range: IpRange::<Ipv6Net>::new(),
@@ -51,27 +51,14 @@ impl Rule {
 }
 
 #[derive(Debug)]
-pub struct OutboundAndRule(pub Outbound, pub Option<Rule>);
-
-impl OutboundAndRule {
-    pub fn new(name: String, url: Option<Url>, bind_range: Option<IpRange<Ipv6Net>>) -> Self {
-        Self(
-            Outbound {
-                name,
-                url,
-                bind_range,
-            },
-            None,
-        )
-    }
-}
+pub struct RouteRule(pub Outbound, pub Option<Condition>);
 
 pub type OutboundName = String;
 
-pub struct Outbounds {
+pub struct RouteTable {
     pub default: Outbound,
-    pub outbound_dict: HashMap<OutboundName, OutboundAndRule>,
-    pub maxmind_readder: Option<maxminddb::Reader<Vec<u8>>>,
+    pub outbound_dict: HashMap<OutboundName, RouteRule>,
+    pub ip_db: Option<maxminddb::Reader<Vec<u8>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,8 +112,8 @@ impl Display for RouteContext {
 
 fn match_rule_with_sockaddr(
     dst_sock: &SocketAddr,
-    rule: &Rule,
-    maxmind_readder: Option<&maxminddb::Reader<Vec<u8>>>,
+    rule: &Condition,
+    ip_db: Option<&maxminddb::Reader<Vec<u8>>>,
 ) -> bool {
     let dst_ip = dst_sock.ip();
     if rule
@@ -137,7 +124,7 @@ fn match_rule_with_sockaddr(
     }
 
     /* Check the maxmind */
-    if let Some(reader) = maxmind_readder {
+    if let Some(reader) = ip_db {
         let region: Result<maxminddb::geoip2::Country, maxminddb::MaxMindDBError> =
             reader.lookup(dst_ip);
         if let Ok(region) = region {
@@ -152,8 +139,8 @@ fn match_rule_with_sockaddr(
     return false;
 }
 
-impl Outbounds {
-    pub fn init_outbound<S: ToString>(
+impl RouteTable {
+    pub fn add<S: ToString>(
         &mut self,
         name: S,
         url: Option<Url>,
@@ -161,16 +148,23 @@ impl Outbounds {
     ) {
         self.outbound_dict.insert(
             name.to_string(),
-            OutboundAndRule::new(name.to_string(), url, bind_range),
+            RouteRule(
+                Outbound {
+                    name: name.to_string(),
+                    url,
+                    bind_range,
+                },
+                None,
+            ),
         );
     }
 
-    pub fn match_outbound(&self, context: &RouteContext) -> (&str, &Outbound) {
+    pub fn match_route(&self, context: &RouteContext) -> (&str, &Outbound) {
         for (name, outbound_rule) in self.outbound_dict.iter() {
             if let Some(rule) = outbound_rule.1.as_ref() {
                 match &context.target_addr {
                     TargetAddr::Ip(dst_sock) => {
-                        if match_rule_with_sockaddr(dst_sock, rule, self.maxmind_readder.as_ref()) {
+                        if match_rule_with_sockaddr(dst_sock, rule, self.ip_db.as_ref()) {
                             return (name, &outbound_rule.0);
                         }
                     }
@@ -195,7 +189,7 @@ impl Outbounds {
                             if match_rule_with_sockaddr(
                                 dst_sock,
                                 rule,
-                                self.maxmind_readder.as_ref(),
+                                self.ip_db.as_ref(),
                             ) {
                                 return (name, &outbound_rule.0);
                             }
@@ -209,7 +203,7 @@ impl Outbounds {
 
     pub async fn get_tcp_sock(&self, context: &RouteContext) -> tokio::io::Result<TcpStream> {
         let start = Instant::now();
-        let (name, outbound) = self.match_outbound(context);
+        let (name, outbound) = self.match_route(context);
         let duration = start.elapsed();
         println!(
             "{} -> Outbound({}){}",

@@ -6,7 +6,7 @@ use itertools::Itertools;
 use config::{Config, ConfigError, Environment, File};
 use ipnet::IpNet;
 
-use crate::rules::{Outbound, OutboundAndRule, Outbounds, Rule, RULE_DOMAIN_SUFFIX_TAG};
+use crate::rules::{Outbound, RouteRule, RouteTable, Condition, RULE_DOMAIN_SUFFIX_TAG};
 
 use crate::utils::{BoomHashSet, ToV6Net};
 
@@ -47,7 +47,7 @@ pub struct Settings {
     pub debug: bool,
     pub tproxy_listen: Option<String>,
     pub socks5_listen: Option<String>,
-    pub outbounds: Outbounds,
+    pub outbounds: RouteTable,
     pub intercept_mode: InterceptMode,
 }
 
@@ -61,14 +61,14 @@ impl Settings {
         s.merge(Environment::with_prefix("rfor"))?;
 
         /* 1. Setup the initial rules object. */
-        let mut route = Outbounds {
+        let mut route = RouteTable {
             default: Outbound {
                 name: "direct-implicitly".to_owned(),
                 url: None,
                 bind_range: None,
             },
             outbound_dict: HashMap::new(),
-            maxmind_readder: None,
+            ip_db: None,
         };
 
         /* 2. Parse the outbounds section */
@@ -102,14 +102,20 @@ impl Settings {
                 }
             }
 
-            route.init_outbound(name, url, Some(bind_range));
+            route.add(name, url, Some(bind_range));
         }
 
         /* 3. Populate the DIRECT rule. */
         if route.outbound_dict.get(DIRECT_OUTBOUND_NAME).is_none() {
             route.outbound_dict.insert(
                 DIRECT_OUTBOUND_NAME.to_string(),
-                OutboundAndRule::new(DIRECT_OUTBOUND_NAME.to_owned(), None, None),
+                RouteRule(
+                    Outbound {
+                        name: DIRECT_OUTBOUND_NAME.to_owned(), 
+                        url: None, 
+                        bind_range: None},
+                    None,
+                ),
             );
         }
 
@@ -239,7 +245,7 @@ fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
     }
 }
 
-fn parse_forwarder_rules(s: &mut Config, route: &mut Outbounds) -> Result<(), ConfigError> {
+fn parse_forwarder_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), ConfigError> {
     let mut domain_dict: HashMap<String, HashSet<_>> = HashMap::new();
     for rule in s.get_array("rules").unwrap_or_default() {
         let rule = rule.into_str()?;
@@ -256,7 +262,7 @@ fn parse_forwarder_rules(s: &mut Config, route: &mut Outbounds) -> Result<(), Co
             .expect(format!("Outbound {} is not found.", outbound_name).as_str());
 
         if o_rule.1.is_none() {
-            o_rule.1 = Some(Rule::new());
+            o_rule.1 = Some(Condition::default());
         }
         let rules = o_rule.1.as_mut().unwrap();
 
@@ -281,7 +287,7 @@ fn parse_forwarder_rules(s: &mut Config, route: &mut Outbounds) -> Result<(), Co
                     .collect_tuple::<_>()
                     .expect("Expect a (filename, region) tuple.");
                 let maxmind_reader = maxminddb::Reader::open_readfile(filename).unwrap();
-                route.maxmind_readder = Some(maxmind_reader);
+                route.ip_db = Some(maxmind_reader);
                 rules.maxmind_regions.push(region.to_string());
             }
             tag @ ("DOMAIN" | "DOMAIN-SUFFIX") => {
