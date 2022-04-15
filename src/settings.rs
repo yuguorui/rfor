@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashSet};
 
 use clap::Parser;
 use itertools::Itertools;
@@ -6,7 +6,7 @@ use itertools::Itertools;
 use config::{Config, ConfigError, Environment, File};
 use ipnet::IpNet;
 
-use crate::rules::{Outbound, RouteRule, RouteTable, Condition, RULE_DOMAIN_SUFFIX_TAG};
+use crate::rules::{RouteTable, RULE_DOMAIN_SUFFIX_TAG};
 
 use crate::utils::{BoomHashSet, ToV6Net};
 
@@ -61,15 +61,7 @@ impl Settings {
         s.merge(Environment::with_prefix("rfor"))?;
 
         /* 1. Setup the initial rules object. */
-        let mut route = RouteTable {
-            default: Outbound {
-                name: "direct-implicitly".to_owned(),
-                url: None,
-                bind_range: None,
-            },
-            outbound_dict: HashMap::new(),
-            ip_db: None,
-        };
+        let mut route = RouteTable::new();
 
         /* 2. Parse the outbounds section */
         for outbound_value in s.get_array("outbounds").unwrap_or_default() {
@@ -102,27 +94,18 @@ impl Settings {
                 }
             }
 
-            route.add(name, url, Some(bind_range));
+            route.add_empty_rule(name, url, Some(bind_range));
         }
 
         /* 3. Populate the DIRECT rule. */
-        if route.outbound_dict.get(DIRECT_OUTBOUND_NAME).is_none() {
-            route.outbound_dict.insert(
-                DIRECT_OUTBOUND_NAME.to_string(),
-                RouteRule(
-                    Outbound {
-                        name: DIRECT_OUTBOUND_NAME.to_owned(), 
-                        url: None, 
-                        bind_range: None},
-                    None,
-                ),
-            );
+        if route.get_outbound_by_name(DIRECT_OUTBOUND_NAME).is_none() {
+            route.add_empty_rule(DIRECT_OUTBOUND_NAME.to_owned(), None, None);
         }
 
-        /* 3. Parse the actual rules. */
-        parse_forwarder_rules(&mut s, &mut route)?;
+        /* 4. Parse the actual rules. */
+        parse_route_rules(&mut s, &mut route)?;
 
-        /* 4. Parse the Intercept Mode */
+        /* 5. Parse the Intercept Mode */
         let intercept_mode = parse_intercept_mode(&mut s)?;
 
         let settings = Settings {
@@ -181,7 +164,7 @@ fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
                             )
                         })
                         .unwrap_or(DEFAULT_IPTABLES_PROXY_MARK);
-                    
+
                     let direct_mark = table
                         .get("direct-mark")
                         .and_then(|v| {
@@ -215,14 +198,15 @@ fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
                             )
                         })
                         .unwrap_or(DEFAULT_IPTABLES_MARK_CHAIN_NAME.to_owned());
-                    
+
                     let rule_table_index = table
                         .get("rule-table")
                         .and_then(|v| {
                             Some(
                                 v.to_owned()
                                     .into_int()
-                                    .expect("rule-table field need an int") as u8
+                                    .expect("rule-table field need an int")
+                                    as u8,
                             )
                         })
                         .unwrap_or(DEFAULT_IPRULE_TABLE);
@@ -245,10 +229,11 @@ fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
     }
 }
 
-fn parse_forwarder_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), ConfigError> {
-    let mut domain_dict: HashMap<String, HashSet<_>> = HashMap::new();
-    for rule in s.get_array("rules").unwrap_or_default() {
-        let rule = rule.into_str()?;
+fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), ConfigError> {
+    let mut domain_sets: Vec<HashSet<_>> = vec![HashSet::new(); route.outbounds.len()];
+
+    for user_rule in s.get_array("rules").unwrap_or_default() {
+        let rule = user_rule.into_str()?;
         let (keyword, param, outbound_name) = rule
             .split(",")
             .into_iter()
@@ -256,22 +241,18 @@ fn parse_forwarder_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), C
             .collect_tuple::<_>()
             .expect("Expect a (keyword, param, outbound_name) tuple.");
 
-        let o_rule = route
-            .outbound_dict
-            .get_mut(outbound_name)
+        let outbound_index = route
+            .get_outbound_index_by_name(outbound_name)
             .expect(format!("Outbound {} is not found.", outbound_name).as_str());
 
-        if o_rule.1.is_none() {
-            o_rule.1 = Some(Condition::default());
-        }
-        let rules = o_rule.1.as_mut().unwrap();
+        let cond = &mut route.rules[outbound_index as usize];
 
         match keyword {
             "DEFAULT" => {
-                route.default = o_rule.0.clone();
+                route.set_default_route(outbound_index);
             }
             "IP-CIDR" => {
-                rules.dst_ip_range.add(
+                cond.dst_ip_range.add(
                     param
                         .parse::<IpNet>()
                         .expect("Wrong format for IP-CIDR.")
@@ -288,12 +269,13 @@ fn parse_forwarder_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), C
                     .expect("Expect a (filename, region) tuple.");
                 let maxmind_reader = maxminddb::Reader::open_readfile(filename).unwrap();
                 route.ip_db = Some(maxmind_reader);
-                rules.maxmind_regions.push(region.to_string());
+                cond.maxmind_regions.push(region.to_string());
             }
             tag @ ("DOMAIN" | "DOMAIN-SUFFIX") => {
-                let domains = domain_dict
-                    .entry(outbound_name.to_owned())
-                    .or_insert(HashSet::new());
+                let domains = &mut domain_sets[route
+                    .get_outbound_index_by_name(outbound_name)
+                    .expect(format!("outbound {} not found", outbound_name).as_str())
+                    as usize];
                 match tag {
                     "DOMAIN" => {
                         domains.insert(param.to_string());
@@ -310,10 +292,9 @@ fn parse_forwarder_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), C
         }
     }
 
-    for (k, v) in domain_dict.iter() {
-        let o_rule = route.outbound_dict.get_mut(k).unwrap();
-        o_rule.1.as_mut().unwrap().domains =
-            Some(BoomHashSet::new(v.to_owned().into_iter().collect_vec()));
+    for (i, v) in domain_sets.iter().enumerate() {
+        let cond = route.rules.get_mut(i).unwrap();
+        cond.domains = Some(BoomHashSet::new(v.to_owned().into_iter().collect_vec()));
     }
 
     Ok(())
