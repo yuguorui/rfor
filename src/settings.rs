@@ -1,4 +1,4 @@
-use std::collections::{HashSet};
+use std::collections::HashSet;
 
 use clap::Parser;
 use itertools::Itertools;
@@ -270,6 +270,47 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                 let maxmind_reader = maxminddb::Reader::open_readfile(filename).unwrap();
                 route.ip_db = Some(maxmind_reader);
                 cond.maxmind_regions.push(region.to_string());
+            }
+            "GEOSITE" => {
+                let (filename, code) = param
+                    .split(":")
+                    .into_iter()
+                    .map(|v| v.trim())
+                    .collect_tuple::<_>()
+                    .expect("Expect a (filename, code) tuple.");
+
+                let domains = &mut domain_sets[route
+                    .get_outbound_index_by_name(outbound_name)
+                    .expect(format!("outbound {} not found", outbound_name).as_str())
+                    as usize];
+
+                let mut f = std::fs::File::open(filename)
+                    .expect(format!("file {} not found", filename).as_str());
+                let mut b = protobuf::CodedInputStream::new(&mut f);
+                let list: crate::protos::common::GeoSiteList =
+                    protobuf::Message::parse_from(&mut b).expect("Failed to parse geosite.dat");
+                list.entry
+                    .iter()
+                    .filter(|&geosites| geosites.country_code.to_lowercase() == code.to_lowercase())
+                    .map(|e| &e.domain)
+                    .map(|ds| {
+                        ds.iter().for_each(|d| {
+                            match d.field_type {
+                                crate::protos::common::Domain_Type::Plain => {
+                                    domains.insert(d.value.to_owned());
+                                }
+                                crate::protos::common::Domain_Type::Regex => { /* Not supported. */
+                                }
+                                crate::protos::common::Domain_Type::RootDomain => {
+                                    domains.insert(d.value.to_owned() + RULE_DOMAIN_SUFFIX_TAG);
+                                }
+                                crate::protos::common::Domain_Type::Full => {
+                                    domains.insert(d.value.to_owned());
+                                }
+                            }
+                        })
+                    })
+                    .for_each(drop);
             }
             tag @ ("DOMAIN" | "DOMAIN-SUFFIX") => {
                 let domains = &mut domain_sets[route
