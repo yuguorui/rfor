@@ -271,6 +271,12 @@ impl RouteTable {
 
         let proxy_url = outbound.url.as_ref().unwrap();
         match proxy_url.scheme() {
+            "drop" => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Connection dropped",
+                ));
+            }
             "socks" | "socks5" => {
                 let socks_server = format!(
                     "{}:{}",

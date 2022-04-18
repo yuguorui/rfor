@@ -131,14 +131,26 @@ where
 }
 
 pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> Result<()> {
-    let mut out_sock = SETTINGS
+    let mut out_sock = match SETTINGS
         .read()
         .await
         .outbounds
         .get_tcp_sock(&rt_context)
-        .await?;
+        .await {
+            Ok(sock) => sock,
+            Err(err) => {
+                match err.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        return Ok(());
+                    },
+                    _ => {
+                        return Err(err.into());
+                    }
+                }
+            },
+        };
 
-    out_sock.set_nodelay(true).unwrap();
+    out_sock.set_nodelay(true)?;
     // let _ = tokio::io::copy_bidirectional(in_sock, &mut out_sock).await;
     let _ = _copy_bidirectional(in_sock, &mut out_sock).await;
 
@@ -147,9 +159,9 @@ pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> 
 
 /*
  * _copy_bidirectional is a zero-copy implementation of io::copy_bidirectional.
- * 
+ *
  * It uses a pipe to transfer data between the two sockets. The original implementation comes from
- * [midori](https://github.com/zephyrchien/midori/blob/master/src/io/zero_copy.rs), 
+ * [midori](https://github.com/zephyrchien/midori/blob/master/src/io/zero_copy.rs),
  * but removed the unsafe code.
  */
 async fn _copy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) -> Result<()> {

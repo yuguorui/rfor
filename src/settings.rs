@@ -11,6 +11,7 @@ use crate::rules::{RouteTable, RULE_DOMAIN_SUFFIX_TAG};
 use crate::utils::{BoomHashSet, ToV6Net};
 
 const DIRECT_OUTBOUND_NAME: &str = "DIRECT";
+const DROP_OUTBOUND_NAME: &str = "DROP";
 const DEFAULT_IPTABLES_PROXY_MARK: u32 = 0xff42;
 const DEFAULT_IPTABLES_DIRECT_MARK: u32 = 0xff43;
 const DEFAULT_IPTABLES_PROXY_CHAIN_NAME: &str = "rfor-proxy";
@@ -97,9 +98,17 @@ impl Settings {
             route.add_empty_rule(name, url, Some(bind_range));
         }
 
-        /* 3. Populate the DIRECT rule. */
+        /* 3. Populate the DIRECT/DROP rule. */
         if route.get_outbound_by_name(DIRECT_OUTBOUND_NAME).is_none() {
             route.add_empty_rule(DIRECT_OUTBOUND_NAME.to_owned(), None, None);
+        }
+
+        if route.get_outbound_by_name(DROP_OUTBOUND_NAME).is_none() {
+            route.add_empty_rule(
+                DROP_OUTBOUND_NAME.to_owned(),
+                Some("drop://0.0.0.0".parse().unwrap()),
+                None,
+            );
         }
 
         /* 4. Parse the actual rules. */
