@@ -9,8 +9,6 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 nix = "0.23.1"
 futures = "0.3.19"
-sniffglue = "0.14.0"
-pktparse = { version = "0.7", features = [] }
 config = "0.11"
 serde = "1"
 iprange = "0.6.6"
@@ -26,6 +24,8 @@ clap = { version = "3.0.14", features = ["derive"] }
 anyhow = "1.0"
 thiserror = "1.0"
 protobuf = "2.27.1"
+nom = "7"
+tls-parser = "0.11.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 iptables = "*"

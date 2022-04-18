@@ -100,39 +100,14 @@ pub async fn handle_intercept_sock(sock: &tokio::net::TcpSocket) -> tokio::io::R
 }
 
 async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
-    use pktparse::tcp::TcpHeader;
-    use sniffglue::centrifuge::tcp::extract as tcp_extract;
-    use sniffglue::structs::tcp::TCP as TCP_CATEGORY;
-    use sniffglue::structs::tls::TLS;
-
     use crate::rules::{InboundProtocol, RouteContext, TargetAddr};
     use crate::utils::{is_valid_domain, transfer_tcp};
 
     let mut buffer = [0u8; 0x400];
-    let dummy_tcp_header = TcpHeader::default();
     inbound.peek(&mut buffer).await?;
 
-    let __now = std::time::Instant::now();
-    let cate = match tcp_extract(&dummy_tcp_header, &buffer) {
-        Ok(c) => c,
-        Err(_) => TCP_CATEGORY::Empty,
-    };
-    let __elapsed_time = __now.elapsed();
-
-    let domain = match cate {
-        TCP_CATEGORY::HTTP(http_req) => http_req.host,
-        TCP_CATEGORY::TLS(tls_hello) => match tls_hello {
-            TLS::ClientHello(client_hello) => {
-                if is_valid_domain(client_hello.hostname.as_deref().unwrap_or_default()) {
-                    client_hello.hostname
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        },
-        _ => None,
-    };
+    let domain = crate::sniffer::parse_host(&buffer)
+        .filter(|s| is_valid_domain(s.as_str()));
 
     let target_addr = match domain {
         Some(domain) => TargetAddr::Domain(
