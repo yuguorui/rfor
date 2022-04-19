@@ -201,6 +201,12 @@ impl Pipe {
     }
 }
 
+use std::convert::TryInto;
+
+pub fn vec_to_array<T, const N: usize>(v: Vec<T>) -> Option<[T; N]> {
+    v.try_into().ok()
+}
+
 #[inline]
 fn splice_n(r: i32, w: i32, n: usize, has_more_data: bool) -> std::io::Result<usize> {
     let flags = nix::fcntl::SpliceFFlags::SPLICE_F_NONBLOCK

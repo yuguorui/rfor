@@ -5,10 +5,11 @@ use itertools::Itertools;
 
 use config::{Config, ConfigError, Environment, File};
 use ipnet::IpNet;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::rules::{RouteTable, RULE_DOMAIN_SUFFIX_TAG};
 
-use crate::utils::{BoomHashSet, ToV6Net};
+use crate::utils::{vec_to_array, BoomHashSet, ToV6Net};
 
 const DIRECT_OUTBOUND_NAME: &str = "DIRECT";
 const DROP_OUTBOUND_NAME: &str = "DROP";
@@ -276,9 +277,59 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                     .map(|v| v.trim())
                     .collect_tuple::<_>()
                     .expect("Expect a (filename, region) tuple.");
-                let maxmind_reader = maxminddb::Reader::open_readfile(filename).unwrap();
-                route.ip_db = Some(maxmind_reader);
-                cond.maxmind_regions.push(region.to_string());
+                match filename {
+                    name if name.ends_with(".mmdb") => {
+                        let maxmind_reader = maxminddb::Reader::open_readfile(filename).unwrap();
+                        route.ip_db = Some(maxmind_reader);
+                        cond.maxmind_regions.push(region.to_string());
+                    }
+                    name if name.ends_with(".dat") => {
+                        let mut f = std::fs::File::open(filename)
+                            .expect(format!("file {} not found", filename).as_str());
+                        let mut b = protobuf::CodedInputStream::new(&mut f);
+                        let list: crate::protos::common::GeoIPList =
+                            protobuf::Message::parse_from(&mut b)
+                                .expect(format!("failed to parse GeoIPList {}", filename).as_str());
+                        list.entry
+                            .iter()
+                            .filter(|&l| l.country_code.to_lowercase() == region.to_lowercase())
+                            .for_each(|geoip| {
+                                geoip.cidr.iter().for_each(|cidr| {
+                                    match cidr.ip.len() {
+                                        4 => {
+                                            cond.dst_ip_range.add(
+                                                ipnet::Ipv6Net::new(
+                                                    Ipv4Addr::from(
+                                                        vec_to_array(cidr.ip.to_owned()).unwrap(),
+                                                    )
+                                                    .to_ipv6_mapped(),
+                                                    cidr.prefix.try_into().unwrap(),
+                                                )
+                                                .unwrap(),
+                                            );
+                                        }
+                                        16 => {
+                                            cond.dst_ip_range.add(
+                                                ipnet::Ipv6Net::new(
+                                                    Ipv6Addr::from(
+                                                        vec_to_array(cidr.ip.to_owned()).unwrap(),
+                                                    ),
+                                                    cidr.prefix.try_into().unwrap(),
+                                                )
+                                                .unwrap(),
+                                            );
+                                        }
+                                        _ => {}
+                                    };
+                                });
+                            });
+                    }
+                    _ => {
+                        return Err(ConfigError::Message(format!(
+                            "GEOIP filename must end with .mmdb or .dat"
+                        )))
+                    }
+                }
             }
             "GEOSITE" => {
                 let (filename, code) = param
