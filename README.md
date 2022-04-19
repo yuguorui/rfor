@@ -11,7 +11,7 @@ Features
 - Standard SOCKS5 proxy protocols support
 - Fast routing decision ( <= 15us with 70k rules )
     - TLS SNI sniffing
-    - MMDB support
+    - GeoIP/GeoSite/MMDB support
 - Auto configuration and cleanup for transparent proxy with iptables and tproxy (No more mess with iptables)
 - Optional source IP preserving when connects directly
 - Native IPv6 support
