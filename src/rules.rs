@@ -84,7 +84,7 @@ impl Condition {
             if let Ok(region) = region {
                 if self
                     .maxmind_regions
-                    .contains(&region.country.unwrap().iso_code.unwrap().to_string())
+                    .contains(&region.country.unwrap().iso_code.unwrap().to_string().to_lowercase())
                 {
                     return true;
                 }

@@ -281,7 +281,7 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                     name if name.ends_with(".mmdb") => {
                         let maxmind_reader = maxminddb::Reader::open_readfile(filename).unwrap();
                         route.ip_db = Some(maxmind_reader);
-                        cond.maxmind_regions.push(region.to_string());
+                        cond.maxmind_regions.push(region.to_string().to_lowercase());
                     }
                     name if name.ends_with(".dat") => {
                         let mut f = std::fs::File::open(filename)
