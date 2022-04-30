@@ -178,7 +178,7 @@ async fn _copy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) 
         Ok::<(), std::io::Error>(())
     };
 
-    let (_, _) = tokio::join!(client_to_server, server_to_client);
+    let _ = tokio::try_join!(client_to_server, server_to_client);
 
     Ok(())
 }
@@ -244,7 +244,7 @@ where
                 if ret > 0 {
                     n = ret;
                 } else {
-                    break;
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "zero_copy"));
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -278,7 +278,5 @@ where
             }
         }
     }
-
-    Ok(())
 }
 
