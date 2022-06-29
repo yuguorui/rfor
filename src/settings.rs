@@ -47,6 +47,7 @@ pub enum InterceptMode {
 
 pub struct Settings {
     pub debug: bool,
+    pub disable_ipv6: bool,
     pub tproxy_listen: Option<String>,
     pub socks5_listen: Option<String>,
     pub outbounds: RouteTable,
@@ -120,6 +121,7 @@ impl Settings {
 
         let settings = Settings {
             debug: s.get_bool("debug").unwrap_or(false),
+            disable_ipv6: s.get_bool("disable-ipv6").unwrap_or(false),
             tproxy_listen: s.get::<String>("tproxy-listen").ok(),
             socks5_listen: s.get::<String>("socks5-listen").ok(),
             outbounds: route,

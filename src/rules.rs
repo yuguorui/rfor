@@ -82,10 +82,15 @@ impl Condition {
             let region: Result<maxminddb::geoip2::Country, maxminddb::MaxMindDBError> =
                 reader.lookup(dst_ip);
             if let Ok(region) = region {
-                if self
-                    .maxmind_regions
-                    .contains(&region.country.unwrap().iso_code.unwrap().to_string().to_lowercase())
-                {
+                if self.maxmind_regions.contains(
+                    &region
+                        .country
+                        .unwrap()
+                        .iso_code
+                        .unwrap()
+                        .to_string()
+                        .to_lowercase(),
+                ) {
                     return true;
                 }
             }
@@ -240,7 +245,10 @@ impl RouteTable {
         );
 
         if outbound.url.is_none() {
-            let sock = TcpSocket::new_v6()?;
+            let sock = match SETTINGS.read().await.disable_ipv6 {
+                false => TcpSocket::new_v6()?,
+                true => TcpSocket::new_v4()?,
+            };
 
             if let Some(bind_range) = &outbound.bind_range {
                 if bind_range.contains(context.src_sock.ip().to_ipv6_net().as_ref().unwrap()) {
@@ -252,16 +260,30 @@ impl RouteTable {
 
             match &context.target_addr {
                 TargetAddr::Ip(dst_sock) => {
-                    return Ok(sock.connect(dst_sock.to_ipv6_sockaddr()).await?);
+                    return Ok(sock
+                        .connect(match SETTINGS.read().await.disable_ipv6 {
+                            false => dst_sock.to_ipv6_sockaddr(),
+                            true => *dst_sock,
+                        })
+                        .await?);
                 }
                 TargetAddr::Domain(domain, port, sock_addr) => {
                     let sock_addr = match sock_addr {
-                        Some(addr) => addr.to_ipv6_sockaddr(),
-                        None => (domain.as_str(), *port)
-                            .to_socket_addrs()?
-                            .next()
-                            .expect("unreachable")
-                            .to_ipv6_sockaddr(),
+                        Some(addr) => match SETTINGS.read().await.disable_ipv6 {
+                            false => addr.to_ipv6_sockaddr(),
+                            true => *addr,
+                        },
+                        None => {
+                            let sock = (domain.as_str(), *port)
+                                .to_socket_addrs()?
+                                .next()
+                                .expect("unreachable");
+
+                            match SETTINGS.read().await.disable_ipv6 {
+                                false => sock.to_ipv6_sockaddr(),
+                                true => sock,
+                            }
+                        }
                     };
                     let fut = sock.connect(sock_addr);
                     return timeout(Duration::from_millis(TIMEOUT), fut).await?;

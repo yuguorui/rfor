@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 
+use crate::SETTINGS;
+
 pub async fn tproxy_worker() -> Result<()> {
     use nix::sys::socket::sockopt::IpTransparent;
-    use std::os::unix::prelude::AsRawFd;
-
-    use crate::SETTINGS;
     use nix::sys::socket::{self};
+    use std::os::unix::prelude::AsRawFd;
     use tokio::net::TcpListener;
 
     if SETTINGS.read().await.tproxy_listen.is_none() {
@@ -74,8 +74,6 @@ pub fn tproxy_bind_src(
 }
 
 pub async fn handle_intercept_sock(sock: &tokio::net::TcpSocket) -> tokio::io::Result<()> {
-    use crate::SETTINGS;
-
     match &SETTINGS.read().await.intercept_mode {
         crate::settings::InterceptMode::AUTO {
             local_traffic: _,
@@ -106,8 +104,7 @@ async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
     let mut buffer = [0u8; 0x400];
     inbound.peek(&mut buffer).await?;
 
-    let domain = crate::sniffer::parse_host(&buffer)
-        .filter(|s| is_valid_domain(s.as_str()));
+    let domain = crate::sniffer::parse_host(&buffer).filter(|s| is_valid_domain(s.as_str()));
 
     let target_addr = match domain {
         Some(domain) => TargetAddr::Domain(
@@ -261,7 +258,7 @@ fn __setup_iptables(
     Ok(())
 }
 
-fn set_iptables(
+async fn set_iptables(
     proxy_chain: &str,
     mark_chain: &str,
     tproxy_port: u16,
@@ -269,7 +266,7 @@ fn set_iptables(
     direct_mark: u32,
     ports: &[u16],
     local_traffic: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     __setup_iptables(
         &iptables::new(false).unwrap(),
         proxy_chain,
@@ -289,28 +286,42 @@ fn set_iptables(
             "169.254.0.0/16",
             "255.255.255.255/32",
         ],
-    )?;
+    )
+    .map_err(|e| {
+        tokio::io::Error::new(
+            tokio::io::ErrorKind::Other,
+            format!("failed adding ipv4 iptable rules, {}.", e.to_string()),
+        )
+    })?;
 
-    __setup_iptables(
-        &iptables::new(true).unwrap(),
-        proxy_chain,
-        mark_chain,
-        tproxy_port,
-        xmark,
-        direct_mark,
-        ports,
-        local_traffic,
-        &[
-            "::1/128",
-            "100::/64",
-            "2002::/16",
-            "fc00::/7",
-            "fe80::/10",
-            "ff00::/8",
-            "::ffff:0:0/96",
-            "::ffff:0:0:0/96",
-        ],
-    )?;
+    if !SETTINGS.read().await.disable_ipv6 {
+        __setup_iptables(
+            &iptables::new(true).unwrap(),
+            proxy_chain,
+            mark_chain,
+            tproxy_port,
+            xmark,
+            direct_mark,
+            ports,
+            local_traffic,
+            &[
+                "::1/128",
+                "100::/64",
+                "2002::/16",
+                "fc00::/7",
+                "fe80::/10",
+                "ff00::/8",
+                "::ffff:0:0/96",
+                "::ffff:0:0:0/96",
+            ],
+        )
+        .map_err(|e| {
+            tokio::io::Error::new(
+                tokio::io::ErrorKind::Other,
+                format!("failed adding ipv6 iptable rules, {}.", e.to_string()),
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -399,14 +410,16 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
     rule.message_mut().nlas.push(Nla::FwMark(fwmark));
     rule.execute().await?;
 
-    let mut rule = handle
-        .rule()
-        .add()
-        .v6()
-        .table(route_table_index)
-        .action(FR_ACT_TO_TBL);
-    rule.message_mut().nlas.push(Nla::FwMark(fwmark));
-    rule.execute().await?;
+    if !SETTINGS.read().await.disable_ipv6 {
+        let mut rule = handle
+            .rule()
+            .add()
+            .v6()
+            .table(route_table_index)
+            .action(FR_ACT_TO_TBL);
+        rule.message_mut().nlas.push(Nla::FwMark(fwmark));
+        rule.execute().await?;
+    }
 
     // ip route add
     // Scope host for local routes, see also /etc/iproute2/rt_scopes
@@ -429,25 +442,25 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
     route.message_mut().header.kind = RTN_LOCAL;
     route.execute().await?;
 
-    // Add default IPv6 route.
-    let mut route = handle
-        .route()
-        .add()
-        .v6()
-        .destination_prefix(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 0)
-        .output_interface(lo_link_index)
-        .table(route_table_index)
-        .scope(scope_host);
-    route.message_mut().header.kind = RTN_LOCAL;
-    route.execute().await?;
+    if !SETTINGS.read().await.disable_ipv6 {
+        // Add default IPv6 route.
+        let mut route = handle
+            .route()
+            .add()
+            .v6()
+            .destination_prefix(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 0)
+            .output_interface(lo_link_index)
+            .table(route_table_index)
+            .scope(scope_host);
+        route.message_mut().header.kind = RTN_LOCAL;
+        route.execute().await?;
+    }
 
     Ok(())
 }
 
 async fn environment_setup() -> Result<()> {
     use std::net::SocketAddr;
-
-    use crate::SETTINGS;
 
     let settings = SETTINGS.read().await;
     match &settings.intercept_mode {
@@ -486,7 +499,9 @@ async fn environment_setup() -> Result<()> {
                 *direct_mark,
                 ports,
                 *local_traffic,
-            ) {
+            )
+            .await
+            {
                 Ok(_) => {}
                 Err(err) => {
                     return Err(anyhow!("Failed on setting up iptables rules: {}", err));
@@ -517,8 +532,6 @@ async fn receive_signal() -> Result<()> {
 }
 
 async fn clean_environment() -> Result<()> {
-    use crate::SETTINGS;
-
     let settings = SETTINGS.read().await;
     match &settings.intercept_mode {
         crate::settings::InterceptMode::MANUAL => return Ok(()),
@@ -537,8 +550,7 @@ async fn clean_environment() -> Result<()> {
             let rule_table_index = *rule_table_index;
 
             cleanup_iptables(&proxy_chain, &mark_chain).unwrap();
-            cleanup_ip_rule(rule_table_index, tproxy_mark)
-                .await?;
+            cleanup_ip_rule(rule_table_index, tproxy_mark).await?;
 
             Ok(())
         }
