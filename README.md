@@ -7,11 +7,11 @@ Do one thing and do it well.
 Features
 ------
 - Build on Tokio with Rust, low CPU/memory overhead
-    - Zero copy support
+    - Zero copy support with splice syscall.
 - Standard SOCKS5 proxy protocols support
 - Fast routing decision ( <= 15us with 70k rules )
     - TLS SNI sniffing
-    - GeoIP/GeoSite/MMDB support
+    - [GeoIP](https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat)/[GeoSite](https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat)/[MMDB](https://raw.githubusercontent.com/alecthw/mmdb_china_ip_list/release/Country.mmdb) support
 - Auto configuration and cleanup for transparent proxy with iptables and tproxy (No more mess with iptables)
 - Optional source IP preserving when connects directly
 - Native IPv6 support
@@ -33,6 +33,7 @@ Usage
 -----
 ```yaml
 debug: false
+# disable-ipv6: false
 tproxy-listen: '[::]:50080'
 socks5-listen: '[::]:50081'
 
@@ -63,7 +64,7 @@ rules:
   - DOMAIN,www.google.com,PROXY
   - IP-CIDR,1.1.1.1/32,PROXY
   - GEOIP,Country.mmdb:JP,DIRECT
-
+  - GEOSITE,geosite.dat:category-ads,DROP
 ```
 
 You can run it with:
