@@ -25,7 +25,7 @@ pub async fn tproxy_worker() -> Result<()> {
 
     tokio::select! {
         _ = accept_socket_loop(listener) => {},
-        Err(err) = receive_signal() => {
+        Err(err) = crate::utils::receive_signal() => {
             clean_environment().await?;
             return Err(err);
         },
@@ -73,30 +73,6 @@ pub fn tproxy_bind_src(
     Ok(())
 }
 
-pub async fn handle_intercept_sock(sock: &tokio::net::TcpSocket) -> tokio::io::Result<()> {
-    match &SETTINGS.read().await.intercept_mode {
-        crate::settings::InterceptMode::AUTO {
-            local_traffic: _,
-            ports: _,
-            proxy_mark: _,
-            direct_mark,
-            proxy_chain: _,
-            mark_chain: _,
-            rule_table_index: _,
-        } => {
-            // Avoid local traffic looping
-            nix::sys::socket::setsockopt(
-                std::os::unix::prelude::AsRawFd::as_raw_fd(sock),
-                nix::sys::socket::sockopt::Mark,
-                &direct_mark,
-            )?;
-        }
-        crate::settings::InterceptMode::MANUAL => {}
-    }
-
-    Ok(())
-}
-
 async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
     use crate::rules::{InboundProtocol, RouteContext, TargetAddr};
     use crate::utils::{is_valid_domain, transfer_tcp};
@@ -127,7 +103,6 @@ async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
 
     Ok(())
 }
-
 
 fn cleanup_iptables(proxy_chain: &str, mark_chain: &str) -> Result<(), Box<dyn std::error::Error>> {
     let ipts = [iptables::new(false).unwrap(), iptables::new(true).unwrap()];
@@ -461,7 +436,7 @@ async fn environment_setup() -> Result<()> {
     let settings = SETTINGS.read().await;
     match &settings.intercept_mode {
         crate::settings::InterceptMode::MANUAL => return Ok(()),
-        crate::settings::InterceptMode::AUTO {
+        crate::settings::InterceptMode::TPROXY {
             local_traffic,
             ports,
             proxy_mark: tproxy_mark,
@@ -508,30 +483,15 @@ async fn environment_setup() -> Result<()> {
             set_ip_rule(*rule_table_index, *tproxy_mark).await?;
             return Ok(());
         }
+        crate::settings::InterceptMode::REDIRECT { .. } => return Ok(()),
     }
-}
-
-async fn receive_signal() -> Result<()> {
-    use tokio::signal::unix::signal;
-    use tokio::signal::unix::SignalKind;
-    let mut sighang = signal(SignalKind::hangup())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
-
-    tokio::select! {
-        _ = sighang.recv() => {},
-        _ = sigint.recv() => {},
-        _ = sigterm.recv() => {},
-    }
-
-    Err(anyhow!("Recieved signal"))
 }
 
 async fn clean_environment() -> Result<()> {
     let settings = SETTINGS.read().await;
     match &settings.intercept_mode {
         crate::settings::InterceptMode::MANUAL => return Ok(()),
-        crate::settings::InterceptMode::AUTO {
+        crate::settings::InterceptMode::TPROXY {
             local_traffic: _,
             ports: _,
             proxy_mark: tproxy_mark,
@@ -550,5 +510,6 @@ async fn clean_environment() -> Result<()> {
 
             Ok(())
         }
+        crate::settings::InterceptMode::REDIRECT { .. } => return Ok(()),
     }
 }

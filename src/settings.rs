@@ -33,7 +33,7 @@ struct Args {
 }
 
 pub enum InterceptMode {
-    AUTO {
+    TPROXY {
         local_traffic: bool,
         ports: Vec<u16>,
         proxy_mark: u32,
@@ -41,6 +41,12 @@ pub enum InterceptMode {
         proxy_chain: String,
         mark_chain: String,
         rule_table_index: u8,
+    },
+    REDIRECT {
+        local_traffic: bool,
+        ports: Vec<u16>,
+        direct_mark: u32,
+        proxy_chain: String,
     },
     MANUAL,
 }
@@ -50,6 +56,7 @@ pub struct Settings {
     pub disable_ipv6: bool,
     pub tproxy_listen: Option<String>,
     pub socks5_listen: Option<String>,
+    pub redirect_listen: Option<String>,
     pub outbounds: RouteTable,
     pub intercept_mode: InterceptMode,
 }
@@ -124,6 +131,7 @@ impl Settings {
             disable_ipv6: s.get_bool("disable-ipv6").unwrap_or(false),
             tproxy_listen: s.get::<String>("tproxy-listen").ok(),
             socks5_listen: s.get::<String>("socks5-listen").ok(),
+            redirect_listen: s.get::<String>("redirect-listen").ok(),
             outbounds: route,
             intercept_mode,
         };
@@ -140,10 +148,10 @@ fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
                 .get("mode")
                 .expect("mode field not found.")
                 .clone()
-                .into_str()?;
+                .into_str()?.to_lowercase();
             match mode.as_str() {
                 "manual" => return Ok(InterceptMode::MANUAL),
-                "auto" => {
+                "auto"|"tproxy"|"redirect" => {
                     let capture_local_traffic = table
                         .get("local-traffic")
                         .and_then(|v| {
@@ -222,19 +230,29 @@ fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
                             )
                         })
                         .unwrap_or(DEFAULT_IPRULE_TABLE);
+                    
+                    if mode.as_str() != "redirect" {
+                        return Ok(InterceptMode::TPROXY {
+                            local_traffic: capture_local_traffic,
+                            ports,
+                            proxy_mark,
+                            direct_mark,
+                            proxy_chain,
+                            rule_table_index,
+                            mark_chain,
+                        });
+                    } else {
+                        return Ok(InterceptMode::REDIRECT {
+                            local_traffic: capture_local_traffic,
+                            ports,
+                            direct_mark,
+                            proxy_chain,
+                        });
+                    }
 
-                    return Ok(InterceptMode::AUTO {
-                        local_traffic: capture_local_traffic,
-                        ports,
-                        proxy_mark,
-                        direct_mark,
-                        proxy_chain,
-                        rule_table_index,
-                        mark_chain,
-                    });
                 }
                 _ => Err(ConfigError::Message(
-                    "either `auto` or `manual` is expected.".to_owned(),
+                    "either `auto/tproxy`, `redirect` or `manual` is expected.".to_owned(),
                 )),
             }
         }

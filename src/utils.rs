@@ -20,6 +20,8 @@ use std::io;
 use std::ops::Drop;
 use std::os::unix::io::AsRawFd;
 
+use anyhow::anyhow;
+
 const PIPE_BUF_SIZE: usize = 512 * 1024;
 
 pub trait ToV6Net {
@@ -136,19 +138,18 @@ pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> 
         .await
         .outbounds
         .get_tcp_sock(&rt_context)
-        .await {
-            Ok(sock) => sock,
-            Err(err) => {
-                match err.kind() {
-                    std::io::ErrorKind::PermissionDenied => {
-                        return Ok(());
-                    },
-                    _ => {
-                        return Err(err.into());
-                    }
-                }
-            },
-        };
+        .await
+    {
+        Ok(sock) => sock,
+        Err(err) => match err.kind() {
+            std::io::ErrorKind::PermissionDenied => {
+                return Ok(());
+            }
+            _ => {
+                return Err(err.into());
+            }
+        },
+    };
 
     out_sock.set_nodelay(true)?;
     // let _ = tokio::io::copy_bidirectional(in_sock, &mut out_sock).await;
@@ -280,8 +281,23 @@ where
     }
 }
 
-
 pub fn geteuid() -> u32 {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap()
+}
+
+pub async fn receive_signal() -> Result<()> {
+    use tokio::signal::unix::signal;
+    use tokio::signal::unix::SignalKind;
+    let mut sighang = signal(SignalKind::hangup())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    tokio::select! {
+        _ = sighang.recv() => {},
+        _ = sigint.recv() => {},
+        _ = sigterm.recv() => {},
+    }
+
+    Err(anyhow!("Recieved signal"))
 }

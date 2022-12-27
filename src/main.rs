@@ -5,9 +5,11 @@ mod settings;
 mod socks5;
 
 mod tproxy;
+mod redirect;
 mod utils;
 
 use lazy_static::lazy_static;
+use redirect::redirect_worker;
 use tokio::task::JoinHandle;
 use tokio::try_join;
 
@@ -36,8 +38,9 @@ async fn flatten(handle: JoinHandle<Result<()>>) -> Result<()> {
 async fn main() -> Result<()> {
     let tproxy_worker = tokio::spawn(tproxy::tproxy_worker());
     let socks_worker = tokio::spawn(socks5::socks5_worker());
+    let redirect_worker = tokio::spawn(redirect_worker());
 
-    match try_join!(flatten(tproxy_worker), flatten(socks_worker)) {
+    match try_join!(flatten(tproxy_worker), flatten(socks_worker), flatten(redirect_worker)) {
         Ok(_) => {
             unreachable!("shouldn't be here.");
         }

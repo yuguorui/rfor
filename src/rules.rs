@@ -13,7 +13,6 @@ use tokio::{
 };
 use url::Url;
 
-use crate::tproxy::handle_intercept_sock;
 use crate::utils::{to_io_err, BoomHashSet, ToV6Net, ToV6SockAddr};
 use crate::SETTINGS;
 
@@ -131,6 +130,7 @@ pub enum InboundProtocol {
     SOCKS5,
     #[cfg(target_os = "linux")]
     TPROXY,
+    REDIRECT,
     UNKNOWN,
 }
 
@@ -256,7 +256,7 @@ impl RouteTable {
                 }
             }
 
-            handle_intercept_sock(&sock).await?;
+            prepare_socket(&sock).await?;
 
             match &context.target_addr {
                 TargetAddr::Ip(dst_sock) => {
@@ -351,4 +351,24 @@ impl RouteTable {
             }
         }
     }
+}
+
+pub async fn prepare_socket(sock: &tokio::net::TcpSocket) -> tokio::io::Result<()> {
+    match &SETTINGS.read().await.intercept_mode {
+        crate::settings::InterceptMode::TPROXY {
+            direct_mark, ..
+        } | crate::settings::InterceptMode::REDIRECT {
+            direct_mark, ..
+        }=> {
+            // Avoid local traffic looping
+            nix::sys::socket::setsockopt(
+                std::os::unix::prelude::AsRawFd::as_raw_fd(sock),
+                nix::sys::socket::sockopt::Mark,
+                &direct_mark,
+            )?;
+        }
+        crate::settings::InterceptMode::MANUAL => {}
+    }
+
+    Ok(())
 }

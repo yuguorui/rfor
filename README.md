@@ -38,9 +38,9 @@ tproxy-listen: '[::]:50080'
 socks5-listen: '[::]:50081'
 
 traffic-intercept:
-  mode: auto            # set to "manual" when you want set iptables by hand.
-  local-traffic: false  # set to true to allow intercept local traffic
-  ports: [80,443,8080]  # ports you are interested
+  mode: auto                # set to "manual" when you want set iptables by hand.
+  local-traffic: redirect   # set to redirect/tproxy to allow intercept local traffic
+  ports: [80,443,8080]      # ports you are interested
 #   proxy-mark: 0xff42
 #   direct-mark: 0xff43
 #   tproxy-proxy-chain: rfor-proxy
