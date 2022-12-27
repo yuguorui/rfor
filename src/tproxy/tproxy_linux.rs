@@ -128,10 +128,6 @@ async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
     Ok(())
 }
 
-fn geteuid() -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap()
-}
 
 fn cleanup_iptables(proxy_chain: &str, mark_chain: &str) -> Result<(), Box<dyn std::error::Error>> {
     let ipts = [iptables::new(false).unwrap(), iptables::new(true).unwrap()];
@@ -474,7 +470,7 @@ async fn environment_setup() -> Result<()> {
             rule_table_index,
             mark_chain,
         } => {
-            if geteuid() != 0 {
+            if crate::utils::geteuid() != 0 {
                 return Err(anyhow!("Must be root to set the iptables."));
             }
 

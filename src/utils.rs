@@ -280,3 +280,8 @@ where
     }
 }
 
+
+pub fn geteuid() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap()
+}
