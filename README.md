@@ -26,6 +26,7 @@ $ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 $ cargo build --release
 
 # Or build static rfor!
+# rustup target add x86_64-unknown-linux-musl
 # RUSTFLAGS='-C target-feature=+crt-static' cargo build --target x86_64-unknown-linux-musl
 ```
 
@@ -38,8 +39,8 @@ tproxy-listen: '[::]:50080'
 socks5-listen: '[::]:50081'
 
 traffic-intercept:
-  mode: auto                # set to "manual" when you want set iptables by hand.
-  local-traffic: redirect   # set to redirect/tproxy to allow intercept local traffic
+  mode: auto                # auto(tproxy)/redirect/manual, set to "manual" when you want set iptables by hand.
+  local-traffic: true       # set to true to allow intercept local traffic
   ports: [80,443,8080]      # ports you are interested
 #   proxy-mark: 0xff42
 #   direct-mark: 0xff43
@@ -82,9 +83,6 @@ OPTIONS:
     -V, --version                Print version information
     -w, --work-dir <WORK_DIR>    working directory [default: .]
 ```
-
-# TODO
-- [ ] UDP relay
 
 # Known Issues
 - `br_netfilter` has some known issues [link](http://patchwork.ozlabs.org/project/netfilter-devel/patch/1518715545-2188-1-git-send-email-gregory.vanderschueren@tessares.net/) with tproxy, which may lead to network timeout in Docker.
