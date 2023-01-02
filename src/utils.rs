@@ -151,7 +151,6 @@ pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> 
         },
     };
 
-    out_sock.set_nodelay(true)?;
     // let _ = tokio::io::copy_bidirectional(in_sock, &mut out_sock).await;
     let _ = _copy_bidirectional(in_sock, &mut out_sock).await;
 
