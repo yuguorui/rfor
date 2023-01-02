@@ -1,5 +1,8 @@
 target/
 config.*ml
 *.mmdb
+geoip.dat
+geosite.dat
 src/protos/common.rs
 .gitback/
+rfor-*.tar.gz

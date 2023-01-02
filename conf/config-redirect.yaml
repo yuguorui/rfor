@@ -1,0 +1,23 @@
+debug: false
+tproxy-listen: '[::]:50080'
+socks5-listen: '[::]:50081'
+redirect-listen: '[::]:50082'
+
+traffic-intercept:
+  mode: redirect        # set to "manual" when you want set iptables by hand.
+  local-traffic: true   # set to redirect/tproxy to allow intercept local traffic
+  ports: [80,443,8080]  # ports you are interested
+
+outbounds:
+  - name: PROXY
+    url: socks5://192.168.51.1:1080
+
+  - name: DIRECT
+
+# It is worth noting that all rules are aggregated in order to improve the speed of rule matching. 
+# So the matching of rules is not sequential, but declarative. When multiple identical rules exist, 
+# the matching priority is undefined.
+rules:
+  - DEFAULT,,DIRECT
+  - DOMAIN-SUFFIX,google.com,PROXY
+  - DOMAIN,www.google.com,PROXY

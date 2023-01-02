@@ -1,0 +1,23 @@
+tproxy-listen: '[::]:50080'
+socks5-listen: '[::]:1081'
+
+outbounds:
+  - name: DROP
+    url: drop://0.0.0.0
+  - name: PROXY
+    url: socks5://127.0.0.1:1080
+  - name: DIRECT
+    bind_range:
+      - 2000::/3
+
+traffic-intercept:
+  mode: auto
+  local-traffic: true
+  ports: [22,80,443,465,587,993,8080,9001,9030]
+
+rules:
+  - DEFAULT,,PROXY
+  - GEOSITE,geosite.dat:cn,DIRECT
+  - GEOSITE,geosite.dat:google,PROXY
+  - GEOSITE,geosite.dat:speedtest,DIRECT
+  - GEOSITE,geosite.dat:category-ads,DROP
