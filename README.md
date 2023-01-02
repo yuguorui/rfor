@@ -12,7 +12,7 @@ Features
 - Fast routing decision ( <= 15us with 70k rules )
     - TLS SNI sniffing
     - [GeoIP](https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat)/[GeoSite](https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat)/[MMDB](https://raw.githubusercontent.com/alecthw/mmdb_china_ip_list/release/Country.mmdb) support
-- Auto configuration and cleanup for transparent proxy with iptables and tproxy (No more mess with iptables)
+- Auto configuration and cleanup for transparent proxy with iptables and tproxy (No more mess with iptables🥳)
 - Optional source IP preserving when connects directly
 - Native IPv6 support
 
@@ -87,7 +87,9 @@ OPTIONS:
 # Known Issues
 - `br_netfilter` has some known issues [link](http://patchwork.ozlabs.org/project/netfilter-devel/patch/1518715545-2188-1-git-send-email-gregory.vanderschueren@tessares.net/) with tproxy, which may lead to network timeout in Docker.
    You can mitigate this problem with:
-```shell
-echo "0" | sudo tee /proc/sys/net/bridge/bridge-nf-call-iptables
-echo "0" | sudo tee /proc/sys/net/bridge/bridge-nf-call-ip6tables
-```
+
+      echo "0" | sudo tee /proc/sys/net/bridge/bridge-nf-call-iptables
+      echo "0" | sudo tee /proc/sys/net/bridge/bridge-nf-call-ip6tables
+
+
+  And you may also switch to mode `redirect`, but the source IP preserving feature will not work anymore.
