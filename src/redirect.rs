@@ -120,7 +120,7 @@ async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
 
     let target_addr = match domain {
         Some(domain) => TargetAddr::Domain(domain, origin_addr.port(), Some(origin_addr)),
-        None => TargetAddr::Ip(inbound.local_addr()?),
+        None => TargetAddr::Ip(origin_addr),
     };
 
     let rt_context = RouteContext {
