@@ -178,9 +178,7 @@ fn __setup_nat_iptables(
         ),
     )?;
 
-    if local_traffic {
-        ipt.append(table, "PREROUTING", &format!("-j {}", proxy_chain))?;
-    }
+    ipt.append(table, "PREROUTING", &format!("-j {}", proxy_chain))?;
 
     if local_traffic {
         ipt.append(table, "OUTPUT", &format!("-j {}", proxy_chain))?;
