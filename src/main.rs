@@ -23,7 +23,7 @@ use anyhow::Result;
 
 lazy_static! {
     static ref SETTINGS: Arc<RwLock<Settings>> =
-        Arc::new(RwLock::const_new(Settings::new().unwrap()));
+        Arc::new(RwLock::const_new(Settings::new().expect("Failed to load settings")));
 }
 
 async fn flatten(handle: JoinHandle<Result<()>>) -> Result<()> {
