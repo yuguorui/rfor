@@ -1,12 +1,68 @@
 use anyhow::{anyhow, Context, Result};
 
-use crate::SETTINGS;
+use crate::{rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr, SETTINGS};
+use std::mem::MaybeUninit;
 
-pub async fn tproxy_worker() -> Result<()> {
+fn setup_iptransparent_opts(sock: socket2::SockRef) -> std::io::Result<()> {
     use nix::sys::socket::sockopt::IpTransparent;
     use nix::sys::socket::{self};
-    use std::os::unix::prelude::AsRawFd;
-    use tokio::net::TcpListener;
+    use std::os::unix::io::AsRawFd;
+
+    socket::setsockopt(sock.as_raw_fd(), IpTransparent, &true)?;
+    Ok(())
+}
+
+fn setup_udpsock_opts(sock: &tokio::net::UdpSocket) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    setup_iptransparent_opts(socket2::SockRef::from(sock))?;
+
+    let optret = match sock.local_addr()?.ip() {
+        std::net::IpAddr::V4(_) => unsafe {
+            nix::libc::setsockopt(
+                sock.as_raw_fd(),
+                nix::libc::SOL_IP,
+                nix::libc::IP_RECVORIGDSTADDR,
+                &1 as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            )
+        },
+        std::net::IpAddr::V6(_) => unsafe {
+            // set both ipv4 and ipv6 for compatibility
+            let r = nix::libc::setsockopt(
+                sock.as_raw_fd(),
+                nix::libc::SOL_IP,
+                nix::libc::IP_RECVORIGDSTADDR,
+                &1 as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+
+            if r != 0 {
+                r
+            } else {
+                nix::libc::setsockopt(
+                    sock.as_raw_fd(),
+                    nix::libc::SOL_IPV6,
+                    nix::libc::IPV6_RECVORIGDSTADDR,
+                    &1 as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                )
+            }
+        },
+    };
+
+    if optret < 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "failed to set IP_RECVORIGDSTADDR.",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+pub async fn tproxy_worker() -> Result<()> {
+    use tokio::net::{TcpListener, UdpSocket};
 
     if SETTINGS.read().await.tproxy_listen.is_none() {
         return Ok(());
@@ -20,11 +76,18 @@ pub async fn tproxy_worker() -> Result<()> {
     let listen_addr = SETTINGS.read().await.tproxy_listen.clone().unwrap();
     println!("tproxy listen: {}", listen_addr);
 
-    let listener = TcpListener::bind(listen_addr).await?;
-    socket::setsockopt(listener.as_raw_fd(), IpTransparent, &true)?;
+    let tcp_listener = TcpListener::bind(listen_addr.clone()).await?;
+    setup_iptransparent_opts(socket2::SockRef::from(&tcp_listener))?;
+
+    let udp_socket = UdpSocket::bind(listen_addr).await?;
+    setup_udpsock_opts(&udp_socket)?;
 
     tokio::select! {
-        _ = accept_socket_loop(listener) => {},
+        _ = accept_socket_loop(tcp_listener) => {},
+        Err(err) = udp_socket_loop(udp_socket) => {
+            clean_environment().await?;
+            return Err(err);
+        },
         Err(err) = crate::utils::receive_signal() => {
             clean_environment().await?;
             return Err(err);
@@ -52,15 +115,293 @@ async fn accept_socket_loop(listener: tokio::net::TcpListener) {
     }
 }
 
+fn parse_sockaddr_storage(
+    sockaddr_storage: &nix::libc::sockaddr_storage,
+) -> std::io::Result<std::net::SocketAddr> {
+    unsafe {
+        socket2::SockAddr::new(
+            *sockaddr_storage,
+            std::mem::size_of_val(sockaddr_storage) as _,
+        )
+    }
+    .as_socket()
+    .ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "failed to parse sockaddr_storage.",
+        )
+    })
+}
+
+fn parse_cmsg_orig_dst_addr(msghdr: &nix::libc::msghdr) -> std::io::Result<std::net::SocketAddr> {
+    let cmsgptr = unsafe { nix::libc::CMSG_FIRSTHDR(msghdr) };
+    if cmsgptr.is_null() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "no control message is valid.",
+        ));
+    }
+
+    let mut target_sockaddr_option = None;
+    loop {
+        let cmsg_level = unsafe { *cmsgptr }.cmsg_level;
+        let cmsg_type = unsafe { *cmsgptr }.cmsg_type;
+        let cmsg_data = unsafe { nix::libc::CMSG_DATA(cmsgptr) } as *const nix::libc::c_uchar;
+
+        if cmsg_level == nix::libc::SOL_IP && cmsg_type == nix::libc::IP_ORIGDSTADDR {
+            let sockaddr_storage = cmsg_data as *const nix::libc::sockaddr_storage;
+            target_sockaddr_option = Some(
+                unsafe {
+                    socket2::SockAddr::new(
+                        *sockaddr_storage,
+                        std::mem::size_of::<nix::libc::sockaddr_in>() as _,
+                    )
+                }
+                .as_socket()
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "failed to parse sockaddr_in.")
+                })?,
+            );
+            break;
+        }
+
+        if cmsg_level == nix::libc::SOL_IPV6 && cmsg_type == nix::libc::IPV6_ORIGDSTADDR {
+            let sockaddr_storage = cmsg_data as *const nix::libc::sockaddr_storage;
+            target_sockaddr_option = Some(
+                unsafe {
+                    socket2::SockAddr::new(
+                        *sockaddr_storage,
+                        std::mem::size_of::<nix::libc::sockaddr_in6>() as _,
+                    )
+                }
+                .as_socket()
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "failed to parse sockaddr_in6.")
+                })?,
+            );
+            break;
+        }
+
+        let cmsgptr = unsafe { nix::libc::CMSG_NXTHDR(msghdr, cmsgptr) };
+        if cmsgptr.is_null() {
+            break;
+        }
+    }
+
+    target_sockaddr_option.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "no target sockaddr received.")
+    })
+}
+
+fn recvmsg_wrapper(
+    fd: i32,
+    buffer: &mut [u8],
+) -> std::io::Result<(usize, std::net::SocketAddr, std::net::SocketAddr)> {
+    let mut iovec_buffer = nix::libc::iovec {
+        iov_base: buffer.as_mut_ptr() as *mut nix::libc::c_void,
+        iov_len: buffer.len(),
+    };
+    let mut control = [0 as u8; 0x200];
+    let mut source_storage = MaybeUninit::<nix::libc::sockaddr_storage>::uninit();
+    let mut msghdr = nix::libc::msghdr {
+        msg_name: source_storage.as_mut_ptr() as *mut nix::libc::c_void,
+        msg_namelen: std::mem::size_of::<nix::libc::sockaddr_storage>() as u32,
+        msg_iov: &mut iovec_buffer,
+        msg_iovlen: 1,
+        msg_control: control.as_mut_ptr() as *mut nix::libc::c_void,
+        msg_controllen: control.len(),
+        msg_flags: 0,
+    };
+
+    let ret = unsafe { nix::libc::recvmsg(fd, &mut msghdr, 0) };
+
+    if ret > 0 {
+        let source_sockaddr =
+            parse_sockaddr_storage(&unsafe { source_storage.assume_init() })?.to_ipv6_sockaddr();
+        let target_sockaddr = parse_cmsg_orig_dst_addr(&msghdr)?.to_ipv6_sockaddr();
+
+        return Ok((ret as usize, source_sockaddr, target_sockaddr));
+    } else {
+        return Err(std::io::Error::last_os_error());
+    }
+}
+
+#[derive(Eq, Hash, PartialEq, Clone)]
+struct UdpStateKey {
+    from: std::net::SocketAddr,
+    to: std::net::SocketAddr,
+}
+
+async fn udp_socket_loop(udp_socket: tokio::net::UdpSocket) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    use std::sync::Arc;
+    use tokio::io::Interest;
+
+    let r = Arc::new(udp_socket);
+
+    loop {
+        let r = r.clone();
+
+        let mut buffer = [0 as u8; 0x10000];
+        match r
+            .clone()
+            .async_io(Interest::READABLE, || {
+                recvmsg_wrapper(r.as_raw_fd(), &mut buffer)
+            })
+            .await
+        {
+            Ok((size, source_sockaddr, target_sockaddr)) => {
+                let prefilled_data = bytes::Bytes::copy_from_slice(&buffer[..size]);
+
+                println!(
+                    "udp relay: create tunnel {:?} <-> {:?}",
+                    source_sockaddr, target_sockaddr
+                );
+
+                let prefilled_data_clone = prefilled_data.clone();
+                tokio::spawn(async move {
+                    match relay_udp_packet(prefilled_data_clone, source_sockaddr, target_sockaddr)
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            println!("Failed to relay udp packet: {}", e);
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
+        };
+    }
+}
+
+async fn relay_udp_packet(
+    init_packet: bytes::Bytes,
+    source_sockaddr: std::net::SocketAddr,
+    target_sockaddr: std::net::SocketAddr,
+) -> Result<()> {
+    use nix::libc;
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::fd::OwnedFd;
+    use tokio::net::UdpSocket;
+
+    let target_socket = UdpSocket::bind("[::]:0").await?;
+    prepare_socket_bypass_mangle(target_socket.as_raw_fd()).await?;
+    target_socket.connect(target_sockaddr).await?;
+
+    let fd;
+    unsafe {
+        fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        let ret = libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_TRANSPARENT,
+            &1 as *const _ as *const libc::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        let ret = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &1 as *const _ as *const libc::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        let addr = socket2::SockAddr::from(target_sockaddr);
+        let ret = libc::bind(
+            fd,
+            &addr.as_storage() as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as u32,
+        );
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    let source_socket =
+        unsafe { UdpSocket::from_std(std::net::UdpSocket::from(OwnedFd::from_raw_fd(fd))) }?;
+    prepare_socket_bypass_mangle(source_socket.as_raw_fd()).await?;
+    source_socket.connect(source_sockaddr).await?;
+
+    // source_socket is ready and the new reply from target_sockaddr will be recv by the source_socket
+    target_socket.send(&init_packet).await?;
+
+    let timeout = std::time::Duration::from_secs(30);
+    let sleep = tokio::time::sleep(timeout);
+    tokio::pin!(sleep);
+
+    const BUFFER_SIZE: usize = 0x10000;
+    let mut dst_buffer = [0 as u8; BUFFER_SIZE];
+    let mut src_buffer = [0 as u8; BUFFER_SIZE];
+    loop {
+        tokio::select! {
+            data = source_socket.recv(&mut src_buffer) => {
+                match data {
+                    Ok(size) => {
+                        sleep.as_mut().set(tokio::time::sleep(timeout));
+                        match target_socket.send(&src_buffer[..size]).await {
+                            Ok(_) => {
+                                println!("udp relay: {:?} -> {:?} with bytes {}", source_sockaddr, target_sockaddr, size);
+                            }
+                            Err(e) => {
+                                println!("Failed to send udp packet to target: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("Failed to receive udp packet from source: {}", e);
+                        break;
+                    }
+                }
+            },
+            size = target_socket.recv(&mut dst_buffer) => {
+                match size {
+                    Ok(size) => {
+                        sleep.as_mut().set(tokio::time::sleep(timeout));
+                        match source_socket.send(&dst_buffer[..size]).await {
+                            Ok(_) => {
+                                println!("udp relay: {:?} <- {:?} with bytes {}", source_sockaddr, target_sockaddr, size);
+                            }
+                            Err(e) => {
+                                println!("Failed to send back udp packet to source: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("Failed to receive udp packet from target: {}", e);
+                        break;
+                    }
+                }
+            },
+            _ = &mut sleep => {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn tproxy_bind_src(
     sock: &tokio::net::TcpSocket,
     src_sock: std::net::SocketAddr,
 ) -> tokio::io::Result<()> {
-    use nix::sys::socket::sockopt::IpTransparent;
-    use nix::sys::socket::{self};
-    use std::os::unix::prelude::AsRawFd;
-
-    socket::setsockopt(sock.as_raw_fd(), IpTransparent, &true)?;
+    setup_iptransparent_opts(socket2::SockRef::from(sock))?;
     match sock.bind(src_sock) {
         Ok(_) => {}
         Err(err) => match err.kind() {
@@ -186,6 +527,17 @@ fn __setup_iptables(
         table,
         proxy_chain,
         &format!(
+            "-p udp --match multiport --dports {} -j TPROXY --tproxy-mark {} --on-port {}",
+            ports.into_iter().map(|v| v.to_string()).join(","),
+            xmark,
+            tproxy_port,
+        ),
+    )?;
+
+    ipt.append(
+        table,
+        proxy_chain,
+        &format!(
             "-p tcp --match multiport --sports {} -j MARK --set-mark {}",
             ports.into_iter().map(|v| v.to_string()).join(","),
             xmark,
@@ -219,6 +571,16 @@ fn __setup_iptables(
             mark_chain,
             &format!(
                 "-p tcp --match multiport --dports {} -j MARK --set-mark {}",
+                ports.into_iter().map(|v| v.to_string()).join(","),
+                xmark,
+            ),
+        )?;
+
+        ipt.append(
+            table,
+            mark_chain,
+            &format!(
+                "-p udp --match multiport --dports {} -j MARK --set-mark {}",
                 ports.into_iter().map(|v| v.to_string()).join(","),
                 xmark,
             ),

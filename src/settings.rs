@@ -299,7 +299,8 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                     .expect("Expect a (filename, region) tuple.");
                 match filename {
                     name if name.ends_with(".mmdb") => {
-                        let maxmind_reader = maxminddb::Reader::open_readfile(filename).unwrap();
+                        let maxmind_reader = maxminddb::Reader::open_readfile(filename)
+                            .map_err(|e| ConfigError::Message(format!("Failed to open file '{}' with error: {}", filename, e)))?;
                         route.ip_db = Some(maxmind_reader);
                         cond.maxmind_regions.push(region.to_string().to_lowercase());
                     }

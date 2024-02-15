@@ -6,6 +6,7 @@ use tokio::time::Instant;
 
 use std::fmt::Display;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 use tokio::{
     net::{TcpSocket, TcpStream},
@@ -256,7 +257,7 @@ impl RouteTable {
                 }
             }
 
-            prepare_socket(&sock).await?;
+            prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
 
             match &context.target_addr {
                 TargetAddr::Ip(dst_sock) => {
@@ -353,7 +354,7 @@ impl RouteTable {
     }
 }
 
-pub async fn prepare_socket(sock: &tokio::net::TcpSocket) -> tokio::io::Result<()> {
+pub async fn prepare_socket_bypass_mangle(sockfd: i32) -> tokio::io::Result<()> {
     match &SETTINGS.read().await.intercept_mode {
         crate::settings::InterceptMode::TPROXY {
             direct_mark, ..
@@ -362,7 +363,7 @@ pub async fn prepare_socket(sock: &tokio::net::TcpSocket) -> tokio::io::Result<(
         }=> {
             // Avoid local traffic looping
             nix::sys::socket::setsockopt(
-                std::os::unix::prelude::AsRawFd::as_raw_fd(sock),
+                sockfd,
                 nix::sys::socket::sockopt::Mark,
                 &direct_mark,
             )?;
