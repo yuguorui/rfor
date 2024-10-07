@@ -79,7 +79,7 @@ async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
     use crate::rules::{InboundProtocol, RouteContext, TargetAddr};
     use crate::utils::{is_valid_domain, transfer_tcp};
 
-    let mut buffer = [0u8; 0x400];
+    let mut buffer = [0u8; 0x800];
     inbound.peek(&mut buffer).await?;
 
     let domain = crate::sniffer::parse_host(&buffer).filter(|s| is_valid_domain(s.as_str()));
