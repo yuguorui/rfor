@@ -88,50 +88,6 @@ pub struct BoomHashSet<K: Hash> {
     keys: Vec<K>,
 }
 
-impl<K> BoomHashSet<K>
-where
-    K: Clone + Hash + Debug + PartialEq,
-{
-    fn create_set(mut keys: Vec<K>, mphf: Mphf<K>) -> BoomHashSet<K> {
-        // reorder the keys and values according to the Mphf
-        for i in 0..keys.len() {
-            loop {
-                let kmer_slot = mphf.hash(&keys[i]) as usize;
-                if i == kmer_slot {
-                    break;
-                }
-                keys.swap(i, kmer_slot);
-            }
-        }
-        BoomHashSet {
-            mphf: mphf,
-            keys: keys,
-        }
-    }
-
-    /// Create a new hash map from the parallel array `keys` and `values`
-    pub fn new(keys: Vec<K>) -> BoomHashSet<K> {
-        let mphf = Mphf::new(1.7, &keys);
-        Self::create_set(keys, mphf)
-    }
-
-    /// Get the value associated with `key`, if available, otherwise return None
-    pub fn get(&self, kmer: &K) -> bool {
-        let maybe_pos = self.mphf.try_hash(kmer);
-        match maybe_pos {
-            Some(pos) => {
-                let hashed_kmer = &self.keys[pos as usize];
-                if *kmer == hashed_kmer.clone() {
-                    true
-                } else {
-                    false
-                }
-            }
-            None => false,
-        }
-    }
-}
-
 pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> Result<()> {
     let mut out_sock = match SETTINGS
         .read()
