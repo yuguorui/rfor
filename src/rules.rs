@@ -13,7 +13,7 @@ use tokio::{
 };
 use url::Url;
 
-use crate::utils::{to_io_err, BoomHashSet, ToV6Net, ToV6SockAddr};
+use crate::utils::{to_io_err, ToV6Net, ToV6SockAddr};
 use crate::SETTINGS;
 
 use fast_socks5::client as socks_client;
@@ -32,7 +32,7 @@ pub struct Outbound {
 pub struct Condition {
     pub maxmind_regions: Vec<String>,
     pub dst_ip_range: IpRange<Ipv6Net>,
-    pub domains: Option<BoomHashSet<String>>,
+    pub domains: Option<std::collections::HashSet<String>>,
 }
 
 impl Condition {
@@ -46,7 +46,7 @@ impl Condition {
 
     pub fn match_domain(&self, name: &str) -> bool {
         if let Some(ref domains) = self.domains {
-            if domains.get(&name.to_owned()) {
+            if domains.get(&name.to_owned()).is_some() {
                 return true;
             }
 
@@ -54,7 +54,7 @@ impl Condition {
             let domain = format!(".{}{}", name, RULE_DOMAIN_SUFFIX_TAG);
             let indices = domain.match_indices(".");
             for index in indices {
-                if domains.get(&domain[index.0 + 1..].to_string()) {
+                if domains.get(&domain[index.0 + 1..].to_string()).is_some() {
                     return true;
                 }
             }

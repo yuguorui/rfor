@@ -9,7 +9,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::rules::{RouteTable, RULE_DOMAIN_SUFFIX_TAG};
 
-use crate::utils::{vec_to_array, BoomHashSet, ToV6Net};
+use crate::utils::{vec_to_array, ToV6Net};
 
 const DIRECT_OUTBOUND_NAME: &str = "DIRECT";
 const DROP_OUTBOUND_NAME: &str = "DROP";
@@ -148,10 +148,11 @@ fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
                 .get("mode")
                 .expect("mode field not found.")
                 .clone()
-                .into_str()?.to_lowercase();
+                .into_str()?
+                .to_lowercase();
             match mode.as_str() {
                 "manual" => return Ok(InterceptMode::MANUAL),
-                "auto"|"tproxy"|"redirect" => {
+                "auto" | "tproxy" | "redirect" => {
                     let capture_local_traffic = table
                         .get("local-traffic")
                         .and_then(|v| {
@@ -230,7 +231,7 @@ fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
                             )
                         })
                         .unwrap_or(DEFAULT_IPRULE_TABLE);
-                    
+
                     if mode.as_str() != "redirect" {
                         return Ok(InterceptMode::TPROXY {
                             local_traffic: capture_local_traffic,
@@ -249,7 +250,6 @@ fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
                             proxy_chain,
                         });
                     }
-
                 }
                 _ => Err(ConfigError::Message(
                     "either `auto/tproxy`, `redirect` or `manual` is expected.".to_owned(),
@@ -415,7 +415,7 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
 
     for (i, v) in domain_sets.iter().enumerate() {
         let cond = route.rules.get_mut(i).unwrap();
-        cond.domains = Some(BoomHashSet::new(v.to_owned().into_iter().collect_vec()));
+        cond.domains = Some(v.clone());
     }
 
     Ok(())
