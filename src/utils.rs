@@ -92,7 +92,7 @@ pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> 
     let mut out_sock = match SETTINGS
         .read()
         .await
-        .outbounds
+        .routetable
         .get_tcp_sock(&rt_context)
         .await
     {
@@ -255,4 +255,18 @@ pub async fn receive_signal() -> Result<()> {
     }
 
     Err(anyhow!("Recieved signal"))
+}
+
+pub fn to_target_addr(target_addr: fast_socks5::util::target_addr::TargetAddr) -> crate::rules::TargetAddr {
+    match target_addr {
+        fast_socks5::util::target_addr::TargetAddr::Ip(sock_addr) => crate::rules::TargetAddr::Ip(sock_addr),
+        fast_socks5::util::target_addr::TargetAddr::Domain(domain, port) => crate::rules::TargetAddr::Domain(domain, port, None),
+    }
+}
+
+pub async fn rfor_bind_addr() -> String {
+    match crate::SETTINGS.read().await.disable_ipv6 {
+        false => "[::]:0".to_owned(),
+        true => "0.0.0.0:0".to_owned(),
+    }
 }

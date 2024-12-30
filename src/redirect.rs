@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result};
 use nix::sys::socket::GetSockOpt;
 
-use crate::SETTINGS;
+use crate::{utils::rfor_bind_addr, SETTINGS};
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpListener;
 
@@ -18,10 +18,7 @@ pub async fn redirect_worker() -> Result<()> {
             direct_mark,
             proxy_chain,
         } => {
-            let listen_addr = match &SETTINGS.read().await.disable_ipv6 {
-                true => "0.0.0.0",
-                false => "[::]",
-            };
+            let listen_addr = rfor_bind_addr().await;
 
             let listener = match &SETTINGS.read().await.redirect_listen {
                 Some(addr) => TcpListener::bind(addr).await?,
@@ -124,9 +121,10 @@ async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
     };
 
     let rt_context = RouteContext {
-        src_sock: inbound.peer_addr()?,
-        target_addr,
+        src_addr: inbound.peer_addr()?,
+        dst_addr: target_addr,
         inbound_proto: Some(InboundProtocol::REDIRECT),
+        socket_type: crate::rules::SocketType::STREAM,
     };
 
     transfer_tcp(inbound, rt_context.to_owned())

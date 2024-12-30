@@ -1,6 +1,9 @@
 tproxy-listen: '[::]:50080'
 socks5-listen: '[::]:1081'
 
+udp-enabled: true
+# udp-timeout: 60
+
 outbounds:
   - name: DROP
     url: drop://0.0.0.0

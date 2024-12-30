@@ -15,6 +15,7 @@ Features
 - Auto configuration and cleanup for transparent proxy with iptables and tproxy (No more mess with iptables🥳)
 - Optional source IP preserving when connects directly
 - Native IPv6 support
+- UDP transparent proxy
 
 Build
 -----
@@ -37,6 +38,9 @@ debug: false
 # disable-ipv6: false
 tproxy-listen: '[::]:50080'
 socks5-listen: '[::]:50081'
+
+udp-enabled: true
+# udp-timeout: 60
 
 traffic-intercept:
   mode: auto                # auto(tproxy)/redirect/manual, set to "manual" when you want set iptables by hand.

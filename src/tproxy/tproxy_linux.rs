@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use tokio::net::TcpListener;
 
 use crate::{rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr, SETTINGS};
 use std::mem::MaybeUninit;
@@ -62,8 +63,6 @@ fn setup_udpsock_opts(sock: &tokio::net::UdpSocket) -> Result<()> {
 }
 
 pub async fn tproxy_worker() -> Result<()> {
-    use tokio::net::{TcpListener, UdpSocket};
-
     if SETTINGS.read().await.tproxy_listen.is_none() {
         return Ok(());
     }
@@ -76,15 +75,12 @@ pub async fn tproxy_worker() -> Result<()> {
     let listen_addr = SETTINGS.read().await.tproxy_listen.clone().unwrap();
     println!("tproxy listen: {}", listen_addr);
 
-    let tcp_listener = TcpListener::bind(listen_addr.clone()).await?;
-    setup_iptransparent_opts(socket2::SockRef::from(&tcp_listener))?;
-
-    let udp_socket = UdpSocket::bind(listen_addr).await?;
-    setup_udpsock_opts(&udp_socket)?;
-
     tokio::select! {
-        _ = accept_socket_loop(tcp_listener) => {},
-        Err(err) = udp_socket_loop(udp_socket) => {
+        Err(err) = accept_socket_loop(&listen_addr) => {
+            clean_environment().await?;
+            return Err(err);
+        },
+        Err(err) = udp_socket_loop(&listen_addr) => {
             clean_environment().await?;
             return Err(err);
         },
@@ -93,11 +89,12 @@ pub async fn tproxy_worker() -> Result<()> {
             return Err(err);
         },
     };
-
-    Ok(())
 }
 
-async fn accept_socket_loop(listener: tokio::net::TcpListener) {
+async fn accept_socket_loop(listen_addr: &str) -> Result<()> {
+    let listener = TcpListener::bind(listen_addr).await.context("failed to bind tcp listener")?;
+    setup_iptransparent_opts(socket2::SockRef::from(&listener)).context("failed to set IP_TRANSPARENT")?;
+
     loop {
         match listener.accept().await {
             Ok((mut _socket, _)) => {
@@ -193,6 +190,7 @@ fn parse_cmsg_orig_dst_addr(msghdr: &nix::libc::msghdr) -> std::io::Result<std::
     })
 }
 
+/// recvmsg wrapper for tproxy, which returns the source and target sockaddr of the packet.
 fn recvmsg_wrapper(
     fd: i32,
     buffer: &mut [u8],
@@ -203,15 +201,14 @@ fn recvmsg_wrapper(
     };
     let mut control = [0 as u8; 0x200];
     let mut source_storage = MaybeUninit::<nix::libc::sockaddr_storage>::uninit();
-    let mut msghdr = nix::libc::msghdr {
-        msg_name: source_storage.as_mut_ptr() as *mut nix::libc::c_void,
-        msg_namelen: std::mem::size_of::<nix::libc::sockaddr_storage>() as u32,
-        msg_iov: &mut iovec_buffer,
-        msg_iovlen: 1,
-        msg_control: control.as_mut_ptr() as *mut nix::libc::c_void,
-        msg_controllen: control.len(),
-        msg_flags: 0,
-    };
+    let mut msghdr = unsafe { std::mem::zeroed::<nix::libc::msghdr>() };
+    msghdr.msg_name = source_storage.as_mut_ptr() as *mut nix::libc::c_void;
+    msghdr.msg_namelen = std::mem::size_of::<nix::libc::sockaddr_storage>() as u32;
+    msghdr.msg_iov = &mut iovec_buffer;
+    msghdr.msg_iovlen = 1;
+    msghdr.msg_control = control.as_mut_ptr() as *mut nix::libc::c_void;
+    msghdr.msg_controllen = control.len() as _;
+    msghdr.msg_flags = 0;
 
     let ret = unsafe { nix::libc::recvmsg(fd, &mut msghdr, 0) };
 
@@ -226,16 +223,17 @@ fn recvmsg_wrapper(
     }
 }
 
-#[derive(Eq, Hash, PartialEq, Clone)]
-struct UdpStateKey {
-    from: std::net::SocketAddr,
-    to: std::net::SocketAddr,
-}
-
-async fn udp_socket_loop(udp_socket: tokio::net::UdpSocket) -> Result<()> {
+async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     use std::sync::Arc;
     use tokio::io::Interest;
+
+    if !SETTINGS.read().await.udp_enable {
+        return Ok(());
+    }
+
+    let udp_socket = tokio::net::UdpSocket::bind(listen_addr).await?;
+    setup_udpsock_opts(&udp_socket)?;
 
     let r = Arc::new(udp_socket);
 
@@ -288,15 +286,20 @@ async fn relay_udp_packet(
     use std::os::fd::OwnedFd;
     use tokio::net::UdpSocket;
 
-    let target_socket = UdpSocket::bind("[::]:0").await?;
-    prepare_socket_bypass_mangle(target_socket.as_raw_fd()).await?;
-    target_socket.connect(target_sockaddr).await?;
+    let target_socket = SETTINGS.read().await.routetable.get_dgram_sock(&crate::rules::RouteContext {
+            src_addr: source_sockaddr,
+            dst_addr: crate::rules::TargetAddr::Ip(target_sockaddr),
+            inbound_proto: Some(crate::rules::InboundProtocol::TPROXY),
+            socket_type: crate::rules::SocketType::DGRAM,
+        }).await?;
 
+    // 2. prepare the intermediate socket which is connect to the source, which should bind to the target address,
+    // and pretend to be the target.
     let fd;
     unsafe {
         fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0);
         if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(anyhow!("failed to create socket: {}", std::io::Error::last_os_error()));
         }
 
         let ret = libc::setsockopt(
@@ -307,7 +310,7 @@ async fn relay_udp_packet(
             std::mem::size_of::<i32>() as u32,
         );
         if ret < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(anyhow!("failed to set IP_TRANSPARENT: {}", std::io::Error::last_os_error()));
         }
 
         let ret = libc::setsockopt(
@@ -318,7 +321,7 @@ async fn relay_udp_packet(
             std::mem::size_of::<i32>() as u32,
         );
         if ret < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(anyhow!("failed to set SO_REUSEADDR: {}", std::io::Error::last_os_error()));
         }
 
         let addr = socket2::SockAddr::from(target_sockaddr);
@@ -328,7 +331,7 @@ async fn relay_udp_packet(
             std::mem::size_of::<libc::sockaddr_in6>() as u32,
         );
         if ret < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(anyhow!("failed to bind to target address {}: {}", target_sockaddr, std::io::Error::last_os_error()));
         }
     }
     let source_socket =
@@ -337,9 +340,9 @@ async fn relay_udp_packet(
     source_socket.connect(source_sockaddr).await?;
 
     // source_socket is ready and the new reply from target_sockaddr will be recv by the source_socket
-    target_socket.send(&init_packet).await?;
+    target_socket.send_to(&init_packet, crate::rules::TargetAddr::Ip(target_sockaddr)).await?;
 
-    let timeout = std::time::Duration::from_secs(30);
+    let timeout = std::time::Duration::from_secs(SETTINGS.read().await.udp_timeout);
     let sleep = tokio::time::sleep(timeout);
     tokio::pin!(sleep);
 
@@ -352,7 +355,7 @@ async fn relay_udp_packet(
                 match data {
                     Ok(size) => {
                         sleep.as_mut().set(tokio::time::sleep(timeout));
-                        match target_socket.send(&src_buffer[..size]).await {
+                        match target_socket.send_to(&src_buffer[..size], crate::rules::TargetAddr::Ip(target_sockaddr)).await {
                             Ok(_) => {
                                 println!("udp relay: {:?} -> {:?} with bytes {}", source_sockaddr, target_sockaddr, size);
                             }
@@ -368,9 +371,9 @@ async fn relay_udp_packet(
                     }
                 }
             },
-            size = target_socket.recv(&mut dst_buffer) => {
-                match size {
-                    Ok(size) => {
+            val = target_socket.recv_from(&mut dst_buffer) => {
+                match val {
+                    Ok((size, _)) => {
                         sleep.as_mut().set(tokio::time::sleep(timeout));
                         match source_socket.send(&dst_buffer[..size]).await {
                             Ok(_) => {
@@ -433,9 +436,10 @@ async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
     };
 
     let rt_context = RouteContext {
-        src_sock: inbound.peer_addr()?,
-        target_addr,
+        src_addr: inbound.peer_addr()?,
+        dst_addr: target_addr,
         inbound_proto: Some(InboundProtocol::TPROXY),
+        socket_type: crate::rules::SocketType::STREAM,
     };
 
     transfer_tcp(inbound, rt_context.to_owned())
@@ -446,7 +450,10 @@ async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
 }
 
 fn cleanup_iptables(proxy_chain: &str, mark_chain: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let ipts = [iptables::new(false).unwrap(), iptables::new(true).unwrap()];
+    let ipts = [
+        iptables::new(false).expect("command iptables not found"), 
+        iptables::new(true).expect("command ip6tables not found")
+    ];
 
     for ipt in ipts {
         // cleanup proxy chain
@@ -488,6 +495,7 @@ fn __setup_iptables(
     direct_mark: u32,
     ports: &[u16],
     local_traffic: bool,
+    udp_enable: bool,
     reserved_ip: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
     use itertools::Itertools;
@@ -523,16 +531,18 @@ fn __setup_iptables(
         ),
     )?;
 
-    ipt.append(
-        table,
-        proxy_chain,
-        &format!(
-            "-p udp --match multiport --dports {} -j TPROXY --tproxy-mark {} --on-port {}",
-            ports.into_iter().map(|v| v.to_string()).join(","),
-            xmark,
-            tproxy_port,
-        ),
-    )?;
+    if udp_enable {
+        ipt.append(
+            table,
+            proxy_chain,
+            &format!(
+                "-p udp --match multiport --dports {} -j TPROXY --tproxy-mark {} --on-port {}",
+                ports.into_iter().map(|v| v.to_string()).join(","),
+                xmark,
+                tproxy_port,
+            ),
+        )?;
+    }
 
     ipt.append(
         table,
@@ -576,15 +586,17 @@ fn __setup_iptables(
             ),
         )?;
 
-        ipt.append(
-            table,
-            mark_chain,
-            &format!(
-                "-p udp --match multiport --dports {} -j MARK --set-mark {}",
-                ports.into_iter().map(|v| v.to_string()).join(","),
-                xmark,
-            ),
-        )?;
+        if udp_enable {
+            ipt.append(
+                table,
+                mark_chain,
+                &format!(
+                    "-p udp --match multiport --dports {} -j MARK --set-mark {}",
+                    ports.into_iter().map(|v| v.to_string()).join(","),
+                    xmark,
+                ),
+            )?;
+        }
 
         ipt.append(table, "OUTPUT", &format!("-j {}", mark_chain))?;
     }
@@ -609,6 +621,7 @@ async fn set_iptables(
         direct_mark,
         ports,
         local_traffic,
+        SETTINGS.read().await.udp_enable,
         &[
             "0.0.0.0/8",
             "127.0.0.0/8",
@@ -637,6 +650,7 @@ async fn set_iptables(
             direct_mark,
             ports,
             local_traffic,
+            SETTINGS.read().await.udp_enable,
             &[
                 "::1/128",
                 "100::/64",

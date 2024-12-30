@@ -57,8 +57,10 @@ pub struct Settings {
     pub tproxy_listen: Option<String>,
     pub socks5_listen: Option<String>,
     pub redirect_listen: Option<String>,
-    pub outbounds: RouteTable,
+    pub routetable: RouteTable,
     pub intercept_mode: InterceptMode,
+    pub udp_enable: bool,
+    pub udp_timeout: u64,
 }
 
 impl Settings {
@@ -126,14 +128,25 @@ impl Settings {
         /* 5. Parse the Intercept Mode */
         let intercept_mode = parse_intercept_mode(&mut s)?;
 
+        /* 6. Parse the UDP enabling */
+        let udp_enable = match &intercept_mode {
+            InterceptMode::TPROXY { .. } | InterceptMode::MANUAL => s.get_bool("udp-enable").unwrap_or(true),
+            InterceptMode::REDIRECT { .. } => {
+                println!("UDP is not supported in REDIRECT mode, disabling it.");
+                false
+            },
+        };
+
         let settings = Settings {
             debug: s.get_bool("debug").unwrap_or(false),
             disable_ipv6: s.get_bool("disable-ipv6").unwrap_or(false),
             tproxy_listen: s.get::<String>("tproxy-listen").ok(),
             socks5_listen: s.get::<String>("socks5-listen").ok(),
             redirect_listen: s.get::<String>("redirect-listen").ok(),
-            outbounds: route,
+            routetable: route,
             intercept_mode,
+            udp_enable,
+            udp_timeout: s.get_int("udp-timeout").unwrap_or(60) as u64,
         };
 
         Ok(settings)

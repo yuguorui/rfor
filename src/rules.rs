@@ -2,10 +2,11 @@ use anyhow::Context;
 use iprange::IpRange;
 
 use ipnet::Ipv6Net;
+use tokio::net::UdpSocket;
 use tokio::time::Instant;
 
 use std::fmt::Display;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 use tokio::{
@@ -14,7 +15,7 @@ use tokio::{
 };
 use url::Url;
 
-use crate::utils::{to_io_err, ToV6Net, ToV6SockAddr};
+use crate::utils::{rfor_bind_addr, to_io_err, ToV6Net, ToV6SockAddr};
 use crate::SETTINGS;
 
 use fast_socks5::client as socks_client;
@@ -136,22 +137,30 @@ pub enum InboundProtocol {
 }
 
 #[derive(Debug, Clone)]
+pub enum SocketType {
+    STREAM,
+    DGRAM,
+}
+
+#[derive(Debug, Clone)]
 pub struct RouteContext {
-    pub src_sock: SocketAddr,
-    pub target_addr: TargetAddr,
+    pub src_addr: SocketAddr,
+    pub dst_addr: TargetAddr,
     pub inbound_proto: Option<InboundProtocol>,
+    pub socket_type: SocketType,
 }
 
 impl Display for RouteContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:?}:{} -> {}",
+            "{:?}:{}:{:?} -> {}",
             self.inbound_proto
                 .as_ref()
                 .unwrap_or(&InboundProtocol::UNKNOWN),
-            self.src_sock,
-            self.target_addr
+            self.src_addr,
+            self.socket_type,
+            self.dst_addr
         )
     }
 }
@@ -205,7 +214,7 @@ impl RouteTable {
 
     fn match_route(&self, context: &RouteContext) -> u8 {
         for (index, cond) in self.rules.iter().enumerate() {
-            match &context.target_addr {
+            match &context.dst_addr {
                 TargetAddr::Ip(dst_sock) => {
                     if cond.match_sockaddr(dst_sock, self.ip_db.as_ref()) {
                         return index as u8;
@@ -251,45 +260,23 @@ impl RouteTable {
                 true => TcpSocket::new_v4()?,
             };
 
-            if let Some(bind_range) = &outbound.bind_range {
-                if bind_range.contains(context.src_sock.ip().to_ipv6_net().as_ref().unwrap()) {
-                    crate::tproxy::tproxy_bind_src(&sock, context.src_sock)?;
-                }
-            }
-
-            prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
-
-            match &context.target_addr {
-                TargetAddr::Ip(dst_sock) => {
-                    return Ok(sock
-                        .connect(match SETTINGS.read().await.disable_ipv6 {
-                            false => dst_sock.to_ipv6_sockaddr(),
-                            true => *dst_sock,
-                        })
-                        .await?);
-                }
-                TargetAddr::Domain(domain, port, sock_addr) => {
-                    let sock_addr = match sock_addr {
-                        Some(addr) => match SETTINGS.read().await.disable_ipv6 {
-                            false => addr.to_ipv6_sockaddr(),
-                            true => *addr,
-                        },
-                        None => {
-                            let sock = (domain.as_str(), *port)
-                                .to_socket_addrs()?
-                                .next()
-                                .expect("unreachable");
-
-                            match SETTINGS.read().await.disable_ipv6 {
-                                false => sock.to_ipv6_sockaddr(),
-                                true => sock,
-                            }
+            match context.inbound_proto.as_ref().unwrap() {
+                InboundProtocol::TPROXY => {
+                    if let Some(bind_range) = &outbound.bind_range {
+                        if bind_range
+                            .contains(context.src_addr.ip().to_ipv6_net().as_ref().unwrap())
+                        {
+                            crate::tproxy::tproxy_bind_src(&sock, context.src_addr)?;
                         }
-                    };
-                    let fut = sock.connect(sock_addr);
-                    return timeout(Duration::from_millis(TIMEOUT), fut).await?;
+                    }
+
+                    prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
                 }
+                _ => {}
             }
+
+            let sock_addr = resolve_target_addr(context.dst_addr.clone()).await?;
+            return timeout(Duration::from_millis(TIMEOUT), sock.connect(sock_addr)).await?;
         }
 
         let proxy_url = outbound.url.as_ref().unwrap();
@@ -309,11 +296,11 @@ impl RouteTable {
                         .expect("Not found default fault for this scheme.")
                 );
 
-                let target_addr = match &context.target_addr {
+                let target_addr = match &context.dst_addr {
                     TargetAddr::Ip(dst_sock) => dst_sock.ip().to_string(),
                     TargetAddr::Domain(domain, _, _) => domain.to_owned(),
                 };
-                let target_port = match context.target_addr {
+                let target_port = match context.dst_addr {
                     TargetAddr::Ip(dst_sock) => dst_sock.port(),
                     TargetAddr::Domain(_, port, _) => port,
                 };
@@ -352,24 +339,187 @@ impl RouteTable {
             }
         }
     }
+
+    pub async fn get_dgram_sock(&self, context: &RouteContext) -> tokio::io::Result<Box<dyn ProxyDgram>> {
+        let start = Instant::now();
+        let outbound_index = self.match_route(context);
+        let outbound = &self.outbounds[outbound_index as usize];
+        let duration = start.elapsed();
+        println!(
+            "{} -> Outbound({}){}",
+            context,
+            outbound.name,
+            if SETTINGS.read().await.debug {
+                format!(", time: {}us", duration.as_micros())
+            } else {
+                "".to_owned()
+            },
+        );
+
+        if outbound.url.is_none() {
+            let sock = UdpSocket::bind(rfor_bind_addr().await).await?;
+            prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
+
+            let sock_addr = resolve_target_addr(context.dst_addr.clone()).await?;
+            sock.connect(sock_addr).await?;
+
+            return Ok(Box::new(sock));
+        }
+
+        let proxy_url = outbound.url.as_ref().unwrap();
+        match proxy_url.scheme() {
+            "drop" => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Connection dropped",
+                ));
+            }
+            "socks" | "socks5" => {
+                let socks_server = format!(
+                    "{}:{}",
+                    proxy_url.host_str().unwrap(),
+                    proxy_url
+                        .port_or_known_default()
+                        .expect("Not found default fault for this scheme.")
+                );
+
+                let backing_socket = TcpStream::connect(socks_server).await.unwrap();
+
+                match proxy_url.username().is_empty() {
+                    true => {
+                        let fut = socks_client::Socks5Datagram::bind(
+                            backing_socket,
+                            rfor_bind_addr().await,
+                        );
+                        let sock = timeout(Duration::from_millis(TIMEOUT), fut)
+                            .await?
+                            .map_err(to_io_err)?;
+                        return Ok(Box::new(sock));
+                    }
+                    false => {
+                        let fut = socks_client::Socks5Datagram::bind_with_password(
+                            backing_socket,
+                            rfor_bind_addr().await,
+                            proxy_url.username(),
+                            proxy_url.password().unwrap_or(""),
+                        );
+                        let sock = timeout(Duration::from_millis(TIMEOUT), fut)
+                            .await?
+                            .map_err(to_io_err)?;
+                        return Ok(Box::new(sock));
+                    }
+                }
+            }
+            _ => {
+                panic!("only socks5 scheme is implemented.");
+            }
+        }
+    }
+
+}
+
+async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr> {
+    match target {
+        TargetAddr::Ip(addr) => {
+            let sock = match SETTINGS.read().await.disable_ipv6 {
+                false => addr.to_ipv6_sockaddr(),
+                true => addr,
+            };
+            Ok(sock)
+        },
+        TargetAddr::Domain(domain, port, osock) => {
+            let sock = match osock {
+                Some(sock) => sock,
+                None => {
+                    let sock = tokio::net::lookup_host((domain.as_str(), port))
+                        .await?
+                        .next()
+                        .expect("unreachable");
+                    match SETTINGS.read().await.disable_ipv6 {
+                        false => sock.to_ipv6_sockaddr(),
+                        true => sock,
+                    }
+                }
+            };
+            Ok(sock)
+        }
+    }
 }
 
 pub async fn prepare_socket_bypass_mangle(sockfd: i32) -> tokio::io::Result<()> {
     match &SETTINGS.read().await.intercept_mode {
-        crate::settings::InterceptMode::TPROXY {
-            direct_mark, ..
-        } | crate::settings::InterceptMode::REDIRECT {
-            direct_mark, ..
-        }=> {
+        crate::settings::InterceptMode::TPROXY { direct_mark, .. }
+        | crate::settings::InterceptMode::REDIRECT { direct_mark, .. } => {
             // Avoid local traffic looping
-            nix::sys::socket::setsockopt(
-                sockfd,
-                nix::sys::socket::sockopt::Mark,
-                &direct_mark,
-            )?;
+            nix::sys::socket::setsockopt(sockfd, nix::sys::socket::sockopt::Mark, &direct_mark)?;
         }
         crate::settings::InterceptMode::MANUAL => {}
     }
 
     Ok(())
 }
+
+#[async_trait::async_trait]
+pub trait ProxyDgram: Send + Sync {
+    async fn recv_from(&self, buf: &mut [u8]) -> tokio::io::Result<(usize, TargetAddr)>;
+    async fn send_to(&self, buf: &[u8], target: TargetAddr) -> tokio::io::Result<usize>;
+}
+
+#[async_trait::async_trait]
+impl ProxyDgram for UdpSocket {
+    async fn recv_from(&self, buf: &mut [u8]) -> tokio::io::Result<(usize, TargetAddr)> {
+        self.recv_from(buf)
+            .await
+            .map(|(size, addr)| (size, TargetAddr::Ip(addr)))
+    }
+
+    async fn send_to(&self, buf: &[u8], target: TargetAddr) -> tokio::io::Result<usize> {
+        match target {
+            TargetAddr::Ip(addr) => self.send_to(buf, addr).await,
+            TargetAddr::Domain(domain, port, osock) => {
+                let sock = match osock {
+                    Some(sock) => sock,
+                    None => {
+                        let sock = tokio::net::lookup_host((domain.as_str(), port))
+                            .await?
+                            .next()
+                            .expect("unreachable");
+                        match SETTINGS.read().await.disable_ipv6 {
+                            false => sock.to_ipv6_sockaddr(),
+                            true => sock,
+                        }
+                    }
+                };
+                self.send_to(buf, sock).await
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ProxyDgram for fast_socks5::client::Socks5Datagram<tokio::net::TcpStream> {
+    async fn recv_from(&self, buf: &mut [u8]) -> tokio::io::Result<(usize, TargetAddr)> {
+        let (size, addr) = self
+            .recv_from(buf)
+            .await
+            .map_err(|e| tokio::io::Error::new(tokio::io::ErrorKind::NetworkUnreachable, e))?;
+        Ok((
+            size,
+            match addr {
+                fast_socks5::util::target_addr::TargetAddr::Ip(addr) => TargetAddr::Ip(addr),
+                fast_socks5::util::target_addr::TargetAddr::Domain(domain, port) => {
+                    TargetAddr::Domain(domain, port, None)
+                }
+            },
+        ))
+    }
+
+    async fn send_to(&self, buf: &[u8], target: TargetAddr) -> tokio::io::Result<usize> {
+        match target {
+            TargetAddr::Ip(addr) => self.send_to(buf, addr).await,
+            TargetAddr::Domain(domain, port, _) => self.send_to(buf, (domain.as_str(), port)).await,
+        }
+        .map_err(to_io_err)
+    }
+}
+

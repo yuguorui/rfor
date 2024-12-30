@@ -1,5 +1,5 @@
 SRC_DIR := ./src
-SRC_FILES := $(wildcard $(SRC_DIR)/*.rs)
+SRC_FILES := $(shell find $(SRC_DIR) -name "*.rs")
 
 mode=debug
 ifeq ($(release),1)
