@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 
-use boomphf::Mphf;
 use ipnet::{IpNet, Ipv6Net, PrefixLenError};
-use std::fmt::Debug;
-use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpStream;
 use tokio::{
@@ -77,15 +74,6 @@ pub fn to_io_err(sock_err: fast_socks5::SocksError) -> std::io::Error {
             return std::io::Error::new(std::io::ErrorKind::Other, other_err.to_string());
         }
     };
-}
-
-/// A HashSet data structure where the mapping between keys is encoded in a Mphf. This lets us store the keys in dense
-/// arrays, with ~3 bits/item overhead in the Mphf.
-#[derive(Debug)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct BoomHashSet<K: Hash> {
-    mphf: Mphf<K>,
-    keys: Vec<K>,
 }
 
 pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> Result<()> {

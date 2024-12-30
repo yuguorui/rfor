@@ -16,7 +16,6 @@ ipnet = "2.3.1"
 url = "2.2.2"
 itertools = "0.10.3"
 fast-socks5 = { git = "https://github.com/yuguorui/fast-socks5.git", rev = "9b5480f6" }
-boomphf = "0.5.9"
 maxminddb = "0.17"
 lazy_static = "1.4.0"
 tuple = "0.5.1"
