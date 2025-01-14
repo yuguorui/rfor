@@ -286,9 +286,14 @@ async fn relay_udp_packet(
     use std::os::fd::OwnedFd;
     use tokio::net::UdpSocket;
 
+    let host = crate::sniffer::parse_host(&init_packet);
+
     let target_socket = SETTINGS.read().await.routetable.get_dgram_sock(&crate::rules::RouteContext {
             src_addr: source_sockaddr,
-            dst_addr: crate::rules::TargetAddr::Ip(target_sockaddr),
+            dst_addr: match host {
+                None => crate::rules::TargetAddr::Ip(target_sockaddr),
+                Some(host) => crate::rules::TargetAddr::Domain(host, target_sockaddr.port(), Some(target_sockaddr)),
+            },
             inbound_proto: Some(crate::rules::InboundProtocol::TPROXY),
             socket_type: crate::rules::SocketType::DGRAM,
         }).await?;

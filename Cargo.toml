@@ -1,6 +1,6 @@
 [package]
 name = "rfor"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -28,6 +28,8 @@ tls-parser = "0.11.0"
 bytes = "1"
 socket2 = "0.5.5"
 async-trait = "0.1.77"
+byteorder = "1.5.0"
+rustls = { version = "0.23.21", default-features = false, features = ["ring"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 iptables = "*"
