@@ -1,10 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use tokio::net::TcpListener;
+use socket2::{SockAddr, SockRef};
 
 use crate::{rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr, SETTINGS};
 use std::mem::MaybeUninit;
 
-fn setup_iptransparent_opts(sock: socket2::SockRef) -> std::io::Result<()> {
+fn setup_iptransparent_opts(sock: &SockRef) -> std::io::Result<()> {
     use nix::sys::socket::sockopt::IpTransparent;
     use nix::sys::socket::{self};
     use std::os::unix::io::AsRawFd;
@@ -16,7 +17,7 @@ fn setup_iptransparent_opts(sock: socket2::SockRef) -> std::io::Result<()> {
 fn setup_udpsock_opts(sock: &tokio::net::UdpSocket) -> Result<()> {
     use std::os::unix::io::AsRawFd;
 
-    setup_iptransparent_opts(socket2::SockRef::from(sock))?;
+    setup_iptransparent_opts(&SockRef::from(sock))?;
 
     let optret = match sock.local_addr()?.ip() {
         std::net::IpAddr::V4(_) => unsafe {
@@ -93,7 +94,7 @@ pub async fn tproxy_worker() -> Result<()> {
 
 async fn accept_socket_loop(listen_addr: &str) -> Result<()> {
     let listener = TcpListener::bind(listen_addr).await.context("failed to bind tcp listener")?;
-    setup_iptransparent_opts(socket2::SockRef::from(&listener)).context("failed to set IP_TRANSPARENT")?;
+    setup_iptransparent_opts(&SockRef::from(&listener)).context("failed to set IP_TRANSPARENT")?;
 
     loop {
         match listener.accept().await {
@@ -406,11 +407,11 @@ async fn relay_udp_packet(
 }
 
 pub fn tproxy_bind_src(
-    sock: &tokio::net::TcpSocket,
+    sock: SockRef,
     src_sock: std::net::SocketAddr,
 ) -> tokio::io::Result<()> {
-    setup_iptransparent_opts(socket2::SockRef::from(sock))?;
-    match sock.bind(src_sock) {
+    setup_iptransparent_opts(&sock)?;
+    match sock.bind(&SockAddr::from(src_sock)) {
         Ok(_) => {}
         Err(err) => match err.kind() {
             // In this branch, we are processing the local traffic.
@@ -418,7 +419,6 @@ pub fn tproxy_bind_src(
             _ => return Err(err),
         },
     };
-    sock.set_reuseaddr(true)?;
     Ok(())
 }
 

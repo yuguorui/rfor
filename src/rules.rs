@@ -2,6 +2,7 @@ use anyhow::Context;
 use iprange::IpRange;
 
 use ipnet::Ipv6Net;
+use socket2::SockRef;
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
 
@@ -266,7 +267,11 @@ impl RouteTable {
                         if bind_range
                             .contains(context.src_addr.ip().to_ipv6_net().as_ref().unwrap())
                         {
-                            crate::tproxy::tproxy_bind_src(&sock, context.src_addr)?;
+                            crate::tproxy::tproxy_bind_src(
+                                socket2::SockRef::from(&sock),
+                                context.src_addr,
+                            )?;
+                            sock.set_reuseaddr(true)?;
                         }
                     }
 
@@ -340,7 +345,10 @@ impl RouteTable {
         }
     }
 
-    pub async fn get_dgram_sock(&self, context: &RouteContext) -> tokio::io::Result<Box<dyn ProxyDgram>> {
+    pub async fn get_dgram_sock(
+        &self,
+        context: &RouteContext,
+    ) -> tokio::io::Result<Box<dyn ProxyDgram>> {
         let start = Instant::now();
         let outbound_index = self.match_route(context);
         let outbound = &self.outbounds[outbound_index as usize];
@@ -357,12 +365,43 @@ impl RouteTable {
         );
 
         if outbound.url.is_none() {
-            let sock = UdpSocket::bind(rfor_bind_addr().await).await?;
-            prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
+            let raw_sock = socket2::Socket::new(
+                match SETTINGS.read().await.disable_ipv6 {
+                    false => socket2::Domain::IPV6,
+                    true => socket2::Domain::IPV4,
+                },
+                socket2::Type::DGRAM,
+                None,
+            )?;
 
-            let sock_addr = resolve_target_addr(context.dst_addr.clone()).await?;
-            sock.connect(sock_addr).await?;
+            raw_sock
+                .set_nonblocking(true)
+                .expect("set nonblocking failed");
+            match context.inbound_proto.as_ref().unwrap() {
+                InboundProtocol::TPROXY => {
+                    if let Some(bind_range) = &outbound.bind_range {
+                        if bind_range
+                            .contains(context.src_addr.ip().to_ipv6_net().as_ref().unwrap())
+                        {
+                            crate::tproxy::tproxy_bind_src(
+                                SockRef::from(&raw_sock),
+                                context.src_addr,
+                            )
+                            .expect("tproxy_bind_src failed");
+                        }
+                    }
 
+                    prepare_socket_bypass_mangle(raw_sock.as_raw_fd()).await?;
+                }
+                _ => {}
+            }
+
+            let sock = UdpSocket::from_std(unsafe {
+                use std::os::fd::FromRawFd;
+                std::net::UdpSocket::from_raw_fd(raw_sock.as_raw_fd())
+            })?;
+
+            core::mem::forget(raw_sock);
             return Ok(Box::new(sock));
         }
 
@@ -415,7 +454,6 @@ impl RouteTable {
             }
         }
     }
-
 }
 
 async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr> {
@@ -426,7 +464,7 @@ async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr
                 true => addr,
             };
             Ok(sock)
-        },
+        }
         TargetAddr::Domain(domain, port, osock) => {
             let sock = match osock {
                 Some(sock) => sock,
@@ -522,4 +560,3 @@ impl ProxyDgram for fast_socks5::client::Socks5Datagram<tokio::net::TcpStream> {
         .map_err(to_io_err)
     }
 }
-
