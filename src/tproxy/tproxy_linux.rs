@@ -288,13 +288,13 @@ async fn relay_udp_packet(
     use tokio::net::UdpSocket;
 
     let host = crate::sniffer::parse_host(&init_packet);
-
+    let dst_addr = match host {
+        None => crate::rules::TargetAddr::Ip(target_sockaddr),
+        Some(host) => crate::rules::TargetAddr::Domain(host, target_sockaddr.port(), Some(target_sockaddr)),
+    };
     let target_socket = SETTINGS.read().await.routetable.get_dgram_sock(&crate::rules::RouteContext {
             src_addr: source_sockaddr,
-            dst_addr: match host {
-                None => crate::rules::TargetAddr::Ip(target_sockaddr),
-                Some(host) => crate::rules::TargetAddr::Domain(host, target_sockaddr.port(), Some(target_sockaddr)),
-            },
+            dst_addr: dst_addr.clone(),
             inbound_proto: Some(crate::rules::InboundProtocol::TPROXY),
             socket_type: crate::rules::SocketType::DGRAM,
         }).await?;
@@ -363,7 +363,7 @@ async fn relay_udp_packet(
                         sleep.as_mut().set(tokio::time::sleep(timeout));
                         match target_socket.send_to(&src_buffer[..size], crate::rules::TargetAddr::Ip(target_sockaddr)).await {
                             Ok(_) => {
-                                println!("udp relay: {:?} -> {:?} with bytes {}", source_sockaddr, target_sockaddr, size);
+                                println!("udp relay: {:?} -> {} with bytes {}", source_sockaddr, &dst_addr, size);
                             }
                             Err(e) => {
                                 println!("Failed to send udp packet to target: {}", e);
@@ -383,7 +383,7 @@ async fn relay_udp_packet(
                         sleep.as_mut().set(tokio::time::sleep(timeout));
                         match source_socket.send(&dst_buffer[..size]).await {
                             Ok(_) => {
-                                println!("udp relay: {:?} <- {:?} with bytes {}", source_sockaddr, target_sockaddr, size);
+                                println!("udp relay: {:?} <- {} with bytes {}", source_sockaddr, &dst_addr, size);
                             }
                             Err(e) => {
                                 println!("Failed to send back udp packet to source: {}", e);
