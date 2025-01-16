@@ -83,18 +83,17 @@ impl Condition {
         if let Some(reader) = ip_db {
             let region: Result<maxminddb::geoip2::Country, maxminddb::MaxMindDBError> =
                 reader.lookup(dst_ip);
-            if let Ok(region) = region {
-                if self.maxmind_regions.contains(
-                    &region
-                        .country
-                        .unwrap()
-                        .iso_code
-                        .unwrap()
-                        .to_string()
-                        .to_lowercase(),
-                ) {
-                    return true;
+            let isocode = region.and_then(|r| Ok(r.country.and_then(|c| c.iso_code)));
+            match isocode {
+                Ok(Some(isocode)) => {
+                    if self
+                        .maxmind_regions
+                        .contains(&isocode.to_string().to_lowercase())
+                    {
+                        return true;
+                    }
                 }
+                _ => {}
             }
         }
         return false;
