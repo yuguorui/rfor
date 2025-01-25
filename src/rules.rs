@@ -421,7 +421,7 @@ impl RouteTable {
                         .expect("Not found default fault for this scheme.")
                 );
 
-                let backing_socket = TcpStream::connect(socks_server).await.unwrap();
+                let backing_socket = TcpStream::connect(socks_server).await?;
 
                 match proxy_url.username().is_empty() {
                     true => {
