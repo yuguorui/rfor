@@ -1,7 +1,6 @@
-use std::sync::Arc;
-
-use fast_socks5::server::Socks5Socket;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use fast_socks5::server::Socks5ServerProtocol;
+use fast_socks5::ReplyError;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::UdpSocket;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -34,23 +33,9 @@ pub async fn socks5_worker() -> Result<()> {
         match listener.accept().await {
             Ok((mut _socket, _)) => {
                 tokio::spawn(async {
-                    let mut config = fast_socks5::server::BaseConfig::<
-                        TcpStream,
-                        fast_socks5::server::DenyAuthentication,
-                        RforRelaySocket,
-                    >::default()
-                    .with_command_executor(RforRelaySocket::default());
-
-                    config.set_dns_resolve(false);
-                    config.set_udp_support(true);
-                    let mut socks5_socket = Socks5Socket::new(_socket, Arc::new(config));
-                    socks5_socket
-                        .set_reply_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
-
-                    match socks5_socket.upgrade_to_socks5().await {
-                        Ok(_) => {}
-                        Err(e) => println!("socks5 error: {}", e),
-                    }
+                    socks5_instance(_socket).await.unwrap_or_else(|e| {
+                        println!("socks5 error: {:#}", e);
+                    });
                 });
             }
             Err(e) => println!("couldn't get client: {:?}", e),
@@ -58,76 +43,58 @@ pub async fn socks5_worker() -> Result<()> {
     }
 }
 
-#[derive(Copy, Clone, Default)]
-pub struct RforRelaySocket;
+async fn socks5_instance(socket: TcpStream) -> Result<()> {
+    let (proto, cmd, target_addr) = Socks5ServerProtocol::accept_no_auth(socket).await?
+        .read_command().await?;
 
-#[async_trait::async_trait]
-impl fast_socks5::server::CommandExecutor<TcpStream> for RforRelaySocket {
-    async fn connect(
-        &self,
-        inbound: &mut TcpStream,
-        target_addr: &fast_socks5::util::target_addr::TargetAddr,
-        _timeout: u64,
-        _nodelay: bool,
-    ) -> fast_socks5::Result<()> {
-        inbound
-            .write(&fast_socks5::server::new_reply(
-                &fast_socks5::ReplyError::Succeeded,
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 0),
-            ))
-            .await
-            .context("Can't write successful reply")?;
+    let empty_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0));
+    let empty_sockaddr = std::net::SocketAddr::new(empty_ip, 0);
+    match cmd {
+        fast_socks5::Socks5Command::TCPConnect => {
+            let mut inner = proto.reply_success(empty_sockaddr).await?;
+            let src_addr = inner.peer_addr()?;
 
-        inbound.flush().await.context("Can't flush the reply!")?;
+            let context = match target_addr {
+                fast_socks5::util::target_addr::TargetAddr::Ip(sock_addr) => RouteContext {
+                    src_addr: src_addr,
+                    dst_addr: crate::rules::TargetAddr::Ip(sock_addr.to_owned()),
+                    inbound_proto: Some(InboundProtocol::SOCKS5),
+                    socket_type: crate::rules::SocketType::STREAM,
+                },
+                fast_socks5::util::target_addr::TargetAddr::Domain(domain, port) => RouteContext {
+                    src_addr: src_addr,
+                    dst_addr: crate::rules::TargetAddr::Domain(
+                        domain.to_owned(),
+                        port.to_owned(),
+                        None,
+                    ),
+                    inbound_proto: Some(InboundProtocol::SOCKS5),
+                    socket_type: crate::rules::SocketType::STREAM,
+                },
+            };
 
-        let context = match target_addr {
-            fast_socks5::util::target_addr::TargetAddr::Ip(sock_addr) => RouteContext {
-                src_addr: inbound.peer_addr()?,
-                dst_addr: crate::rules::TargetAddr::Ip(sock_addr.to_owned()),
-                inbound_proto: Some(InboundProtocol::SOCKS5),
-                socket_type: crate::rules::SocketType::STREAM,
-            },
-            fast_socks5::util::target_addr::TargetAddr::Domain(domain, port) => RouteContext {
-                src_addr: inbound.peer_addr()?,
-                dst_addr: crate::rules::TargetAddr::Domain(
-                    domain.to_owned(),
-                    port.to_owned(),
-                    None,
-                ),
-                inbound_proto: Some(InboundProtocol::SOCKS5),
-                socket_type: crate::rules::SocketType::STREAM,
-            },
-        };
-        transfer_tcp(inbound, context).await?;
+            transfer_tcp(&mut inner, context.clone()).await.with_context(
+                || format!("failed to relay {}", context),
+            )?;
+        }
+        fast_socks5::Socks5Command::TCPBind => {
+            proto.reply_error(&ReplyError::CommandNotSupported).await?;
+            return Err(ReplyError::CommandNotSupported.into());
+        }
+        fast_socks5::Socks5Command::UDPAssociate => {
+            // Listen with UDP6 socket, so the client can connect to it with either
+            // IPv4 or IPv6.
+            let peer_sock = UdpSocket::bind("[::]:0").await?;
 
-        Ok(())
+            let mut inner = proto.reply_success(std::net::SocketAddr::new(
+                empty_ip, peer_sock.local_addr().unwrap().port())
+            ).await?;
+
+            transfer_udp(&mut inner, peer_sock).await?;
+        }
     }
 
-    /// Bind to a random UDP port, wait for the traffic from
-    /// the client, and then forward the data to the remote addr.
-    async fn udp_associate(
-        &self,
-        inbound: &mut TcpStream,
-        _: Option<&fast_socks5::util::target_addr::TargetAddr>,
-        reply_ip: std::net::IpAddr,
-    ) -> fast_socks5::Result<()> {
-
-        // Listen with UDP6 socket, so the client can connect to it with either
-        // IPv4 or IPv6.
-        let peer_sock = UdpSocket::bind("[::]:0").await?;
-
-        // Respect the pre-populated reply IP address.
-        inbound
-            .write(&fast_socks5::server::new_reply(
-                &fast_socks5::ReplyError::Succeeded,
-                std::net::SocketAddr::new(reply_ip, peer_sock.local_addr()?.port()),
-            ))
-            .await
-            .context("Can't write successful reply")?;
-
-        transfer_udp(inbound, peer_sock).await?;
-        Ok(())
-    }
+    Ok(())
 }
 
 async fn handle_udp_request(inbound: &UdpSocket, outbound: &dyn ProxyDgram) -> Result<()> {
