@@ -139,11 +139,10 @@ fn __setup_nat_iptables(
     proxy_chain: &str,
     redirect_port: u16,
     direct_mark: u32,
-    ports: &[u16],
+    ports: &str,
     local_traffic: bool,
     reserved_ip: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use itertools::Itertools;
 
     let table = "nat";
 
@@ -171,7 +170,7 @@ fn __setup_nat_iptables(
         proxy_chain,
         &format!(
             "-p tcp --match multiport --dports {} -j REDIRECT --to-ports {}",
-            ports.into_iter().map(|v| v.to_string()).join(","),
+            ports,
             redirect_port,
         ),
     )?;
@@ -188,7 +187,7 @@ async fn set_nat_iptables(
     proxy_chain: &str,
     redirect_port: u16,
     direct_mark: u32,
-    ports: &[u16],
+    ports: &str,
     local_traffic: bool,
 ) -> Result<()> {
     __setup_nat_iptables(

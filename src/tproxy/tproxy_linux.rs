@@ -568,12 +568,11 @@ fn __setup_iptables(
     tproxy_port: u16,
     xmark: u32,
     direct_mark: u32,
-    ports: &[u16],
+    ports: &str,
     local_traffic: bool,
     udp_enable: bool,
     reserved_ip: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use itertools::Itertools;
 
     let table = "mangle";
     ipt.new_chain(table, proxy_chain)?;
@@ -600,7 +599,7 @@ fn __setup_iptables(
         proxy_chain,
         &format!(
             "-p tcp --match multiport --dports {} -j TPROXY --tproxy-mark {} --on-port {}",
-            ports.into_iter().map(|v| v.to_string()).join(","),
+            ports,
             xmark,
             tproxy_port,
         ),
@@ -612,7 +611,7 @@ fn __setup_iptables(
             proxy_chain,
             &format!(
                 "-p udp --match multiport --dports {} -j TPROXY --tproxy-mark {} --on-port {}",
-                ports.into_iter().map(|v| v.to_string()).join(","),
+                ports,
                 xmark,
                 tproxy_port,
             ),
@@ -624,7 +623,7 @@ fn __setup_iptables(
         proxy_chain,
         &format!(
             "-p tcp --match multiport --sports {} -j MARK --set-mark {}",
-            ports.into_iter().map(|v| v.to_string()).join(","),
+            ports,
             xmark,
         ),
     )?;
@@ -656,7 +655,7 @@ fn __setup_iptables(
             mark_chain,
             &format!(
                 "-p tcp --match multiport --dports {} -j MARK --set-mark {}",
-                ports.into_iter().map(|v| v.to_string()).join(","),
+                ports,
                 xmark,
             ),
         )?;
@@ -667,7 +666,7 @@ fn __setup_iptables(
                 mark_chain,
                 &format!(
                     "-p udp --match multiport --dports {} -j MARK --set-mark {}",
-                    ports.into_iter().map(|v| v.to_string()).join(","),
+                    ports,
                     xmark,
                 ),
             )?;
@@ -684,7 +683,7 @@ async fn set_iptables(
     tproxy_port: u16,
     xmark: u32,
     direct_mark: u32,
-    ports: &[u16],
+    ports: &str,
     local_traffic: bool,
 ) -> Result<()> {
     __setup_iptables(

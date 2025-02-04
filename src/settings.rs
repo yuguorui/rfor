@@ -35,7 +35,7 @@ struct Args {
 pub enum InterceptMode {
     TPROXY {
         local_traffic: bool,
-        ports: Vec<u16>,
+        ports: String,
         proxy_mark: u32,
         direct_mark: u32,
         proxy_chain: String,
@@ -44,7 +44,7 @@ pub enum InterceptMode {
     },
     REDIRECT {
         local_traffic: bool,
-        ports: Vec<u16>,
+        ports: String,
         direct_mark: u32,
         proxy_chain: String,
     },
@@ -155,6 +155,46 @@ impl Settings {
     }
 }
 
+fn santize_port_ranges(s: &Vec<config::Value>) -> Vec<[u16; 2]> {
+    let mut ranges = s.iter()
+        .map(|v| {
+            let v = v.clone().into_str().expect("port must be a string");
+            if !v.contains("-") {
+                let v = v.parse::<u16>().expect("port must contain a number");
+                return [v, v];
+            }
+
+            let (start, end) = v.split("-").collect_tuple::<_>().expect("port range must be start-end");
+            let start = start.parse::<u16>().expect("start must be a number");
+            let end = end.parse::<u16>().expect("end must be a number");
+            return [start, end];
+        })
+        .collect::<Vec<_>>();
+
+    // reduce the ranges
+    ranges.sort();
+    let mut i = 0;
+    while i < ranges.len() - 1 {
+        if ranges[i][1] >= ranges[i + 1][0] {
+            ranges[i][1] = ranges[i + 1][1];
+            ranges.remove(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    return ranges;
+}
+
+fn port_range_to_string(ranges: &[[u16; 2]]) -> String {
+    ranges.iter().map(|r| {
+        if r[0] == r[1] {
+            r[0].to_string()
+        } else {
+            format!("{}:{}", r[0], r[1])
+        }
+    }).join(",")
+}
+
 fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
     match s.get_table("traffic-intercept") {
         Err(_) => return Ok(InterceptMode::MANUAL),
@@ -179,15 +219,14 @@ fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
                         })
                         .unwrap_or(false);
 
-                    let ports: Vec<u16> = table
-                        .get("ports")
-                        .and_then(|v| {
-                            Some(v.clone().into_array().expect("ports field need a vector"))
-                        })
-                        .unwrap_or(vec![])
-                        .into_iter()
-                        .map(|v| v.into_int().expect("ports field need a vector of ints") as u16)
-                        .collect();
+                    let ports = table.get("ports").and_then(|v| {
+                        let ranges = santize_port_ranges(
+                            &v.clone().into_array().expect("ports field need an array"),
+                        );
+
+                        let ports_str = port_range_to_string(&ranges);
+                        Some(ports_str)
+                    });
 
                     let proxy_mark = table
                         .get("proxy-mark")
@@ -250,7 +289,7 @@ fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
                     if mode.as_str() != "redirect" {
                         return Ok(InterceptMode::TPROXY {
                             local_traffic: capture_local_traffic,
-                            ports,
+                            ports: ports.unwrap_or_default(),
                             proxy_mark,
                             direct_mark,
                             proxy_chain,
@@ -260,7 +299,7 @@ fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
                     } else {
                         return Ok(InterceptMode::REDIRECT {
                             local_traffic: capture_local_traffic,
-                            ports,
+                            ports: ports.unwrap_or_default(),
                             direct_mark,
                             proxy_chain,
                         });
