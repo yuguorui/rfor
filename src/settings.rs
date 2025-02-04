@@ -61,6 +61,7 @@ pub struct Settings {
     pub intercept_mode: InterceptMode,
     pub udp_enable: bool,
     pub udp_timeout: u64,
+    pub udp_fullcone: bool,
 }
 
 impl Settings {
@@ -147,6 +148,7 @@ impl Settings {
             intercept_mode,
             udp_enable,
             udp_timeout: s.get_int("udp-timeout").unwrap_or(60) as u64,
+            udp_fullcone: s.get_bool("udp-fullcone").unwrap_or(false),
         };
 
         Ok(settings)
