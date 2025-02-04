@@ -35,7 +35,7 @@ pub struct Outbound {
 pub struct Condition {
     pub maxmind_regions: Vec<String>,
     pub dst_ip_range: IpRange<Ipv6Net>,
-    pub domains: Option<std::collections::HashSet<String>>,
+    pub domains: Option<aho_corasick::AhoCorasick>,
 }
 
 impl Condition {
@@ -49,17 +49,10 @@ impl Condition {
 
     pub fn match_domain(&self, name: &str) -> bool {
         if let Some(ref domains) = self.domains {
-            if domains.get(&name.to_owned()).is_some() {
+            if domains.is_match(&name.to_owned())
+                || domains.is_match(&format!(".{name}{RULE_DOMAIN_SUFFIX_TAG}"))
+                || domains.is_match(&format!("^{}$", name)) {
                 return true;
-            }
-
-            /* Check the DOMAIN-SUFFIX rules */
-            let domain = format!(".{}{}", name, RULE_DOMAIN_SUFFIX_TAG);
-            let indices = domain.match_indices(".");
-            for index in indices {
-                if domains.get(&domain[index.0 + 1..].to_string()).is_some() {
-                    return true;
-                }
             }
         }
 

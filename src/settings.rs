@@ -396,10 +396,10 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                                 crate::protos::common::Domain_Type::Regex => { /* Not supported. */
                                 }
                                 crate::protos::common::Domain_Type::RootDomain => {
-                                    domains.insert(d.value.to_owned() + RULE_DOMAIN_SUFFIX_TAG);
+                                    domains.insert(format!(".{}{}", d.value, RULE_DOMAIN_SUFFIX_TAG));
                                 }
                                 crate::protos::common::Domain_Type::Full => {
-                                    domains.insert(d.value.to_owned());
+                                    domains.insert(format!("^{}$", d.value));
                                 }
                             }
                         })
@@ -429,7 +429,7 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
 
     for (i, v) in domain_sets.iter().enumerate() {
         let cond = route.rules.get_mut(i).unwrap();
-        cond.domains = Some(v.clone());
+        cond.domains = Some(aho_corasick::AhoCorasick::new(v.iter()).unwrap());
     }
 
     Ok(())
