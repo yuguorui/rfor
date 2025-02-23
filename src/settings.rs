@@ -372,16 +372,15 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                                 geoip.cidr.iter().for_each(|cidr| {
                                     match cidr.ip.len() {
                                         4 => {
-                                            cond.dst_ip_range.add(
-                                                ipnet::Ipv6Net::new(
-                                                    Ipv4Addr::from(
-                                                        vec_to_array(cidr.ip.to_owned()).unwrap(),
-                                                    )
-                                                    .to_ipv6_mapped(),
-                                                    cidr.prefix.try_into().unwrap(),
+                                            let net = ipnet::Ipv6Net::new(
+                                                Ipv4Addr::from(
+                                                    vec_to_array(cidr.ip.to_owned()).unwrap(),
                                                 )
-                                                .unwrap(),
-                                            );
+                                                .to_ipv6_mapped(),
+                                                cidr.prefix as u8 + (128 - 32),
+                                            )
+                                            .unwrap();
+                                            cond.dst_ip_range.add(net);
                                         }
                                         16 => {
                                             cond.dst_ip_range.add(
@@ -389,7 +388,7 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                                                     Ipv6Addr::from(
                                                         vec_to_array(cidr.ip.to_owned()).unwrap(),
                                                     ),
-                                                    cidr.prefix.try_into().unwrap(),
+                                                    cidr.prefix as u8,
                                                 )
                                                 .unwrap(),
                                             );
@@ -398,6 +397,7 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                                     };
                                 });
                             });
+                            cond.dst_ip_range.simplify();
                     }
                     _ => {
                         return Err(ConfigError::Message(format!(
