@@ -425,7 +425,7 @@ async fn relay_udp_packet(
 
                         let r = match addr {
                             crate::rules::TargetAddr::Ip(addr) | crate::rules::TargetAddr::Domain(_, _, Some(addr)) => {
-                                match addr == target_sockaddr {
+                                match addr.to_ipv6_sockaddr() == target_sockaddr.to_ipv6_sockaddr() {
                                     true => {
                                         println!("udp relay: {:?} <- {} with bytes {}", source_sockaddr, dst_addr, size);
                                         source_socket.send(&dst_buffer[..size]).await
@@ -447,7 +447,7 @@ async fn relay_udp_packet(
                                                 }
                                             }
                                         } else {
-                                            println!("udp relay: {:?} <- {} with bytes {} discarded, since from unexpected target", source_sockaddr, addr, size);
+                                            println!("udp relay: {:?} <- {} with bytes {} discarded, since from unexpected target (expect {})", source_sockaddr, addr, size, target_sockaddr);
                                             Ok(0 as usize)
                                         }
                                     },
