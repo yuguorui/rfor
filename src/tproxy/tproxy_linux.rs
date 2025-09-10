@@ -424,7 +424,7 @@ async fn relay_udp_packet(
                         sleep.as_mut().set(tokio::time::sleep(timeout));
 
                         let r = match addr {
-                            crate::rules::TargetAddr::Ip(addr) => {
+                            crate::rules::TargetAddr::Ip(addr) | crate::rules::TargetAddr::Domain(_, _, Some(addr)) => {
                                 match addr == target_sockaddr {
                                     true => {
                                         println!("udp relay: {:?} <- {} with bytes {}", source_sockaddr, dst_addr, size);
@@ -453,7 +453,10 @@ async fn relay_udp_packet(
                                     },
                                 }
                             }
-                            crate::rules::TargetAddr::Domain(_, _, _) => Ok(0 as usize)
+                            crate::rules::TargetAddr::Domain(_, _, _) => {
+                                println!("udp relay: {:?} <- {} with bytes {} discarded, since from unexpected domain", source_sockaddr, addr, size);
+                                Ok(0 as usize)
+                            }
                         };
 
                         match r {
