@@ -15,7 +15,7 @@ iprange = "0.6.6"
 ipnet = "2.3.1"
 url = "2.2.2"
 itertools = "0.10.3"
-fast-socks5 = { git = "https://github.com/valpackett/fast-socks5.git", rev = "4c8985c" }
+fast-socks5 = { version = "1.0.0-rc.0" }
 maxminddb = "0.17"
 lazy_static = "1.4.0"
 tuple = "0.5.1"
