@@ -3,6 +3,6 @@ config.*ml
 *.mmdb
 geoip.dat
 geosite.dat
-src/protos/common.rs
+src/protos/
 .gitback/
 rfor-*.tar.gz
