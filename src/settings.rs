@@ -68,6 +68,8 @@ pub struct Settings {
     pub udp_fullcone_socket_timeout: u64,
     /// Maximum new fullcone connections per second per session (0 = unlimited)
     pub udp_fullcone_rate_limit: u32,
+    /// Maximum number of concurrent UDP sessions (0 = unlimited)
+    pub udp_max_sessions: usize,
 }
 
 impl Settings {
@@ -119,6 +121,7 @@ impl Settings {
             udp_fullcone_max_sockets: s.get_int("udp-fullcone-max-sockets").unwrap_or(64) as usize,
             udp_fullcone_socket_timeout: s.get_int("udp-fullcone-socket-timeout").unwrap_or(30) as u64,
             udp_fullcone_rate_limit: s.get_int("udp-fullcone-rate-limit").unwrap_or(10) as u32,
+            udp_max_sessions: s.get_int("udp-max-sessions").unwrap_or(1024) as usize,
         };
 
         // Validate settings

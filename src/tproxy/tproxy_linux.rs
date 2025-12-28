@@ -1,21 +1,31 @@
 use anyhow::{anyhow, Context, Result};
 use socket2::{SockAddr, SockRef};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 
 use tracing::{error, info, warn, debug};
 
 use crate::{rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr, get_settings};
 use std::{collections::hash_map, mem::MaybeUninit, os::fd::BorrowedFd, sync::Arc, time::Instant};
 
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 
 /// Key for UDP session mapping: (source_addr, target_addr)
 type UdpSessionKey = (std::net::SocketAddr, std::net::SocketAddr);
 
-/// Global map to track active UDP sessions, preventing duplicate session creation
-static UDP_SESSIONS: Lazy<RwLock<std::collections::HashSet<UdpSessionKey>>> = 
-    Lazy::new(|| RwLock::new(std::collections::HashSet::new()));
+/// UDP session entry containing a channel sender for forwarding packets
+struct UdpSessionEntry {
+    /// Channel sender for forwarding packets to the session handler
+    packet_tx: mpsc::Sender<bytes::Bytes>,
+}
+
+/// Channel buffer size for forwarding packets to existing sessions
+const UDP_SESSION_CHANNEL_SIZE: usize = 32;
+
+/// Global map to track active UDP sessions with packet forwarding channels
+static UDP_SESSIONS: Lazy<DashMap<UdpSessionKey, UdpSessionEntry>> = 
+    Lazy::new(|| DashMap::new());
 
 fn setup_iptransparent_opts(sock: &SockRef) -> std::io::Result<()> {
     use nix::sys::socket::sockopt::IpTransparent;
@@ -84,7 +94,7 @@ async fn udp_session_stats_logger() {
     
     loop {
         interval.tick().await;
-        let session_count = UDP_SESSIONS.read().await.len();
+        let session_count = UDP_SESSIONS.len();
         if session_count > 0 {
             info!("udp stats: active_sessions={}", session_count);
         }
@@ -261,10 +271,14 @@ fn recvmsg_wrapper(
 async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     use tokio::io::Interest;
+    use dashmap::mapref::entry::Entry;
 
-    if !get_settings().read().await.udp_enable {
+    let settings = get_settings().read().await;
+    if !settings.udp_enable {
         return Ok(());
     }
+    let max_sessions = settings.udp_max_sessions;
+    drop(settings);
 
     let udp_socket = tokio::net::UdpSocket::bind(listen_addr).await?;
     setup_udpsock_opts(&udp_socket)?;
@@ -289,59 +303,85 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
                     target_sockaddr.to_ipv6_sockaddr(),
                 );
 
-                // Check if session already exists
-                {
-                    let sessions = UDP_SESSIONS.read().await;
-                    if sessions.contains(&session_key) {
-                        // Session already exists, this packet will be handled by the existing session
-                        // This can happen due to race conditions, so we just log and continue
-                        debug!(
-                            "udp relay: session already exists {:?} <-> {:?}, packet may be handled by existing session",
-                            source_sockaddr, target_sockaddr
-                        );
-                        continue;
-                    }
-                }
-
-                // Try to acquire the session
-                {
-                    let mut sessions = UDP_SESSIONS.write().await;
-                    if sessions.contains(&session_key) {
-                        // Another task created the session between our read and write lock
-                        debug!(
-                            "udp relay: session created by another task {:?} <-> {:?}",
-                            source_sockaddr, target_sockaddr
-                        );
-                        continue;
-                    }
-                    sessions.insert(session_key);
-                }
-
                 let prefilled_data = bytes::Bytes::copy_from_slice(&buffer[..size]);
 
-                info!(
-                    "udp relay: create tunnel {:?} <-> {:?}",
-                    source_sockaddr, target_sockaddr
-                );
+                // Check max sessions limit before attempting entry (avoid calling len() inside entry())
+                if max_sessions > 0 && UDP_SESSIONS.len() >= max_sessions {
+                    warn!(
+                        "udp relay: max sessions limit ({}) reached, dropping new session {:?} <-> {:?}",
+                        max_sessions, source_sockaddr, target_sockaddr
+                    );
+                    continue;
+                }
 
-                let prefilled_data_clone = prefilled_data.clone();
-                tokio::spawn(async move {
-                    let result = relay_udp_packet(prefilled_data_clone, source_sockaddr, target_sockaddr)
-                        .await;
-
-                    // Always remove the session when done
-                    {
-                        let mut sessions = UDP_SESSIONS.write().await;
-                        sessions.remove(&(
-                            source_sockaddr.to_ipv6_sockaddr(),
-                            target_sockaddr.to_ipv6_sockaddr(),
-                        ));
+                // Use DashMap entry API to atomically check and insert
+                match UDP_SESSIONS.entry(session_key) {
+                    Entry::Occupied(entry) => {
+                        // Session already exists, forward packet through channel
+                        let session = entry.get();
+                        match session.packet_tx.try_send(prefilled_data) {
+                            Ok(_) => {
+                                debug!(
+                                    "udp relay: forwarded packet to existing session {:?} <-> {:?}, {} bytes",
+                                    source_sockaddr, target_sockaddr, size
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                warn!(
+                                    "udp relay: channel full for session {:?} <-> {:?}, packet dropped",
+                                    source_sockaddr, target_sockaddr
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                // Session is closing, remove stale entry and let next packet create new session
+                                drop(entry);
+                                UDP_SESSIONS.remove(&session_key);
+                                debug!(
+                                    "udp relay: removed stale session {:?} <-> {:?}",
+                                    source_sockaddr, target_sockaddr
+                                );
+                            }
+                        }
+                        continue;
                     }
+                    Entry::Vacant(entry) => {
+                        // Create new session with channel
+                        let (tx, rx) = mpsc::channel(UDP_SESSION_CHANNEL_SIZE);
 
-                    if let Err(e) = result {
-                        error!("Failed to relay udp packet: {}", e);
+                        // Use try_send since channel should be empty (freshly created)
+                        if let Err(e) = tx.try_send(prefilled_data) {
+                            error!("Failed to send init packet to new session: {}", e);
+                            continue;
+                        }
+
+                        entry.insert(UdpSessionEntry {
+                            packet_tx: tx,
+                        });
+
+                        info!(
+                            "udp relay: create tunnel {:?} <-> {:?} (active sessions: {})",
+                            source_sockaddr, target_sockaddr, UDP_SESSIONS.len()
+                        );
+
+                        tokio::spawn(async move {
+                            let result = relay_udp_packet(
+                                rx,
+                                source_sockaddr,
+                                target_sockaddr,
+                            ).await;
+
+                            // Always remove the session when done (DashMap remove is lock-free)
+                            UDP_SESSIONS.remove(&(
+                                source_sockaddr.to_ipv6_sockaddr(),
+                                target_sockaddr.to_ipv6_sockaddr(),
+                            ));
+
+                            if let Err(e) = result {
+                                error!("Failed to relay udp packet: {}", e);
+                            }
+                        });
                     }
-                });
+                }
             }
             Err(e) => {
                 return Err(e.into());
@@ -363,7 +403,7 @@ async fn udp_socket_bind_to_any_with_flag(
     let bind_sockaddr = if disable_ipv6 {
         bind_sockaddr
     } else {
-            bind_sockaddr.to_ipv6_sockaddr()
+        bind_sockaddr.to_ipv6_sockaddr()
     };
 
     let fd;
@@ -427,11 +467,10 @@ async fn udp_socket_bind_to_any_with_flag(
 }
 
 async fn relay_udp_packet(
-    init_packet: bytes::Bytes,
+    mut packet_rx: mpsc::Receiver<bytes::Bytes>,
     source_sockaddr: std::net::SocketAddr,
     target_sockaddr: std::net::SocketAddr,
 ) -> Result<()> {
-    // Cache settings at the beginning to avoid repeated async lock acquisitions
     let settings = get_settings().read().await;
     let udp_fullcone = settings.udp_fullcone;
     let udp_timeout = settings.udp_timeout;
@@ -441,6 +480,14 @@ async fn relay_udp_packet(
     let disable_ipv6 = settings.disable_ipv6;
     drop(settings);
 
+    // Wait for the first packet to determine the destination address (for domain sniffing)
+    let init_packet = match packet_rx.recv().await {
+        Some(packet) => packet,
+        None => {
+            return Ok(());
+        }
+    };
+
     let host = crate::sniffer::parse_host(&init_packet);
     let dst_addr = match host {
         None => crate::rules::TargetAddr::Ip(target_sockaddr),
@@ -448,6 +495,7 @@ async fn relay_udp_packet(
             crate::rules::TargetAddr::Domain(host, target_sockaddr.port(), Some(target_sockaddr))
         }
     };
+
     let target_socket = get_settings()
         .read()
         .await
@@ -460,12 +508,12 @@ async fn relay_udp_packet(
         })
         .await?;
 
-    // 2. prepare the intermediate socket which is connect to the source, which should bind to the target address,
+    // Prepare the intermediate socket which is connected to the source, which should bind to the target address,
     // and pretend to be the target.
     let source_socket = udp_socket_bind_to_any_with_flag(target_sockaddr, disable_ipv6).await?;
     source_socket.connect(source_sockaddr).await?;
 
-    // source_socket is ready and the new reply from target_sockaddr will be recv by the source_socket
+    // Send the first packet
     target_socket
         .send_to(&init_packet, crate::rules::TargetAddr::Ip(target_sockaddr))
         .await?;
@@ -532,6 +580,19 @@ async fn relay_udp_packet(
     let mut src_buffer = [0 as u8; BUFFER_SIZE];
     loop {
         tokio::select! {
+            // Handle packets forwarded from other tasks via channel
+            Some(packet) = packet_rx.recv() => {
+                sleep.as_mut().set(tokio::time::sleep(timeout));
+                match target_socket.send_to(&packet, crate::rules::TargetAddr::Ip(target_sockaddr)).await {
+                    Ok(_) => {
+                        debug!("udp relay (forwarded): {:?} -> {} with bytes {}",
+                               source_sockaddr, &dst_addr, packet.len());
+                    }
+                    Err(e) => {
+                        error!("Failed to send forwarded udp packet to target: {}", e);
+                    }
+                }
+            },
             data = source_socket.recv(&mut src_buffer) => {
                 match data {
                     Ok(size) => {
@@ -587,11 +648,9 @@ async fn relay_udp_packet(
                                 let is_expected_target = resp_ip.to_ipv6_sockaddr() == target_sockaddr.to_ipv6_sockaddr();
 
                                 if is_expected_target {
-                                    debug!("udp relay: {:?} <- {} with bytes {}", source_sockaddr, dst_addr, size);
                                     source_socket.send(&dst_buffer[..size]).await
                                 } else if udp_fullcone {
                                     // Full-cone NAT: accept packets from non-original addresses
-                                    debug!("udp relay (fullcone): {:?} <- {} with bytes {}", source_sockaddr, resp_ip, size);
 
                                     match socket_sets.get_mut(&resp_ip) {
                                         Some(entry) => {
@@ -602,21 +661,19 @@ async fn relay_udp_packet(
                                         None => {
                                             // Rate limit check for new socket creation
                                             if !rate_limiter.try_acquire() {
-                                                debug!("Rate limited: dropping fullcone packet from {}", resp_ip);
                                                 Ok(0)
                                             } else {
-                                                // Check if we've reached the maximum number of sockets
-                                                if fullcone_max_sockets > 0 && socket_sets.len() >= fullcone_max_sockets {
-                                                    // Evict the least recently used socket
-                                                    if let Some(oldest_addr) = socket_sets
-                                                        .iter()
-                                                        .min_by_key(|(_, entry)| entry.last_active)
-                                                        .map(|(addr, _)| *addr)
-                                                    {
-                                                        debug!("Evicting LRU fullcone socket for {}", oldest_addr);
-                                                        socket_sets.remove(&oldest_addr);
+                                                    // Check if we've reached the maximum number of sockets
+                                                    if fullcone_max_sockets > 0 && socket_sets.len() >= fullcone_max_sockets {
+                                                        // Evict the least recently used socket
+                                                        if let Some(oldest_addr) = socket_sets
+                                                            .iter()
+                                                            .min_by_key(|(_, entry)| entry.last_active)
+                                                            .map(|(addr, _)| *addr)
+                                                        {
+                                                            socket_sets.remove(&oldest_addr);
+                                                        }
                                                     }
-                                                }
 
                                                 // Create new socket with graceful error handling
                                                 match udp_socket_bind_to_any_with_flag(resp_ip, disable_ipv6).await {
@@ -645,14 +702,10 @@ async fn relay_udp_packet(
                                         }
                                     }
                                 } else {
-                                    debug!("udp relay: {:?} <- {} with bytes {} discarded, since from unexpected target (expect {})", 
-                                           source_sockaddr, resp_ip, size, target_sockaddr);
                                     Ok(0 as usize)
                                 }
                             }
                             None => {
-                                debug!("udp relay: {:?} <- {} with bytes {} discarded, unable to resolve address", 
-                                       source_sockaddr, addr, size);
                                 Ok(0 as usize)
                             }
                         };
@@ -674,23 +727,9 @@ async fn relay_udp_packet(
             _ = cleanup_interval.tick() => {
                 // Cleanup stale fullcone sockets based on per-socket timeout
                 let now = Instant::now();
-                let before_count = socket_sets.len();
-                socket_sets.retain(|addr, entry| {
-                    let should_keep = now.duration_since(entry.last_active) < socket_idle_timeout;
-                    if !should_keep {
-                        debug!("Removing idle fullcone socket for {}", addr);
-                    }
-                    should_keep
+                socket_sets.retain(|_addr, entry| {
+                    now.duration_since(entry.last_active) < socket_idle_timeout
                 });
-                let after_count = socket_sets.len();
-                
-                // Log fullcone socket stats for this session if there are any
-                if after_count > 0 || before_count != after_count {
-                    debug!(
-                        "udp session {:?} -> {:?}: fullcone_sockets={} (removed={})",
-                        source_sockaddr, target_sockaddr, after_count, before_count - after_count
-                    );
-                }
             },
             _ = &mut sleep => {
                 break;
