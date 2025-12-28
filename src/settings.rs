@@ -81,7 +81,7 @@ impl Settings {
         parse_outbounds(&mut s, &mut route)?;
 
         /* 3. Populate the DIRECT/DROP rule. */
-        ensure_default_outbounds(&mut route);
+        ensure_default_outbounds(&mut route)?;
 
         /* 4. Parse the actual rules. */
         parse_route_rules(&mut s, &mut route)?;
@@ -192,16 +192,18 @@ fn cidr_to_ipv6net(cidr: &crate::protos::common::CIDR) -> Option<ipnet::Ipv6Net>
     }
 }
 
-fn ensure_default_outbounds(route: &mut RouteTable) {
+fn ensure_default_outbounds(route: &mut RouteTable) -> Result<(), ConfigError> {
     if route.get_outbound_by_name(DIRECT_OUTBOUND_NAME).is_none() {
         route.add_empty_rule(DIRECT_OUTBOUND_NAME.to_owned(), None, None);
     }
 
     if route.get_outbound_by_name(DROP_OUTBOUND_NAME).is_none() {
-        let drop_url = "drop://0.0.0.0".parse()
-            .expect("drop://0.0.0.0 is a valid URL");
+        let drop_url: url::Url = "drop://0.0.0.0".parse()
+            .map_err(|e| ConfigError::Message(format!("Failed to parse drop URL: {}", e)))?;
         route.add_empty_rule(DROP_OUTBOUND_NAME.to_owned(), Some(drop_url), None);
     }
+
+    Ok(())
 }
 
 fn validate_settings(settings: &Settings) -> Result<(), ConfigError> {
@@ -217,21 +219,26 @@ fn validate_settings(settings: &Settings) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn sanitize_port_ranges(s: &Vec<config::Value>) -> Vec<[u16; 2]> {
+fn sanitize_port_ranges(s: &Vec<config::Value>) -> Result<Vec<[u16; 2]>, ConfigError> {
     let mut ranges = s.iter()
         .map(|v| {
-            let v = v.clone().into_str().expect("port must be a string");
+            let v = v.clone().into_str()
+                .map_err(|e| ConfigError::Message(format!("port must be a string: {}", e)))?;
             if !v.contains("-") {
-                let v = v.parse::<u16>().expect("port must contain a number");
-                return [v, v];
+                let v = v.parse::<u16>()
+                    .map_err(|e| ConfigError::Message(format!("port must contain a number: {}", e)))?;
+                return Ok([v, v]);
             }
 
-            let (start, end) = v.split("-").collect_tuple::<_>().expect("port range must be start-end");
-            let start = start.parse::<u16>().expect("start must be a number");
-            let end = end.parse::<u16>().expect("end must be a number");
-            return [start, end];
+            let (start, end) = v.split("-").collect_tuple::<(&str, &str)>()
+                .ok_or_else(|| ConfigError::Message("port range must be start-end".to_string()))?;
+            let start = start.parse::<u16>()
+                .map_err(|e| ConfigError::Message(format!("start must be a number: {}", e)))?;
+            let end = end.parse::<u16>()
+                .map_err(|e| ConfigError::Message(format!("end must be a number: {}", e)))?;
+            return Ok([start, end]);
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
 
     // reduce the ranges
     ranges.sort();
@@ -244,7 +251,7 @@ fn sanitize_port_ranges(s: &Vec<config::Value>) -> Vec<[u16; 2]> {
             i += 1;
         }
     }
-    return ranges;
+    Ok(ranges)
 }
 
 fn port_range_to_string(ranges: &[[u16; 2]]) -> String {
@@ -277,14 +284,16 @@ fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
                 .and_then(|v| v.clone().into_bool().ok())
                 .unwrap_or(false);
 
-            let ports = table.get("ports")
-                .and_then(|v| {
-                    v.clone().into_array().ok().and_then(|arr| {
-                        let ranges = sanitize_port_ranges(&arr);
-                        let ports_str = port_range_to_string(&ranges);
-                        Some(ports_str)
-                    })
-                });
+            let ports = match table.get("ports") {
+                Some(v) => {
+                    let arr = v.clone().into_array()
+                        .map_err(|e| ConfigError::Message(format!("ports must be an array: {}", e)))?;
+                    let ranges = sanitize_port_ranges(&arr)?;
+                    let ports_str = port_range_to_string(&ranges);
+                    Some(ports_str)
+                }
+                None => None,
+            };
 
             let proxy_mark = parse_optional_int_field(table.clone(), "proxy-mark", DEFAULT_IPTABLES_PROXY_MARK);
             let direct_mark = parse_optional_int_field(table.clone(), "direct-mark", DEFAULT_IPTABLES_DIRECT_MARK);
@@ -346,11 +355,11 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
             .into_iter()
             .map(|v| v.trim())
             .collect_tuple::<_>()
-            .expect("Expect a (keyword, param, outbound_name) tuple.");
+            .ok_or_else(|| ConfigError::Message("Rule must be in format: keyword,param,outbound_name".to_string()))?;
 
         let outbound_index = route
             .get_outbound_index_by_name(outbound_name)
-            .expect(format!("Outbound {} is not found.", outbound_name).as_str());
+            .ok_or_else(|| ConfigError::Message(format!("Outbound '{}' not found", outbound_name)))?;
 
         let cond = &mut route.rules[outbound_index as usize];
 
@@ -359,13 +368,12 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                 route.set_default_route(outbound_index);
             }
             "IP-CIDR" => {
-                cond.dst_ip_range.add(
-                    param
-                        .parse::<IpNet>()
-                        .expect("Wrong format for IP-CIDR.")
-                        .to_ipv6_net()
-                        .unwrap(),
-                );
+                let ip_net = param
+                    .parse::<IpNet>()
+                    .map_err(|e| ConfigError::Message(format!("Wrong format for IP-CIDR '{}': {}", param, e)))?;
+                let ip_v6 = ip_net.to_ipv6_net()
+                    .map_err(|e| ConfigError::Message(format!("Failed to convert IP-CIDR '{}' to IPv6 network: {}", param, e)))?;
+                cond.dst_ip_range.add(ip_v6);
             }
             "GEOIP" => {
                 let (filename, region) = param
@@ -448,10 +456,10 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                     });
             }
             tag @ ("DOMAIN" | "DOMAIN-SUFFIX") => {
-                let domains = &mut domain_sets[route
+                let outbound_index = route
                     .get_outbound_index_by_name(outbound_name)
-                    .expect(format!("outbound {} not found", outbound_name).as_str())
-                    as usize];
+                    .ok_or_else(|| ConfigError::Message(format!("Outbound '{}' not found", outbound_name)))?;
+                let domains = &mut domain_sets[outbound_index as usize];
                 match tag {
                     "DOMAIN" => {
                         domains.insert(param.to_string());
