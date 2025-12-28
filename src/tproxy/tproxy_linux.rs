@@ -126,14 +126,18 @@ async fn accept_socket_loop(listen_addr: &str) -> Result<()> {
 
     loop {
         match listener.accept().await {
-            Ok((mut _socket, _)) => {
+            Ok((mut socket, peer_addr)) => {
                 tokio::spawn(async move {
-                    match handle_tcp(&mut _socket).await {
-                        Err(e) => {
-                            error!("{:#}", e);
-                        }
-                        _ => {}
-                    };
+                    let local_addr = socket
+                        .local_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    if let Err(e) = handle_tcp(&mut socket).await {
+                        error!(
+                            "TCP connection failed: {} -> {}, error: {:#}",
+                            peer_addr, local_addr, e
+                        );
+                    }
                 });
             }
             Err(e) => warn!("couldn't get client: {:?}", e),
