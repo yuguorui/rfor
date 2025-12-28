@@ -1,18 +1,15 @@
-use std::{
-    net::{Ipv4Addr, Ipv6Addr},
-    os::unix::prelude::AsRawFd,
-};
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Context, Result};
 use nix::sys::socket::GetSockOpt;
 use tracing::{error, info, warn};
 
-use crate::{utils::rfor_bind_addr, SETTINGS};
+use crate::{utils::rfor_bind_addr, get_settings};
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpListener;
 
 pub async fn redirect_worker() -> Result<()> {
-    match &SETTINGS.read().await.intercept_mode {
+    match &get_settings().read().await.intercept_mode {
         crate::settings::InterceptMode::REDIRECT {
             local_traffic,
             ports,
@@ -21,7 +18,7 @@ pub async fn redirect_worker() -> Result<()> {
         } => {
             let listen_addr = rfor_bind_addr().await;
 
-            let listener = match &SETTINGS.read().await.redirect_listen {
+            let listener = match &get_settings().read().await.redirect_listen {
                 Some(addr) => TcpListener::bind(addr).await?,
                 None => TcpListener::bind(format!("{}:0", listen_addr)).await?,
             };
@@ -95,7 +92,7 @@ async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
     let origin_addr = match origin_addr {
         SocketAddr::V4(_) => {
             let addr = nix::sys::socket::sockopt::OriginalDst {}
-                .get(inbound.as_raw_fd())
+                .get(inbound)
                 .context("failed to get original ipv4 addr")?;
             SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::from(addr.sin_addr.s_addr.to_be())),
@@ -104,7 +101,7 @@ async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
         }
         SocketAddr::V6(v6) => {
             let addr = nix::sys::socket::sockopt::Ip6tOriginalDst {}
-                .get(inbound.as_raw_fd())
+                .get(inbound)
                 .context(format!(
                     "failed to get original ipv6 addr with peer addr {}",
                     v6
@@ -216,7 +213,7 @@ async fn set_nat_iptables(
         )
     })?;
 
-    if !SETTINGS.read().await.disable_ipv6 {
+    if !get_settings().read().await.disable_ipv6 {
         __setup_nat_iptables(
             &iptables::new(true).unwrap(),
             proxy_chain,

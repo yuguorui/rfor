@@ -12,10 +12,9 @@ use tokio::{
 use anyhow::Result;
 
 use crate::rules::RouteContext;
-use crate::SETTINGS;
+use crate::get_settings;
 
 use std::io;
-use std::ops::Drop;
 use std::os::unix::io::AsRawFd;
 
 use anyhow::anyhow;
@@ -79,7 +78,7 @@ pub fn to_io_err(sock_err: fast_socks5::SocksError) -> std::io::Error {
 }
 
 pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> Result<()> {
-    let mut out_sock = match SETTINGS
+    let mut out_sock = match get_settings()
         .read()
         .await
         .routetable
@@ -129,14 +128,9 @@ async fn _copy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) 
     Ok(())
 }
 
-struct Pipe(i32, i32);
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
-impl Drop for Pipe {
-    fn drop(&mut self) {
-        nix::unistd::close(self.0).unwrap_or(());
-        nix::unistd::close(self.1).unwrap_or(());
-    }
-}
+struct Pipe(OwnedFd, OwnedFd);
 
 impl Pipe {
     fn create() -> io::Result<Self> {
@@ -154,7 +148,7 @@ pub fn vec_to_array<T, const N: usize>(v: Vec<T>) -> Option<[T; N]> {
 }
 
 #[inline]
-fn splice_n(r: i32, w: i32, n: usize, has_more_data: bool) -> std::io::Result<usize> {
+fn splice_n<Fd1: AsFd, Fd2: AsFd>(r: Fd1, w: Fd2, n: usize, has_more_data: bool) -> std::io::Result<usize> {
     let flags = nix::fcntl::SpliceFFlags::SPLICE_F_NONBLOCK
         | if has_more_data {
             nix::fcntl::SpliceFFlags::SPLICE_F_MORE
@@ -173,7 +167,7 @@ where
 {
     // create pipe
     let pipe = Pipe::create()?;
-    let (rpipe, wpipe) = (pipe.0, pipe.1);
+    let (ref rpipe, ref wpipe) = (pipe.0, pipe.1);
     // rw ref
     let rx = r.as_ref();
     let wx = w.as_ref();
@@ -184,8 +178,11 @@ where
     let mut bytes = 0;
 
     loop {
+        // SAFETY: The raw fd is valid for the duration of the async_io closure
+        // since rx is borrowed for the entire call
         let mut n = rx.async_io(Interest::READABLE, || {
-            splice_n(rfd, wpipe, PIPE_BUF_SIZE, false)
+            let borrowed_rfd = unsafe { BorrowedFd::borrow_raw(rfd) };
+            splice_n(borrowed_rfd, wpipe, PIPE_BUF_SIZE, false)
         }).await?;
 
         if n == 0 {
@@ -196,8 +193,11 @@ where
         bytes += n;
 
         while n > 0 {
+            // SAFETY: The raw fd is valid for the duration of the async_io closure
+            // since wx is borrowed for the entire call
             n -= wx.async_io(Interest::WRITABLE, || {
-                splice_n(rpipe, wfd, n, false)
+                let borrowed_wfd = unsafe { BorrowedFd::borrow_raw(wfd) };
+                splice_n(rpipe, borrowed_wfd, n, false)
             }).await?;
         }
     }
@@ -235,7 +235,7 @@ pub fn to_target_addr(target_addr: fast_socks5::util::target_addr::TargetAddr) -
 }
 
 pub async fn rfor_bind_addr() -> String {
-    match crate::SETTINGS.read().await.disable_ipv6 {
+    match crate::get_settings().read().await.disable_ipv6 {
         false => "[::]:0".to_owned(),
         true => "0.0.0.0:0".to_owned(),
     }

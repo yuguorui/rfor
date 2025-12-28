@@ -19,7 +19,7 @@ use url::Url;
 use tracing::info;
 
 use crate::utils::{rfor_bind_addr, to_io_err, ToV6Net, ToV6SockAddr};
-use crate::SETTINGS;
+use crate::get_settings;
 
 use fast_socks5::client as socks_client;
 
@@ -242,7 +242,7 @@ impl RouteTable {
             "{} -> Outbound({}){}",
             context,
             outbound.name,
-            if SETTINGS.read().await.debug {
+            if get_settings().read().await.debug {
                 format!(", time: {}us", duration.as_micros())
             } else {
                 "".to_owned()
@@ -250,7 +250,7 @@ impl RouteTable {
         );
 
         if outbound.url.is_none() {
-            let sock = match SETTINGS.read().await.disable_ipv6 {
+            let sock = match get_settings().read().await.disable_ipv6 {
                 false => TcpSocket::new_v6()?,
                 true => TcpSocket::new_v4()?,
             };
@@ -351,7 +351,7 @@ impl RouteTable {
             "{} -> Outbound({}){}",
             context,
             outbound.name,
-            if SETTINGS.read().await.debug {
+            if get_settings().read().await.debug {
                 format!(", time: {}us", duration.as_micros())
             } else {
                 "".to_owned()
@@ -360,7 +360,7 @@ impl RouteTable {
 
         if outbound.url.is_none() {
             let raw_sock = socket2::Socket::new(
-                match SETTINGS.read().await.disable_ipv6 {
+                match get_settings().read().await.disable_ipv6 {
                     false => socket2::Domain::IPV6,
                     true => socket2::Domain::IPV4,
                 },
@@ -453,7 +453,7 @@ impl RouteTable {
 async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr> {
     match target {
         TargetAddr::Ip(addr) => {
-            let sock = match SETTINGS.read().await.disable_ipv6 {
+            let sock = match get_settings().read().await.disable_ipv6 {
                 false => addr.to_ipv6_sockaddr(),
                 true => addr,
             };
@@ -467,7 +467,7 @@ async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr
                         .await?
                         .next()
                         .expect("unreachable");
-                    match SETTINGS.read().await.disable_ipv6 {
+                    match get_settings().read().await.disable_ipv6 {
                         false => sock.to_ipv6_sockaddr(),
                         true => sock,
                     }
@@ -479,11 +479,14 @@ async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr
 }
 
 pub async fn prepare_socket_bypass_mangle(sockfd: i32) -> tokio::io::Result<()> {
-    match &SETTINGS.read().await.intercept_mode {
+    use std::os::fd::BorrowedFd;
+    match &get_settings().read().await.intercept_mode {
         crate::settings::InterceptMode::TPROXY { direct_mark, .. }
         | crate::settings::InterceptMode::REDIRECT { direct_mark, .. } => {
             // Avoid local traffic looping
-            nix::sys::socket::setsockopt(sockfd, nix::sys::socket::sockopt::Mark, &direct_mark)?;
+            // SAFETY: sockfd is a valid file descriptor for the duration of this call
+            let fd = unsafe { BorrowedFd::borrow_raw(sockfd) };
+            nix::sys::socket::setsockopt(&fd, nix::sys::socket::sockopt::Mark, &direct_mark)?;
         }
         crate::settings::InterceptMode::MANUAL => {}
     }
@@ -516,7 +519,7 @@ impl ProxyDgram for UdpSocket {
                             .await?
                             .next()
                             .expect("unreachable");
-                        match SETTINGS.read().await.disable_ipv6 {
+                        match get_settings().read().await.disable_ipv6 {
                             false => sock.to_ipv6_sockaddr(),
                             true => sock,
                         }

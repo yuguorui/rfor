@@ -11,15 +11,15 @@ use crate::rules::ProxyDgram;
 use crate::{
     rules::{InboundProtocol, RouteContext},
     utils::transfer_tcp,
-    SETTINGS,
+    get_settings,
 };
 
 pub async fn socks5_worker() -> Result<()> {
-    if SETTINGS.read().await.socks5_listen.is_none() {
+    if get_settings().read().await.socks5_listen.is_none() {
         return Ok(());
     }
 
-    let listen_addr = SETTINGS
+    let listen_addr = get_settings()
         .read()
         .await
         .socks5_listen
@@ -171,7 +171,7 @@ async fn transfer_udp<T: AsyncRead + AsyncWrite + Unpin + Send>(
     };
 
     // 2. Do the routing decision and send the data to the target
-    let dgram_sock = SETTINGS.read().await.routetable.get_dgram_sock(&context).await?;
+    let dgram_sock = get_settings().read().await.routetable.get_dgram_sock(&context).await?;
     dgram_sock.send_to(&data, context.dst_addr).await?;
 
     // 3. Start the UDP request/response loop

@@ -4,15 +4,18 @@ use tokio::net::{TcpListener, UdpSocket};
 
 use tracing::{error, info, warn, debug};
 
-use crate::{rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr, SETTINGS};
-use std::{collections::hash_map, mem::MaybeUninit};
+use crate::{rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr, get_settings};
+use std::{collections::hash_map, mem::MaybeUninit, os::fd::BorrowedFd};
 
 fn setup_iptransparent_opts(sock: &SockRef) -> std::io::Result<()> {
     use nix::sys::socket::sockopt::IpTransparent;
     use nix::sys::socket::{self};
     use std::os::unix::io::AsRawFd;
 
-    socket::setsockopt(sock.as_raw_fd(), IpTransparent, &true)?;
+    // SockRef implements AsRawFd but not AsFd, so we need to wrap with BorrowedFd
+    // SAFETY: The fd is valid for the lifetime of sock
+    let fd = unsafe { BorrowedFd::borrow_raw(sock.as_raw_fd()) };
+    socket::setsockopt(&fd, IpTransparent, &true)?;
     Ok(())
 }
 
@@ -66,7 +69,7 @@ fn setup_udpsock_opts(sock: &tokio::net::UdpSocket) -> Result<()> {
 }
 
 pub async fn tproxy_worker() -> Result<()> {
-    if SETTINGS.read().await.tproxy_listen.is_none() {
+    if get_settings().read().await.tproxy_listen.is_none() {
         return Ok(());
     }
 
@@ -75,7 +78,7 @@ pub async fn tproxy_worker() -> Result<()> {
         return Err(err);
     }
 
-    let listen_addr = SETTINGS.read().await.tproxy_listen.clone().unwrap();
+    let listen_addr = get_settings().read().await.tproxy_listen.clone().unwrap();
     info!("tproxy listen: {}", listen_addr);
 
     tokio::select! {
@@ -233,7 +236,7 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
     use std::sync::Arc;
     use tokio::io::Interest;
 
-    if !SETTINGS.read().await.udp_enable {
+    if !get_settings().read().await.udp_enable {
         return Ok(());
     }
 
@@ -289,7 +292,7 @@ async fn udp_socket_bind_to_any(
     use std::os::fd::OwnedFd;
     use tokio::net::UdpSocket;
 
-    let bind_sockaddr = if SETTINGS.read().await.disable_ipv6 {
+    let bind_sockaddr = if get_settings().read().await.disable_ipv6 {
         bind_sockaddr
     } else {
             bind_sockaddr.to_ipv6_sockaddr()
@@ -297,7 +300,7 @@ async fn udp_socket_bind_to_any(
 
     let fd;
     unsafe {
-        fd = libc::socket(if SETTINGS.read().await.disable_ipv6 {libc::AF_INET} else {libc::AF_INET6},
+        fd = libc::socket(if get_settings().read().await.disable_ipv6 {libc::AF_INET} else {libc::AF_INET6},
             libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0);
         if fd < 0 {
             return Err(anyhow!(
@@ -367,7 +370,7 @@ async fn relay_udp_packet(
             crate::rules::TargetAddr::Domain(host, target_sockaddr.port(), Some(target_sockaddr))
         }
     };
-    let target_socket = SETTINGS
+    let target_socket = get_settings()
         .read()
         .await
         .routetable
@@ -391,7 +394,7 @@ async fn relay_udp_packet(
 
     let mut socket_sets = hash_map::HashMap::<std::net::SocketAddr, UdpSocket>::new();
 
-    let timeout = std::time::Duration::from_secs(SETTINGS.read().await.udp_timeout);
+    let timeout = std::time::Duration::from_secs(get_settings().read().await.udp_timeout);
     let sleep = tokio::time::sleep(timeout);
     tokio::pin!(sleep);
 
@@ -433,7 +436,7 @@ async fn relay_udp_packet(
                                         source_socket.send(&dst_buffer[..size]).await
                                     }
                                     false => {
-                                        if SETTINGS.read().await.udp_fullcone {
+                                        if get_settings().read().await.udp_fullcone {
                                             debug!("udp relay: {:?} <- {} with bytes {}", source_sockaddr, addr, size);
                                             match socket_sets.get(&addr) {
                                                 Some(sock) => {
@@ -700,7 +703,7 @@ async fn set_iptables(
         direct_mark,
         ports,
         local_traffic,
-        SETTINGS.read().await.udp_enable,
+        get_settings().read().await.udp_enable,
         &[
             "0.0.0.0/8",
             "127.0.0.0/8",
@@ -719,7 +722,7 @@ async fn set_iptables(
         )
     })?;
 
-    if !SETTINGS.read().await.disable_ipv6 {
+    if !get_settings().read().await.disable_ipv6 {
         __setup_iptables(
             &iptables::new(true).unwrap(),
             proxy_chain,
@@ -729,7 +732,7 @@ async fn set_iptables(
             direct_mark,
             ports,
             local_traffic,
-            SETTINGS.read().await.udp_enable,
+            get_settings().read().await.udp_enable,
             &[
                 "::1/128",
                 "100::/64",
@@ -804,7 +807,7 @@ async fn cleanup_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
 async fn get_link_by_name(
     handle: &rtnetlink::Handle,
     name: String,
-) -> Result<Option<rtnetlink::packet::LinkMessage>, rtnetlink::Error> {
+) -> Result<Option<netlink_packet_route::link::LinkMessage>, rtnetlink::Error> {
     use futures::TryStreamExt;
 
     let mut links = handle.link().get().match_name(name.clone()).execute();
@@ -817,11 +820,10 @@ async fn get_link_by_name(
 
 async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use netlink_packet_route::rule::RuleAttribute;
+    use netlink_packet_route::route::{RouteType, RouteScope};
 
-    use rtnetlink::{
-        new_connection,
-        packet::{rule::Nla, FR_ACT_TO_TBL, RTN_LOCAL},
-    };
+    use rtnetlink::new_connection;
 
     let (connection, handle, _) = new_connection()?;
     tokio::spawn(connection);
@@ -831,25 +833,24 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
         .rule()
         .add()
         .v4()
-        .table(route_table_index)
-        .action(FR_ACT_TO_TBL);
-    rule.message_mut().nlas.push(Nla::FwMark(fwmark));
+        .table_id(route_table_index.into())
+        .action(netlink_packet_route::rule::RuleAction::ToTable);
+    rule.message_mut().attributes.push(RuleAttribute::FwMark(fwmark));
     rule.execute().await?;
 
-    if !SETTINGS.read().await.disable_ipv6 {
+    if !get_settings().read().await.disable_ipv6 {
         let mut rule = handle
             .rule()
             .add()
             .v6()
-            .table(route_table_index)
-            .action(FR_ACT_TO_TBL);
-        rule.message_mut().nlas.push(Nla::FwMark(fwmark));
+            .table_id(route_table_index.into())
+            .action(netlink_packet_route::rule::RuleAction::ToTable);
+        rule.message_mut().attributes.push(RuleAttribute::FwMark(fwmark));
         rule.execute().await?;
     }
 
     // ip route add
     // Scope host for local routes, see also /etc/iproute2/rt_scopes
-    let scope_host = 254;
     let lo_link_index = get_link_by_name(&handle, "lo".to_owned())
         .await?
         .unwrap()
@@ -863,12 +864,12 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
         .v4()
         .destination_prefix(Ipv4Addr::new(0, 0, 0, 0), 0)
         .output_interface(lo_link_index)
-        .table(route_table_index)
-        .scope(scope_host);
-    route.message_mut().header.kind = RTN_LOCAL;
+        .table_id(route_table_index.into())
+        .scope(RouteScope::Host);
+    route.message_mut().header.kind = RouteType::Local;
     route.execute().await?;
 
-    if !SETTINGS.read().await.disable_ipv6 {
+    if !get_settings().read().await.disable_ipv6 {
         // Add default IPv6 route.
         let mut route = handle
             .route()
@@ -876,9 +877,9 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
             .v6()
             .destination_prefix(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 0)
             .output_interface(lo_link_index)
-            .table(route_table_index)
-            .scope(scope_host);
-        route.message_mut().header.kind = RTN_LOCAL;
+            .table_id(route_table_index.into())
+            .scope(RouteScope::Host);
+        route.message_mut().header.kind = RouteType::Local;
         route.execute().await?;
     }
 
@@ -888,7 +889,7 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
 async fn environment_setup() -> Result<()> {
     use std::net::SocketAddr;
 
-    let settings = SETTINGS.read().await;
+    let settings = get_settings().read().await;
     match &settings.intercept_mode {
         crate::settings::InterceptMode::MANUAL => return Ok(()),
         crate::settings::InterceptMode::TPROXY {
@@ -943,7 +944,7 @@ async fn environment_setup() -> Result<()> {
 }
 
 async fn clean_environment() -> Result<()> {
-    let settings = SETTINGS.read().await;
+    let settings = get_settings().read().await;
     match &settings.intercept_mode {
         crate::settings::InterceptMode::MANUAL => return Ok(()),
         crate::settings::InterceptMode::TPROXY {

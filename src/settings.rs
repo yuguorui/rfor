@@ -21,14 +21,14 @@ const DEFAULT_IPRULE_TABLE: u8 = 0x42;
 
 /// A simple but fast traffic forwarder with routing.
 #[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
+#[command(author, version, about, long_about = None)]
 struct Args {
     /// config file filepath
-    #[clap(short, long, default_value = "config.yaml")]
+    #[arg(short, long, default_value = "config.yaml")]
     config: String,
 
     /// working directory
-    #[clap(short, long, default_value = ".")]
+    #[arg(short, long, default_value = ".")]
     work_dir: String,
 }
 
@@ -70,24 +70,25 @@ impl Settings {
         std::env::set_current_dir(&args.work_dir)
             .map_err(|e| ConfigError::Message(format!("Failed to set working directory '{}': {}", args.work_dir, e)))?;
 
-        let mut s = Config::new();
-        s.merge(File::with_name(&args.config))?;
-        s.merge(Environment::with_prefix("rfor"))?;
+        let s = Config::builder()
+            .add_source(File::with_name(&args.config))
+            .add_source(Environment::with_prefix("rfor"))
+            .build()?;
 
         /* 1. Setup the initial rules object. */
         let mut route = RouteTable::new();
 
         /* 2. Parse the outbounds section */
-        parse_outbounds(&mut s, &mut route)?;
+        parse_outbounds(&s, &mut route)?;
 
         /* 3. Populate the DIRECT/DROP rule. */
         ensure_default_outbounds(&mut route)?;
 
         /* 4. Parse the actual rules. */
-        parse_route_rules(&mut s, &mut route)?;
+        parse_route_rules(&s, &mut route)?;
 
         /* 5. Parse the Intercept Mode */
-        let intercept_mode = parse_intercept_mode(&mut s)?;
+        let intercept_mode = parse_intercept_mode(&s)?;
 
         /* 6. Parse the UDP enabling */
         let udp_enable = match &intercept_mode {
@@ -128,7 +129,7 @@ fn parse_outbounds(s: &Config, route: &mut RouteTable) -> Result<(), ConfigError
         let name = parse_required_field(&outbound, "name")?;
 
         let url = outbound.get("url").and_then(|v| {
-            v.clone().into_str().ok().and_then(|s| {
+            v.clone().into_string().ok().and_then(|s| {
                 s.parse().ok()
             })
         });
@@ -143,7 +144,7 @@ fn parse_outbounds(s: &Config, route: &mut RouteTable) -> Result<(), ConfigError
 
 fn parse_required_field(outbound: &std::collections::HashMap<String, config::Value>, field: &str) -> Result<String, ConfigError> {
     outbound.get(field)
-        .and_then(|v| v.clone().into_str().ok())
+        .and_then(|v| v.clone().into_string().ok())
         .ok_or_else(|| ConfigError::Message(format!("Missing required field: {}", field)))
 }
 
@@ -155,7 +156,7 @@ fn parse_bind_range(outbound: &std::collections::HashMap<String, config::Value>)
         let mut bind_range = iprange::IpRange::<ipnet::Ipv6Net>::new();
 
         for item in items {
-            let cidr_str = item.into_str()
+            let cidr_str = item.into_string()
                 .map_err(|e| ConfigError::Message(format!("bind_range item must be a string: {}", e)))?;
 
             let cidr = cidr_str.parse()
@@ -222,7 +223,7 @@ fn validate_settings(settings: &Settings) -> Result<(), ConfigError> {
 fn sanitize_port_ranges(s: &Vec<config::Value>) -> Result<Vec<[u16; 2]>, ConfigError> {
     let mut ranges = s.iter()
         .map(|v| {
-            let v = v.clone().into_str()
+            let v = v.clone().into_string()
                 .map_err(|e| ConfigError::Message(format!("port must be a string: {}", e)))?;
             if !v.contains("-") {
                 let v = v.parse::<u16>()
@@ -264,7 +265,7 @@ fn port_range_to_string(ranges: &[[u16; 2]]) -> String {
     }).join(",")
 }
 
-fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
+fn parse_intercept_mode(s: &Config) -> Result<InterceptMode, ConfigError> {
     let table = match s.get_table("traffic-intercept") {
         Err(_) => return Ok(InterceptMode::MANUAL),
         Ok(t) => t,
@@ -273,7 +274,7 @@ fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
     let mode = table.get("mode")
         .ok_or_else(|| ConfigError::Message("mode field not found.".to_string()))?
         .clone()
-        .into_str()
+        .into_string()
         .map(|s| s.to_lowercase())
         .map_err(|e| ConfigError::Message(format!("Failed to parse mode: {}", e)))?;
 
@@ -341,15 +342,15 @@ fn parse_optional_int_field_u8(table: std::collections::HashMap<String, config::
 
 fn parse_optional_string_field(table: std::collections::HashMap<String, config::Value>, field: &str, default: &str) -> String {
     table.get(field)
-        .and_then(|v| v.clone().into_str().ok())
+        .and_then(|v| v.clone().into_string().ok())
         .unwrap_or_else(|| default.to_string())
 }
 
-fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), ConfigError> {
+fn parse_route_rules(s: &Config, route: &mut RouteTable) -> Result<(), ConfigError> {
     let mut domain_sets: Vec<HashSet<_>> = vec![HashSet::new(); route.outbounds.len()];
 
     for user_rule in s.get_array("rules").unwrap_or_default() {
-        let rule = user_rule.into_str()?;
+        let rule = user_rule.into_string()?;
         let (keyword, param, outbound_name) = rule
             .split(",")
             .into_iter()
@@ -392,9 +393,8 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                     name if name.ends_with(".dat") => {
                         let mut f = std::fs::File::open(filename)
                             .map_err(|e| ConfigError::Message(format!("Failed to open file '{}': {}", filename, e)))?;
-                        let mut b = protobuf::CodedInputStream::new(&mut f);
                         let list: crate::protos::common::GeoIPList =
-                            protobuf::Message::parse_from(&mut b)
+                            protobuf::Message::parse_from_reader(&mut f)
                                 .map_err(|e| ConfigError::Message(format!("Failed to parse GeoIPList '{}': {}", filename, e)))?;
                          list.entry
                              .iter()
@@ -429,9 +429,8 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
  
                 let mut f = std::fs::File::open(filename)
                     .map_err(|e| ConfigError::Message(format!("Failed to open file '{}': {}", filename, e)))?;
-                let mut b = protobuf::CodedInputStream::new(&mut f);
                 let list: crate::protos::common::GeoSiteList =
-                    protobuf::Message::parse_from(&mut b)
+                    protobuf::Message::parse_from_reader(&mut f)
                         .map_err(|e| ConfigError::Message(format!("Failed to parse geosite.dat '{}': {}", filename, e)))?;
                 list.entry
                     .iter()
@@ -439,18 +438,19 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                     .map(|e| &e.domain)
                     .for_each(|ds| {
                         ds.iter().for_each(|d| {
-                            match d.field_type {
-                                crate::protos::common::Domain_Type::Plain => {
+                            match d.type_.enum_value() {
+                                Ok(crate::protos::common::domain::Type::Plain) => {
                                     domains.insert(d.value.to_owned());
                                 }
-                                crate::protos::common::Domain_Type::Regex => { /* Not supported. */
+                                Ok(crate::protos::common::domain::Type::Regex) => { /* Not supported. */
                                 }
-                                crate::protos::common::Domain_Type::RootDomain => {
+                                Ok(crate::protos::common::domain::Type::RootDomain) => {
                                     domains.insert(format!(".{}{}", d.value, RULE_DOMAIN_SUFFIX_TAG));
                                 }
-                                crate::protos::common::Domain_Type::Full => {
+                                Ok(crate::protos::common::domain::Type::Full) => {
                                     domains.insert(format!("^{}$", d.value));
                                 }
+                                Err(_) => { /* Unknown type, skip */ }
                             }
                         })
                     });

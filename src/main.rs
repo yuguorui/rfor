@@ -8,7 +8,7 @@ mod tproxy;
 mod redirect;
 mod utils;
 
-use lazy_static::lazy_static;
+use std::sync::OnceLock;
 use redirect::redirect_worker;
 use tokio::task::JoinHandle;
 use tokio::try_join;
@@ -23,9 +23,12 @@ use anyhow::Result;
 use tracing::error;
 use tracing_subscriber;
 
-lazy_static! {
-    static ref SETTINGS: Arc<RwLock<Settings>> =
-        Arc::new(RwLock::const_new(Settings::new().expect("Failed to load settings")));
+static SETTINGS: OnceLock<Arc<RwLock<Settings>>> = OnceLock::new();
+
+pub fn get_settings() -> &'static Arc<RwLock<Settings>> {
+    SETTINGS.get_or_init(|| {
+        Arc::new(RwLock::const_new(Settings::new().expect("Failed to load settings")))
+    })
 }
 
 async fn flatten(handle: JoinHandle<Result<()>>) -> Result<()> {
