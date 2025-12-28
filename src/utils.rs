@@ -19,6 +19,7 @@ use std::ops::Drop;
 use std::os::unix::io::AsRawFd;
 
 use anyhow::anyhow;
+use tracing;
 
 const PIPE_BUF_SIZE: usize = 512 * 1024;
 
@@ -210,17 +211,20 @@ pub fn geteuid() -> u32 {
 pub async fn receive_signal() -> Result<()> {
     use tokio::signal::unix::signal;
     use tokio::signal::unix::SignalKind;
+
     let mut sighang = signal(SignalKind::hangup())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
 
-    tokio::select! {
-        _ = sighang.recv() => {},
-        _ = sigint.recv() => {},
-        _ = sigterm.recv() => {},
-    }
+    let signal_name = tokio::select! {
+        _ = sighang.recv() => "SIGHUP",
+        _ = sigint.recv() => "SIGINT",
+        _ = sigterm.recv() => "SIGTERM",
+    };
 
-    Err(anyhow!("Recieved signal"))
+    tracing::error!("Received signal: {}", signal_name);
+
+    Err(anyhow!("Received signal: {}", signal_name))
 }
 
 pub fn to_target_addr(target_addr: fast_socks5::util::target_addr::TargetAddr) -> crate::rules::TargetAddr {

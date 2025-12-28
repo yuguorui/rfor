@@ -2,6 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use socket2::{SockAddr, SockRef};
 use tokio::net::{TcpListener, UdpSocket};
 
+use tracing::{error, info, warn, debug};
+
 use crate::{rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr, SETTINGS};
 use std::{collections::hash_map, mem::MaybeUninit};
 
@@ -74,7 +76,7 @@ pub async fn tproxy_worker() -> Result<()> {
     }
 
     let listen_addr = SETTINGS.read().await.tproxy_listen.clone().unwrap();
-    println!("tproxy listen: {}", listen_addr);
+    info!("tproxy listen: {}", listen_addr);
 
     tokio::select! {
         Err(err) = accept_socket_loop(&listen_addr) => {
@@ -104,13 +106,13 @@ async fn accept_socket_loop(listen_addr: &str) -> Result<()> {
                 tokio::spawn(async move {
                     match handle_tcp(&mut _socket).await {
                         Err(e) => {
-                            println!("{:#}", e);
+                            error!("{:#}", e);
                         }
                         _ => {}
                     };
                 });
             }
-            Err(e) => println!("couldn't get client: {:?}", e),
+            Err(e) => warn!("couldn't get client: {:?}", e),
         }
     }
 }
@@ -254,7 +256,7 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
             Ok((size, source_sockaddr, target_sockaddr)) => {
                 let prefilled_data = bytes::Bytes::copy_from_slice(&buffer[..size]);
 
-                println!(
+                info!(
                     "udp relay: create tunnel {:?} <-> {:?}",
                     source_sockaddr, target_sockaddr
                 );
@@ -266,7 +268,7 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
                     {
                         Ok(_) => {}
                         Err(e) => {
-                            println!("Failed to relay udp packet: {}", e);
+                            error!("Failed to relay udp packet: {}", e);
                         }
                     }
                 });
@@ -404,16 +406,16 @@ async fn relay_udp_packet(
                         sleep.as_mut().set(tokio::time::sleep(timeout));
                         match target_socket.send_to(&src_buffer[..size], crate::rules::TargetAddr::Ip(target_sockaddr)).await {
                             Ok(_) => {
-                                println!("udp relay: {:?} -> {} with bytes {}", source_sockaddr, &dst_addr, size);
+                                debug!("udp relay: {:?} -> {} with bytes {}", source_sockaddr, &dst_addr, size);
                             }
                             Err(e) => {
-                                println!("Failed to send udp packet to target: {}", e);
+                                error!("Failed to send udp packet to target: {}", e);
                                 break;
                             }
                         }
                     }
                     Err(e) => {
-                        println!("Failed to receive udp packet from source: {}", e);
+                        error!("Failed to receive udp packet from source: {}", e);
                         break;
                     }
                 }
@@ -427,12 +429,12 @@ async fn relay_udp_packet(
                             crate::rules::TargetAddr::Ip(addr) | crate::rules::TargetAddr::Domain(_, _, Some(addr)) => {
                                 match addr.to_ipv6_sockaddr() == target_sockaddr.to_ipv6_sockaddr() {
                                     true => {
-                                        println!("udp relay: {:?} <- {} with bytes {}", source_sockaddr, dst_addr, size);
+                                        debug!("udp relay: {:?} <- {} with bytes {}", source_sockaddr, dst_addr, size);
                                         source_socket.send(&dst_buffer[..size]).await
                                     }
                                     false => {
                                         if SETTINGS.read().await.udp_fullcone {
-                                            println!("udp relay: {:?} <- {} with bytes {}", source_sockaddr, addr, size);
+                                            debug!("udp relay: {:?} <- {} with bytes {}", source_sockaddr, addr, size);
                                             match socket_sets.get(&addr) {
                                                 Some(sock) => {
                                                     sock.send(&dst_buffer[..size]).await
@@ -447,14 +449,14 @@ async fn relay_udp_packet(
                                                 }
                                             }
                                         } else {
-                                            println!("udp relay: {:?} <- {} with bytes {} discarded, since from unexpected target (expect {})", source_sockaddr, addr, size, target_sockaddr);
+                                            debug!("udp relay: {:?} <- {} with bytes {} discarded, since from unexpected target (expect {})", source_sockaddr, addr, size, target_sockaddr);
                                             Ok(0 as usize)
                                         }
                                     },
                                 }
                             }
                             crate::rules::TargetAddr::Domain(_, _, _) => {
-                                println!("udp relay: {:?} <- {} with bytes {} discarded, since from unexpected domain", source_sockaddr, addr, size);
+                                debug!("udp relay: {:?} <- {} with bytes {} discarded, since from unexpected domain", source_sockaddr, addr, size);
                                 Ok(0 as usize)
                             }
                         };
@@ -462,13 +464,13 @@ async fn relay_udp_packet(
                         match r {
                             Ok(_) => {}
                             Err(e) => {
-                                println!("Failed to send back udp packet to source: {}", e);
+                                error!("Failed to send back udp packet to source: {}", e);
                                 break;
                             }
                         }
                     }
                     Err(e) => {
-                        println!("Failed to receive udp packet from target: {}", e);
+                        error!("Failed to receive udp packet from target: {}", e);
                         break;
                     }
                 }

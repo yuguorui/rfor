@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use nix::sys::socket::GetSockOpt;
+use tracing::{error, info, warn};
 
 use crate::{utils::rfor_bind_addr, SETTINGS};
 use std::net::{IpAddr, SocketAddr};
@@ -29,7 +30,7 @@ pub async fn redirect_worker() -> Result<()> {
                 .local_addr()
                 .expect("TCP socket should have local_addr")
                 .port();
-            println!("redirect listen: {}", listener.local_addr()?);
+            info!("redirect listen: {}", listener.local_addr()?);
 
             if let Err(err) =
                 set_nat_iptables(proxy_chain, port, *direct_mark, ports, *local_traffic).await
@@ -61,13 +62,13 @@ async fn accept_socket_loop(listener: tokio::net::TcpListener) {
                 tokio::spawn(async move {
                     match handle_tcp(&mut _socket).await {
                         Err(e) => {
-                            println!("{:#}", e);
+                            error!("{:#}", e);
                         }
                         _ => {}
                     };
                 });
             }
-            Err(e) => println!("accept incoming connection failed {:?}", e),
+            Err(e) => warn!("accept incoming connection failed {:?}", e),
         }
     }
 }

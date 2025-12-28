@@ -5,6 +5,7 @@ use tokio::net::UdpSocket;
 use tokio::net::{TcpListener, TcpStream};
 
 use anyhow::{Context, Result};
+use tracing::{error, info, warn};
 
 use crate::rules::ProxyDgram;
 use crate::{
@@ -25,7 +26,7 @@ pub async fn socks5_worker() -> Result<()> {
         .as_ref()
         .unwrap()
         .to_owned();
-    println!("socks5 listen: {}", listen_addr);
+    info!("socks5 listen: {}", listen_addr);
 
     let listener = TcpListener::bind(listen_addr).await?;
 
@@ -34,11 +35,11 @@ pub async fn socks5_worker() -> Result<()> {
             Ok((mut _socket, _)) => {
                 tokio::spawn(async {
                     socks5_instance(_socket).await.unwrap_or_else(|e| {
-                        println!("socks5 error: {:#}", e);
+                        error!("socks5 error: {:#}", e);
                     });
                 });
             }
-            Err(e) => println!("couldn't get client: {:?}", e),
+            Err(e) => warn!("couldn't get client: {:?}", e),
         }
     }
 }

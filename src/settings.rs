@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use clap::Parser;
 use itertools::Itertools;
+use tracing::warn;
 
 use config::{Config, ConfigError, Environment, File};
 use ipnet::IpNet;
@@ -133,7 +134,7 @@ impl Settings {
         let udp_enable = match &intercept_mode {
             InterceptMode::TPROXY { .. } | InterceptMode::MANUAL => s.get_bool("udp-enable").unwrap_or(true),
             InterceptMode::REDIRECT { .. } => {
-                println!("UDP is not supported in REDIRECT mode, disabling it.");
+                warn!("UDP is not supported in REDIRECT mode, disabling it.");
                 false
             },
         };

@@ -20,6 +20,8 @@ use settings::Settings;
 
 use anyhow::anyhow;
 use anyhow::Result;
+use tracing::error;
+use tracing_subscriber;
 
 lazy_static! {
     static ref SETTINGS: Arc<RwLock<Settings>> =
@@ -30,12 +32,17 @@ async fn flatten(handle: JoinHandle<Result<()>>) -> Result<()> {
     match handle.await {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(err)) => Err(err),
-        Err(err) => Err(anyhow!("handling failed with error: {:?}", err)),
+        Err(err) => {
+            error!("Task handling failed: {:?}", err);
+            Err(anyhow!("handling failed with error: {:?}", err))
+        }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_logging();
+
     let tproxy_worker = tokio::spawn(tproxy::tproxy_worker());
     let socks_worker = tokio::spawn(socks5::socks5_worker());
     let redirect_worker = tokio::spawn(redirect_worker());
@@ -46,4 +53,17 @@ async fn main() -> Result<()> {
         }
         Err(err) => return Err(err),
     }
+}
+
+fn init_logging() {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "rfor=info".into());
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_file(true)
+        .with_line_number(true)
+        .init();
 }

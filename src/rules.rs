@@ -16,6 +16,8 @@ use tokio::{
 };
 use url::Url;
 
+use tracing::info;
+
 use crate::utils::{rfor_bind_addr, to_io_err, ToV6Net, ToV6SockAddr};
 use crate::SETTINGS;
 
@@ -236,7 +238,7 @@ impl RouteTable {
         let outbound_index = self.match_route(context);
         let outbound = &self.outbounds[outbound_index as usize];
         let duration = start.elapsed();
-        println!(
+        info!(
             "{} -> Outbound({}){}",
             context,
             outbound.name,
@@ -345,7 +347,7 @@ impl RouteTable {
         let outbound_index = self.match_route(context);
         let outbound = &self.outbounds[outbound_index as usize];
         let duration = start.elapsed();
-        println!(
+        info!(
             "{} -> Outbound({}){}",
             context,
             outbound.name,
