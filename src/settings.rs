@@ -62,6 +62,12 @@ pub struct Settings {
     pub udp_enable: bool,
     pub udp_timeout: u64,
     pub udp_fullcone: bool,
+    /// Maximum number of sockets per fullcone session (0 = unlimited)
+    pub udp_fullcone_max_sockets: usize,
+    /// Per-socket idle timeout in fullcone mode (seconds)
+    pub udp_fullcone_socket_timeout: u64,
+    /// Maximum new fullcone connections per second per session (0 = unlimited)
+    pub udp_fullcone_rate_limit: u32,
 }
 
 impl Settings {
@@ -110,6 +116,9 @@ impl Settings {
             udp_enable,
             udp_timeout: s.get_int("udp-timeout").unwrap_or(60) as u64,
             udp_fullcone: s.get_bool("udp-fullcone").unwrap_or(false),
+            udp_fullcone_max_sockets: s.get_int("udp-fullcone-max-sockets").unwrap_or(64) as usize,
+            udp_fullcone_socket_timeout: s.get_int("udp-fullcone-socket-timeout").unwrap_or(30) as u64,
+            udp_fullcone_rate_limit: s.get_int("udp-fullcone-rate-limit").unwrap_or(10) as u32,
         };
 
         // Validate settings

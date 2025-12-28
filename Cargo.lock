@@ -1369,6 +1369,7 @@ dependencies = [
  "netlink-packet-route",
  "nix 0.29.0",
  "nom",
+ "once_cell",
  "protobuf",
  "protobuf-codegen",
  "protoc-bin-vendored",
