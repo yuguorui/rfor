@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn, debug};
 
 use crate::{rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr, get_settings};
+use crate::stats::UDP_STATS;
 use std::{collections::hash_map, mem::MaybeUninit, os::fd::BorrowedFd, sync::Arc, time::Instant};
 
 use dashmap::DashMap;
@@ -88,19 +89,6 @@ fn setup_udpsock_opts(sock: &tokio::net::UdpSocket) -> Result<()> {
     Ok(())
 }
 
-/// Periodically logs the number of active UDP sessions
-async fn udp_session_stats_logger() {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-    
-    loop {
-        interval.tick().await;
-        let session_count = UDP_SESSIONS.len();
-        if session_count > 0 {
-            info!("udp stats: active_sessions={}", session_count);
-        }
-    }
-}
-
 pub async fn tproxy_worker() -> Result<()> {
     if get_settings().read().await.tproxy_listen.is_none() {
         return Ok(());
@@ -122,10 +110,6 @@ pub async fn tproxy_worker() -> Result<()> {
         Err(err) = udp_socket_loop(&listen_addr) => {
             clean_environment().await?;
             return Err(err);
-        },
-        _ = udp_session_stats_logger() => {
-            clean_environment().await?;
-            return Ok(());
         },
         Err(err) = crate::utils::receive_signal() => {
             clean_environment().await?;
@@ -358,6 +342,9 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
                             packet_tx: tx,
                         });
 
+                        // Track UDP session start
+                        UDP_STATS.session_start();
+
                         info!(
                             "udp relay: create tunnel {:?} <-> {:?} (active sessions: {})",
                             source_sockaddr, target_sockaddr, UDP_SESSIONS.len()
@@ -375,6 +362,9 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
                                 source_sockaddr.to_ipv6_sockaddr(),
                                 target_sockaddr.to_ipv6_sockaddr(),
                             ));
+
+                            // Track UDP session end (bytes are tracked inside relay_udp_packet)
+                            UDP_STATS.session_end(0);
 
                             if let Err(e) = result {
                                 error!("Failed to relay udp packet: {}", e);
@@ -517,6 +507,9 @@ async fn relay_udp_packet(
     target_socket
         .send_to(&init_packet, crate::rules::TargetAddr::Ip(target_sockaddr))
         .await?;
+    
+    // Track first packet bytes
+    UDP_STATS.add_bytes(init_packet.len() as u64);
 
     // FullconeSocketEntry: tracks socket with its last activity time for LRU eviction
     struct FullconeSocketEntry {
@@ -585,6 +578,7 @@ async fn relay_udp_packet(
                 sleep.as_mut().set(tokio::time::sleep(timeout));
                 match target_socket.send_to(&packet, crate::rules::TargetAddr::Ip(target_sockaddr)).await {
                     Ok(_) => {
+                        UDP_STATS.add_bytes(packet.len() as u64);
                         debug!("udp relay (forwarded): {:?} -> {} with bytes {}",
                                source_sockaddr, &dst_addr, packet.len());
                     }
@@ -599,6 +593,7 @@ async fn relay_udp_packet(
                         sleep.as_mut().set(tokio::time::sleep(timeout));
                         match target_socket.send_to(&src_buffer[..size], crate::rules::TargetAddr::Ip(target_sockaddr)).await {
                             Ok(_) => {
+                                UDP_STATS.add_bytes(size as u64);
                                 debug!("udp relay: {:?} -> {} with bytes {}", source_sockaddr, &dst_addr, size);
                             }
                             Err(e) => {
@@ -711,7 +706,11 @@ async fn relay_udp_packet(
                         };
 
                         match r {
-                            Ok(_) => {}
+                            Ok(sent) => {
+                                if sent > 0 {
+                                    UDP_STATS.add_bytes(size as u64);
+                                }
+                            }
                             Err(e) => {
                                 error!("Failed to send back udp packet to source: {}", e);
                                 break;

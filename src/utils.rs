@@ -9,6 +9,7 @@ use anyhow::Result;
 
 use crate::rules::RouteContext;
 use crate::get_settings;
+use crate::stats::TCP_STATS;
 
 use std::io;
 
@@ -95,14 +96,34 @@ pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> 
         },
     };
 
+    // Track session start
+    TCP_STATS.session_start();
+
     // Use zero-copy splice on Linux, fallback to tokio copy on other platforms
     #[cfg(target_os = "linux")]
-    let _ = _copy_bidirectional(in_sock, &mut out_sock).await;
+    let bytes_transferred = match _copy_bidirectional(in_sock, &mut out_sock).await {
+        Ok(bytes) => bytes,
+        Err(e) => e.bytes,
+    };
 
     #[cfg(not(target_os = "linux"))]
-    let _ = tokio::io::copy_bidirectional(in_sock, &mut out_sock).await;
+    let bytes_transferred = match tokio::io::copy_bidirectional(in_sock, &mut out_sock).await {
+        Ok((from_client, from_server)) => from_client + from_server,
+        Err(_) => 0,
+    };
+
+    // Track session end with bytes transferred
+    TCP_STATS.session_end(bytes_transferred);
 
     Ok(())
+}
+
+/// Error type for bidirectional copy that includes bytes transferred before the error
+#[cfg(target_os = "linux")]
+struct CopyError {
+    #[allow(dead_code)]
+    source: std::io::Error,
+    bytes: u64,
 }
 
 /*
@@ -113,13 +134,18 @@ pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> 
  * but removed the unsafe code.
  *
  * This is Linux-specific due to the use of splice() system call.
+ *
+ * Returns Ok(bytes) on success, Err(CopyError) on failure. CopyError contains
+ * both the original error and the bytes transferred before the error occurred.
  */
 #[cfg(target_os = "linux")]
-async fn _copy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) -> Result<()> {
+async fn _copy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) -> Result<u64, CopyError> {
     use tokio::io::Interest;
     use tokio::net::tcp::{ReadHalf, WriteHalf};
     use std::os::unix::io::AsRawFd;
     use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     const PIPE_BUF_SIZE: usize = 512 * 1024;
 
@@ -149,7 +175,7 @@ async fn _copy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) 
         }
     }
 
-    async fn zero_copy(r: ReadHalf<'_>, mut w: WriteHalf<'_>) -> io::Result<usize> {
+    async fn zero_copy(r: ReadHalf<'_>, mut w: WriteHalf<'_>, total_bytes: Arc<AtomicU64>) -> io::Result<()> {
         // create pipe
         let pipe = Pipe::create()?;
         let (ref rpipe, ref wpipe) = (pipe.0, pipe.1);
@@ -160,8 +186,6 @@ async fn _copy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) 
         let rfd = rx.as_raw_fd();
         let wfd = wx.as_raw_fd();
 
-        let mut bytes = 0;
-
         loop {
             // SAFETY: The raw fd is valid for the duration of the async_io closure
             // since rx is borrowed for the entire call
@@ -171,11 +195,11 @@ async fn _copy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) 
             }).await?;
 
             if n == 0 {
-                w.shutdown().await?;
-                return Ok(bytes);
+                let _ = w.shutdown().await;
+                return Ok(());
             }
 
-            bytes += n;
+            total_bytes.fetch_add(n as u64, Ordering::Relaxed);
 
             while n > 0 {
                 // SAFETY: The raw fd is valid for the duration of the async_io closure
@@ -191,19 +215,28 @@ async fn _copy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) 
     let (ri, wi) = inbound.split();
     let (ro, wo) = outbound.split();
 
+    // Shared counter for total bytes transferred
+    let total_bytes = Arc::new(AtomicU64::new(0));
+    let total_bytes_clone = Arc::clone(&total_bytes);
+
     let client_to_server = async {
-        zero_copy(ri, wo).await?;
+        zero_copy(ri, wo, total_bytes.clone()).await?;
         Ok::<(), std::io::Error>(())
     };
 
     let server_to_client = async {
-        zero_copy(ro, wi).await?;
+        zero_copy(ro, wi, total_bytes_clone).await?;
         Ok::<(), std::io::Error>(())
     };
 
-    let _ = tokio::try_join!(client_to_server, server_to_client);
+    // Use try_join to terminate both directions when one fails (proper proxy behavior)
+    let result = tokio::try_join!(client_to_server, server_to_client);
+    let bytes = total_bytes.load(Ordering::Relaxed);
 
-    Ok(())
+    match result {
+        Ok(_) => Ok(bytes),
+        Err(e) => Err(CopyError { source: e, bytes }),
+    }
 }
 
 #[cfg(unix)]

@@ -3,6 +3,7 @@ mod protos;
 mod sniffer;
 mod settings;
 mod socks5;
+mod stats;
 
 mod tproxy;
 mod redirect;
@@ -49,8 +50,14 @@ async fn main() -> Result<()> {
     let tproxy_worker = tokio::spawn(tproxy::tproxy_worker());
     let socks_worker = tokio::spawn(socks5::socks5_worker());
     let redirect_worker = tokio::spawn(redirect_worker());
+    let stats_worker = tokio::spawn(stats::stats_logger_worker());
 
-    match try_join!(flatten(tproxy_worker), flatten(socks_worker), flatten(redirect_worker)) {
+    match try_join!(
+        flatten(tproxy_worker),
+        flatten(socks_worker),
+        flatten(redirect_worker),
+        flatten(stats_worker)
+    ) {
         Ok(_) => {
             unreachable!("shouldn't be here.");
         }
