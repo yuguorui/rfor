@@ -9,7 +9,6 @@ use ipnet::IpNet;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::rules::{RouteTable, RULE_DOMAIN_SUFFIX_TAG};
-
 use crate::utils::{vec_to_array, ToV6Net};
 
 const DIRECT_OUTBOUND_NAME: &str = "DIRECT";
@@ -68,7 +67,8 @@ pub struct Settings {
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
         let args = Args::parse();
-        std::env::set_current_dir(args.work_dir).unwrap();
+        std::env::set_current_dir(&args.work_dir)
+            .map_err(|e| ConfigError::Message(format!("Failed to set working directory '{}': {}", args.work_dir, e)))?;
 
         let mut s = Config::new();
         s.merge(File::with_name(&args.config))?;
@@ -78,51 +78,10 @@ impl Settings {
         let mut route = RouteTable::new();
 
         /* 2. Parse the outbounds section */
-        for outbound_value in s.get_array("outbounds").unwrap_or_default() {
-            let outbound = outbound_value.into_table()?;
-
-            let name = outbound
-                .get("name")
-                .expect("Not found the name of outbound.")
-                .clone()
-                .into_str()?;
-            let url = outbound.get("url").and_then(|v| {
-                Some(
-                    v.clone()
-                        .into_str()
-                        .expect("Expect string in the url field.")
-                        .parse()
-                        .expect("Expect a valid url."),
-                )
-            });
-
-            let mut bind_range = iprange::IpRange::<ipnet::Ipv6Net>::new();
-
-            if let Some(items) = outbound.get("bind_range") {
-                for item in items.to_owned().into_array()? {
-                    bind_range.add(
-                        item.into_str()?
-                            .parse()
-                            .expect("Wrong format for bind_range."),
-                    );
-                }
-            }
-
-            route.add_empty_rule(name, url, Some(bind_range));
-        }
+        parse_outbounds(&mut s, &mut route)?;
 
         /* 3. Populate the DIRECT/DROP rule. */
-        if route.get_outbound_by_name(DIRECT_OUTBOUND_NAME).is_none() {
-            route.add_empty_rule(DIRECT_OUTBOUND_NAME.to_owned(), None, None);
-        }
-
-        if route.get_outbound_by_name(DROP_OUTBOUND_NAME).is_none() {
-            route.add_empty_rule(
-                DROP_OUTBOUND_NAME.to_owned(),
-                Some("drop://0.0.0.0".parse().unwrap()),
-                None,
-            );
-        }
+        ensure_default_outbounds(&mut route);
 
         /* 4. Parse the actual rules. */
         parse_route_rules(&mut s, &mut route)?;
@@ -152,11 +111,113 @@ impl Settings {
             udp_fullcone: s.get_bool("udp-fullcone").unwrap_or(false),
         };
 
+        // Validate settings
+        validate_settings(&settings)?;
+
         Ok(settings)
     }
 }
 
-fn santize_port_ranges(s: &Vec<config::Value>) -> Vec<[u16; 2]> {
+fn parse_outbounds(s: &Config, route: &mut RouteTable) -> Result<(), ConfigError> {
+    let outbounds = s.get_array("outbounds").unwrap_or_default();
+
+    for outbound_value in outbounds {
+        let outbound = outbound_value.into_table()
+            .map_err(|e| ConfigError::Message(format!("Failed to parse outbound: {}", e)))?;
+
+        let name = parse_required_field(&outbound, "name")?;
+
+        let url = outbound.get("url").and_then(|v| {
+            v.clone().into_str().ok().and_then(|s| {
+                s.parse().ok()
+            })
+        });
+
+        let bind_range = parse_bind_range(&outbound)?;
+
+        route.add_empty_rule(name, url, bind_range);
+    }
+
+    Ok(())
+}
+
+fn parse_required_field(outbound: &std::collections::HashMap<String, config::Value>, field: &str) -> Result<String, ConfigError> {
+    outbound.get(field)
+        .and_then(|v| v.clone().into_str().ok())
+        .ok_or_else(|| ConfigError::Message(format!("Missing required field: {}", field)))
+}
+
+fn parse_bind_range(outbound: &std::collections::HashMap<String, config::Value>) -> Result<Option<iprange::IpRange<ipnet::Ipv6Net>>, ConfigError> {
+    if let Some(items) = outbound.get("bind_range") {
+        let items = items.clone().into_array()
+            .map_err(|e| ConfigError::Message(format!("bind_range must be an array: {}", e)))?;
+
+        let mut bind_range = iprange::IpRange::<ipnet::Ipv6Net>::new();
+
+        for item in items {
+            let cidr_str = item.into_str()
+                .map_err(|e| ConfigError::Message(format!("bind_range item must be a string: {}", e)))?;
+
+            let cidr = cidr_str.parse()
+                .map_err(|e| ConfigError::Message(format!("Invalid bind_range CIDR '{}': {}", cidr_str, e)))?;
+
+            bind_range.add(cidr);
+        }
+
+        Ok(Some(bind_range))
+    } else {
+        Ok(None)
+    }
+}
+
+fn cidr_to_ipv6net(cidr: &crate::protos::common::CIDR) -> Option<ipnet::Ipv6Net> {
+    match cidr.ip.len() {
+        4 => {
+            vec_to_array::<u8, 4>(cidr.ip.clone()).and_then(|arr| {
+                ipnet::Ipv6Net::new(
+                    Ipv4Addr::from(arr).to_ipv6_mapped(),
+                    cidr.prefix as u8 + (128 - 32),
+                ).ok()
+            })
+        }
+        16 => {
+            vec_to_array::<u8, 16>(cidr.ip.clone()).and_then(|arr| {
+                ipnet::Ipv6Net::new(
+                    Ipv6Addr::from(arr),
+                    cidr.prefix as u8,
+                ).ok()
+            })
+        }
+        _ => None,
+    }
+}
+
+fn ensure_default_outbounds(route: &mut RouteTable) {
+    if route.get_outbound_by_name(DIRECT_OUTBOUND_NAME).is_none() {
+        route.add_empty_rule(DIRECT_OUTBOUND_NAME.to_owned(), None, None);
+    }
+
+    if route.get_outbound_by_name(DROP_OUTBOUND_NAME).is_none() {
+        let drop_url = "drop://0.0.0.0".parse()
+            .expect("drop://0.0.0.0 is a valid URL");
+        route.add_empty_rule(DROP_OUTBOUND_NAME.to_owned(), Some(drop_url), None);
+    }
+}
+
+fn validate_settings(settings: &Settings) -> Result<(), ConfigError> {
+    // At least one listener should be configured
+    if settings.tproxy_listen.is_none()
+        && settings.socks5_listen.is_none()
+        && settings.redirect_listen.is_none() {
+        return Err(ConfigError::Message(
+            "At least one listener (tproxy-listen, socks5-listen, or redirect-listen) must be configured.".to_string()
+        ));
+    }
+
+    Ok(())
+}
+
+fn sanitize_port_ranges(s: &Vec<config::Value>) -> Vec<[u16; 2]> {
     let mut ranges = s.iter()
         .map(|v| {
             let v = v.clone().into_str().expect("port must be a string");
@@ -197,121 +258,82 @@ fn port_range_to_string(ranges: &[[u16; 2]]) -> String {
 }
 
 fn parse_intercept_mode(s: &mut Config) -> Result<InterceptMode, ConfigError> {
-    match s.get_table("traffic-intercept") {
+    let table = match s.get_table("traffic-intercept") {
         Err(_) => return Ok(InterceptMode::MANUAL),
-        Ok(table) => {
-            let mode = table
-                .get("mode")
-                .expect("mode field not found.")
-                .clone()
-                .into_str()?
-                .to_lowercase();
-            match mode.as_str() {
-                "manual" => return Ok(InterceptMode::MANUAL),
-                "auto" | "tproxy" | "redirect" => {
-                    let capture_local_traffic = table
-                        .get("local-traffic")
-                        .and_then(|v| {
-                            Some(
-                                v.clone()
-                                    .into_bool()
-                                    .expect("local-traffic field needs a bool value"),
-                            )
-                        })
-                        .unwrap_or(false);
+        Ok(t) => t,
+    };
 
-                    let ports = table.get("ports").and_then(|v| {
-                        let ranges = santize_port_ranges(
-                            &v.clone().into_array().expect("ports field need an array"),
-                        );
+    let mode = table.get("mode")
+        .ok_or_else(|| ConfigError::Message("mode field not found.".to_string()))?
+        .clone()
+        .into_str()
+        .map(|s| s.to_lowercase())
+        .map_err(|e| ConfigError::Message(format!("Failed to parse mode: {}", e)))?;
 
+    match mode.as_str() {
+        "manual" => return Ok(InterceptMode::MANUAL),
+        "auto" | "tproxy" | "redirect" => {
+            let capture_local_traffic = table.get("local-traffic")
+                .and_then(|v| v.clone().into_bool().ok())
+                .unwrap_or(false);
+
+            let ports = table.get("ports")
+                .and_then(|v| {
+                    v.clone().into_array().ok().and_then(|arr| {
+                        let ranges = sanitize_port_ranges(&arr);
                         let ports_str = port_range_to_string(&ranges);
                         Some(ports_str)
-                    });
+                    })
+                });
 
-                    let proxy_mark = table
-                        .get("proxy-mark")
-                        .and_then(|v| {
-                            Some(
-                                v.to_owned()
-                                    .into_int()
-                                    .expect("tproxy-mark field need an int")
-                                    as u32,
-                            )
-                        })
-                        .unwrap_or(DEFAULT_IPTABLES_PROXY_MARK);
+            let proxy_mark = parse_optional_int_field(table.clone(), "proxy-mark", DEFAULT_IPTABLES_PROXY_MARK);
+            let direct_mark = parse_optional_int_field(table.clone(), "direct-mark", DEFAULT_IPTABLES_DIRECT_MARK);
+            let proxy_chain = parse_optional_string_field(table.clone(), "tproxy-proxy-chain", DEFAULT_IPTABLES_PROXY_CHAIN_NAME);
+            let mark_chain = parse_optional_string_field(table.clone(), "tproxy-mark-chain", DEFAULT_IPTABLES_MARK_CHAIN_NAME);
+            let rule_table_index = parse_optional_int_field_u8(table.clone(), "rule-table", DEFAULT_IPRULE_TABLE);
 
-                    let direct_mark = table
-                        .get("direct-mark")
-                        .and_then(|v| {
-                            Some(
-                                v.to_owned()
-                                    .into_int()
-                                    .expect("direct-xmark field need an int")
-                                    as u32,
-                            )
-                        })
-                        .unwrap_or(DEFAULT_IPTABLES_DIRECT_MARK);
-
-                    let proxy_chain = table
-                        .get("tproxy-proxy-chain")
-                        .and_then(|v| {
-                            Some(
-                                v.to_owned()
-                                    .into_str()
-                                    .expect("tproxy-proxy-chain field need an str"),
-                            )
-                        })
-                        .unwrap_or(DEFAULT_IPTABLES_PROXY_CHAIN_NAME.to_owned());
-
-                    let mark_chain = table
-                        .get("tproxy-mark-chain")
-                        .and_then(|v| {
-                            Some(
-                                v.to_owned()
-                                    .into_str()
-                                    .expect("tproxy-mark-chain field need an str"),
-                            )
-                        })
-                        .unwrap_or(DEFAULT_IPTABLES_MARK_CHAIN_NAME.to_owned());
-
-                    let rule_table_index = table
-                        .get("rule-table")
-                        .and_then(|v| {
-                            Some(
-                                v.to_owned()
-                                    .into_int()
-                                    .expect("rule-table field need an int")
-                                    as u8,
-                            )
-                        })
-                        .unwrap_or(DEFAULT_IPRULE_TABLE);
-
-                    if mode.as_str() != "redirect" {
-                        return Ok(InterceptMode::TPROXY {
-                            local_traffic: capture_local_traffic,
-                            ports: ports.unwrap_or_default(),
-                            proxy_mark,
-                            direct_mark,
-                            proxy_chain,
-                            rule_table_index,
-                            mark_chain,
-                        });
-                    } else {
-                        return Ok(InterceptMode::REDIRECT {
-                            local_traffic: capture_local_traffic,
-                            ports: ports.unwrap_or_default(),
-                            direct_mark,
-                            proxy_chain,
-                        });
-                    }
-                }
-                _ => Err(ConfigError::Message(
-                    "either `auto/tproxy`, `redirect` or `manual` is expected.".to_owned(),
-                )),
+            if mode.as_str() != "redirect" {
+                Ok(InterceptMode::TPROXY {
+                    local_traffic: capture_local_traffic,
+                    ports: ports.unwrap_or_default(),
+                    proxy_mark,
+                    direct_mark,
+                    proxy_chain,
+                    rule_table_index,
+                    mark_chain,
+                })
+            } else {
+                Ok(InterceptMode::REDIRECT {
+                    local_traffic: capture_local_traffic,
+                    ports: ports.unwrap_or_default(),
+                    direct_mark,
+                    proxy_chain,
+                })
             }
         }
+        _ => Err(ConfigError::Message(
+            "either `auto/tproxy`, `redirect` or `manual` is expected.".to_owned(),
+        )),
     }
+}
+
+fn parse_optional_int_field(table: std::collections::HashMap<String, config::Value>, field: &str, default: u32) -> u32 {
+    table.get(field)
+        .and_then(|v| v.clone().into_int().ok())
+        .unwrap_or(default as i64) as u32
+}
+
+fn parse_optional_int_field_u8(table: std::collections::HashMap<String, config::Value>, field: &str, default: u8) -> u8 {
+    table.get(field)
+        .and_then(|v| v.clone().into_int().ok())
+        .unwrap_or(default as i64)
+        .min(u8::MAX as i64) as u8
+}
+
+fn parse_optional_string_field(table: std::collections::HashMap<String, config::Value>, field: &str, default: &str) -> String {
+    table.get(field)
+        .and_then(|v| v.clone().into_str().ok())
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), ConfigError> {
@@ -351,59 +373,37 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                     .into_iter()
                     .map(|v| v.trim())
                     .collect_tuple::<_>()
-                    .expect("Expect a (filename, region) tuple.");
+                    .ok_or_else(|| ConfigError::Message("GEOIP rule must be in format: GEOIP,filename,region".to_string()))?;
                 match filename {
                     name if name.ends_with(".mmdb") => {
                         let maxmind_reader = maxminddb::Reader::open_readfile(filename)
-                            .map_err(|e| ConfigError::Message(format!("Failed to open file '{}' with error: {}", filename, e)))?;
+                            .map_err(|e| ConfigError::Message(format!("Failed to open file '{}': {}", filename, e)))?;
                         route.ip_db = Some(maxmind_reader);
                         cond.maxmind_regions.push(region.to_string().to_lowercase());
                     }
                     name if name.ends_with(".dat") => {
                         let mut f = std::fs::File::open(filename)
-                            .expect(format!("file {} not found", filename).as_str());
+                            .map_err(|e| ConfigError::Message(format!("Failed to open file '{}': {}", filename, e)))?;
                         let mut b = protobuf::CodedInputStream::new(&mut f);
                         let list: crate::protos::common::GeoIPList =
                             protobuf::Message::parse_from(&mut b)
-                                .expect(format!("failed to parse GeoIPList {}", filename).as_str());
-                        list.entry
-                            .iter()
-                            .filter(|&l| l.country_code.to_lowercase() == region.to_lowercase())
-                            .for_each(|geoip| {
-                                geoip.cidr.iter().for_each(|cidr| {
-                                    match cidr.ip.len() {
-                                        4 => {
-                                            let net = ipnet::Ipv6Net::new(
-                                                Ipv4Addr::from(
-                                                    vec_to_array(cidr.ip.to_owned()).unwrap(),
-                                                )
-                                                .to_ipv6_mapped(),
-                                                cidr.prefix as u8 + (128 - 32),
-                                            )
-                                            .unwrap();
-                                            cond.dst_ip_range.add(net);
-                                        }
-                                        16 => {
-                                            cond.dst_ip_range.add(
-                                                ipnet::Ipv6Net::new(
-                                                    Ipv6Addr::from(
-                                                        vec_to_array(cidr.ip.to_owned()).unwrap(),
-                                                    ),
-                                                    cidr.prefix as u8,
-                                                )
-                                                .unwrap(),
-                                            );
-                                        }
-                                        _ => {}
-                                    };
-                                });
-                            });
-                            cond.dst_ip_range.simplify();
+                                .map_err(|e| ConfigError::Message(format!("Failed to parse GeoIPList '{}': {}", filename, e)))?;
+                         list.entry
+                             .iter()
+                             .filter(|&l| l.country_code.to_lowercase() == region.to_lowercase())
+                             .for_each(|geoip| {
+                                 geoip.cidr.iter().for_each(|cidr| {
+                                     if let Some(net) = cidr_to_ipv6net(cidr) {
+                                         cond.dst_ip_range.add(net);
+                                     }
+                                 });
+                             });
+                        cond.dst_ip_range.simplify();
                     }
                     _ => {
-                        return Err(ConfigError::Message(format!(
-                            "GEOIP filename must end with .mmdb or .dat"
-                        )))
+                        return Err(ConfigError::Message(
+                            "GEOIP filename must end with .mmdb or .dat".to_string()
+                        ))
                     }
                 }
             }
@@ -413,23 +413,23 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                     .into_iter()
                     .map(|v| v.trim())
                     .collect_tuple::<_>()
-                    .expect("Expect a (filename, code) tuple.");
-
-                let domains = &mut domain_sets[route
-                    .get_outbound_index_by_name(outbound_name)
-                    .expect(format!("outbound {} not found", outbound_name).as_str())
-                    as usize];
-
+                    .ok_or_else(|| ConfigError::Message("GEOSITE rule must be in format: GEOSITE,filename,code".to_string()))?;
+ 
+                let outbound_index = route.get_outbound_index_by_name(outbound_name)
+                    .ok_or_else(|| ConfigError::Message(format!("Outbound '{}' not found", outbound_name)))?;
+                let domains = &mut domain_sets[outbound_index as usize];
+ 
                 let mut f = std::fs::File::open(filename)
-                    .expect(format!("file {} not found", filename).as_str());
+                    .map_err(|e| ConfigError::Message(format!("Failed to open file '{}': {}", filename, e)))?;
                 let mut b = protobuf::CodedInputStream::new(&mut f);
                 let list: crate::protos::common::GeoSiteList =
-                    protobuf::Message::parse_from(&mut b).expect("Failed to parse geosite.dat");
+                    protobuf::Message::parse_from(&mut b)
+                        .map_err(|e| ConfigError::Message(format!("Failed to parse geosite.dat '{}': {}", filename, e)))?;
                 list.entry
                     .iter()
                     .filter(|&geosites| geosites.country_code.to_lowercase() == code.to_lowercase())
                     .map(|e| &e.domain)
-                    .map(|ds| {
+                    .for_each(|ds| {
                         ds.iter().for_each(|d| {
                             match d.field_type {
                                 crate::protos::common::Domain_Type::Plain => {
@@ -445,8 +445,7 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                                 }
                             }
                         })
-                    })
-                    .for_each(drop);
+                    });
             }
             tag @ ("DOMAIN" | "DOMAIN-SUFFIX") => {
                 let domains = &mut domain_sets[route
@@ -464,14 +463,16 @@ fn parse_route_rules(s: &mut Config, route: &mut RouteTable) -> Result<(), Confi
                 }
             }
             e @ _ => {
-                panic!("{} is not a valid rule keyword.", e);
+                return Err(ConfigError::Message(format!("'{}' is not a valid rule keyword", e)));
             }
         }
     }
 
     for (i, v) in domain_sets.iter().enumerate() {
-        let cond = route.rules.get_mut(i).unwrap();
-        cond.domains = Some(aho_corasick::AhoCorasick::new(v.iter()).unwrap());
+        let cond = route.rules.get_mut(i)
+            .ok_or_else(|| ConfigError::Message(format!("Invalid rule index: {}", i)))?;
+        cond.domains = Some(aho_corasick::AhoCorasick::new(v.iter())
+            .map_err(|e| ConfigError::Message(format!("Failed to build domain matcher: {}", e)))?);
     }
 
     Ok(())
