@@ -10,15 +10,6 @@
 	"runArgs": ["--privileged"],
 	"capAdd": ["NET_ADMIN", "SYS_PTRACE"],
 
-	// Use 'mounts' to make the cargo cache persistent in a Docker Volume.
-	"mounts": [
-		{
-			"source": "/Users/yuguorui/Code/fast-socks5",
-			"target": "/workspaces/fast-socks5",
-			"type": "bind"
-		}
-	]
-
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
 	// "forwardPorts": [],
 
