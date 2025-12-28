@@ -3,25 +3,94 @@ on: [push]
 name: CI
 
 jobs:
-  build_and_test:
-    name: Rust project
+  build:
+    name: Build ${{ matrix.target }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+            cross: false
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+            cross: true
+          - target: armv7-unknown-linux-musleabihf
+            arch: armv7
+            cross: true
+          - target: riscv64gc-unknown-linux-musl
+            arch: riscv64
+            cross: true
+
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          target: x86_64-unknown-linux-musl
-      # install musl-gcc
-      - name: Install musl-gcc
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-      - name: make
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cargo (native)
+        if: "!matrix.cross"
         run: |
-          make release=1 release
-      - name: Release
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
+          RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target ${{ matrix.target }}
+
+      - name: Build with cross (cross-compile)
+        if: matrix.cross
+        env:
+          RUSTFLAGS: '-C target-feature=+crt-static'
+        run: |
+          cross build --release --target ${{ matrix.target }}
+
+      - name: Download geoip.dat
+        run: wget https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat
+
+      - name: Download geosite.dat
+        run: wget https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+
+      - name: Get version
+        id: version
+        run: echo "version=$(grep -E ^version Cargo.toml | tr -d '\"'| cut -d ' ' -f 3)" >> $GITHUB_OUTPUT
+
+      - name: Package release
+        run: |
+          artifact_name=rfor-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}
+          mkdir -p $artifact_name
+          cp -a geoip.dat geosite.dat $artifact_name/
+          cp -a conf/* $artifact_name/
+          cp -a target/${{ matrix.target }}/release/rfor $artifact_name/
+          tar czf $artifact_name.tar.gz $artifact_name
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: rfor-*.tar.gz
+          name: rfor-${{ matrix.arch }}
+          path: rfor-*.tar.gz
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/rfor-*.tar.gz
