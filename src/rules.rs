@@ -255,6 +255,7 @@ impl RouteTable {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "inbound_proto is None")
             })?;
 
+            #[cfg(target_os = "linux")]
             if let InboundProtocol::TPROXY = inbound_proto {
                 if let Some(bind_range) = &outbound.bind_range {
                     if let Ok(ipv6_net) = context.src_addr.ip().to_ipv6_net() {
@@ -270,6 +271,9 @@ impl RouteTable {
 
                 prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
             }
+
+            #[cfg(not(target_os = "linux"))]
+            let _ = inbound_proto; // Suppress unused variable warning
 
             let sock_addr = resolve_target_addr(context.dst_addr.clone()).await?;
             return timeout(Duration::from_millis(TIMEOUT), sock.connect(sock_addr)).await?;
@@ -370,6 +374,7 @@ impl RouteTable {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "inbound_proto is None")
             })?;
 
+            #[cfg(target_os = "linux")]
             if let InboundProtocol::TPROXY = inbound_proto {
                 if let Some(bind_range) = &outbound.bind_range {
                     if let Ok(ipv6_net) = context.src_addr.ip().to_ipv6_net() {
@@ -384,6 +389,9 @@ impl RouteTable {
 
                 prepare_socket_bypass_mangle(raw_sock.as_raw_fd()).await?;
             }
+
+            #[cfg(not(target_os = "linux"))]
+            let _ = inbound_proto; // Suppress unused variable warning
 
             let sock = UdpSocket::from_std(unsafe {
                 use std::os::fd::FromRawFd;
@@ -482,16 +490,24 @@ async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr
 }
 
 pub async fn prepare_socket_bypass_mangle(sockfd: i32) -> tokio::io::Result<()> {
-    use std::os::fd::BorrowedFd;
-    match &get_settings().read().await.intercept_mode {
-        crate::settings::InterceptMode::TPROXY { direct_mark, .. }
-        | crate::settings::InterceptMode::REDIRECT { direct_mark, .. } => {
-            // Avoid local traffic looping
-            // SAFETY: sockfd is a valid file descriptor for the duration of this call
-            let fd = unsafe { BorrowedFd::borrow_raw(sockfd) };
-            nix::sys::socket::setsockopt(&fd, nix::sys::socket::sockopt::Mark, &direct_mark)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::BorrowedFd;
+        match &get_settings().read().await.intercept_mode {
+            crate::settings::InterceptMode::TPROXY { direct_mark, .. }
+            | crate::settings::InterceptMode::REDIRECT { direct_mark, .. } => {
+                // Avoid local traffic looping
+                // SAFETY: sockfd is a valid file descriptor for the duration of this call
+                let fd = unsafe { BorrowedFd::borrow_raw(sockfd) };
+                nix::sys::socket::setsockopt(&fd, nix::sys::socket::sockopt::Mark, &direct_mark)?;
+            }
+            crate::settings::InterceptMode::MANUAL => {}
         }
-        crate::settings::InterceptMode::MANUAL => {}
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = sockfd; // Suppress unused variable warning
     }
 
     Ok(())
