@@ -1,4 +1,3 @@
-use anyhow::Context;
 use iprange::IpRange;
 
 use ipnet::Ipv6Net;
@@ -67,31 +66,26 @@ impl Condition {
         ip_db: Option<&maxminddb::Reader<Vec<u8>>>,
     ) -> bool {
         let dst_ip = dst_sock.ip();
-        if self
-            .dst_ip_range
-            .contains(dst_ip.to_ipv6_net().as_ref().unwrap())
-        {
-            return true;
+        if let Ok(ipv6_net) = dst_ip.to_ipv6_net() {
+            if self.dst_ip_range.contains(&ipv6_net) {
+                return true;
+            }
         }
 
         /* Check the maxmind */
         if let Some(reader) = ip_db {
             let region: Result<maxminddb::geoip2::Country, maxminddb::MaxMindDBError> =
                 reader.lookup(dst_ip);
-            let isocode = region.and_then(|r| Ok(r.country.and_then(|c| c.iso_code)));
-            match isocode {
-                Ok(Some(isocode)) => {
-                    if self
-                        .maxmind_regions
-                        .contains(&isocode.to_string().to_lowercase())
-                    {
-                        return true;
-                    }
+            if let Ok(Some(isocode)) = region.map(|r| r.country.and_then(|c| c.iso_code)) {
+                if self
+                    .maxmind_regions
+                    .contains(&isocode.to_string().to_lowercase())
+                {
+                    return true;
                 }
-                _ => {}
             }
         }
-        return false;
+        false
     }
 }
 
@@ -207,35 +201,37 @@ impl RouteTable {
         self.rules.push(Condition::default());
     }
 
-    fn match_route(&self, context: &RouteContext) -> u8 {
+    fn match_route(&self, context: &RouteContext) -> tokio::io::Result<u8> {
         for (index, cond) in self.rules.iter().enumerate() {
             match &context.dst_addr {
                 TargetAddr::Ip(dst_sock) => {
                     if cond.match_sockaddr(dst_sock, self.ip_db.as_ref()) {
-                        return index as u8;
+                        return Ok(index as u8);
                     }
                 }
 
                 TargetAddr::Domain(domain, _, dst_sock) => {
                     if cond.match_domain(domain) {
-                        return index as u8;
+                        return Ok(index as u8);
                     }
 
                     if let Some(dst_sock) = dst_sock {
                         if cond.match_sockaddr(dst_sock, self.ip_db.as_ref()) {
-                            return index as u8;
+                            return Ok(index as u8);
                         }
                     }
                 }
             }
         }
 
-        return self.default_outbound.context("no default route").unwrap();
+        self.default_outbound.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no default route configured")
+        })
     }
 
     pub async fn get_tcp_sock(&self, context: &RouteContext) -> tokio::io::Result<TcpStream> {
         let start = Instant::now();
-        let outbound_index = self.match_route(context);
+        let outbound_index = self.match_route(context)?;
         let outbound = &self.outbounds[outbound_index as usize];
         let duration = start.elapsed();
         info!(
@@ -255,12 +251,14 @@ impl RouteTable {
                 true => TcpSocket::new_v4()?,
             };
 
-            match context.inbound_proto.as_ref().unwrap() {
-                InboundProtocol::TPROXY => {
-                    if let Some(bind_range) = &outbound.bind_range {
-                        if bind_range
-                            .contains(context.src_addr.ip().to_ipv6_net().as_ref().unwrap())
-                        {
+            let inbound_proto = context.inbound_proto.as_ref().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "inbound_proto is None")
+            })?;
+
+            if let InboundProtocol::TPROXY = inbound_proto {
+                if let Some(bind_range) = &outbound.bind_range {
+                    if let Ok(ipv6_net) = context.src_addr.ip().to_ipv6_net() {
+                        if bind_range.contains(&ipv6_net) {
                             crate::tproxy::tproxy_bind_src(
                                 socket2::SockRef::from(&sock),
                                 context.src_addr,
@@ -268,10 +266,9 @@ impl RouteTable {
                             sock.set_reuseaddr(true)?;
                         }
                     }
-
-                    prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
                 }
-                _ => {}
+
+                prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
             }
 
             let sock_addr = resolve_target_addr(context.dst_addr.clone()).await?;
@@ -281,18 +278,20 @@ impl RouteTable {
         let proxy_url = outbound.url.as_ref().unwrap();
         match proxy_url.scheme() {
             "drop" => {
-                return Err(std::io::Error::new(
+                Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "Connection dropped",
-                ));
+                ))
             }
             "socks" | "socks5" => {
                 let socks_server = format!(
                     "{}:{}",
-                    proxy_url.host_str().unwrap(),
-                    proxy_url
-                        .port_or_known_default()
-                        .expect("Not found default fault for this scheme.")
+                    proxy_url.host_str().ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing proxy host")
+                    })?,
+                    proxy_url.port_or_known_default().ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing proxy port")
+                    })?
                 );
 
                 let target_addr = match &context.dst_addr {
@@ -304,38 +303,35 @@ impl RouteTable {
                     TargetAddr::Domain(_, port, _) => port,
                 };
 
-                match proxy_url.username().is_empty() {
-                    true => {
-                        let fut = socks_client::Socks5Stream::connect(
-                            socks_server,
-                            target_addr,
-                            target_port,
-                            socks_client::Config::default(),
-                        );
-                        let sock = timeout(Duration::from_millis(TIMEOUT), fut)
-                            .await?
-                            .map_err(to_io_err)?;
-                        return Ok(sock.get_socket());
-                    }
-                    false => {
-                        let fut = socks_client::Socks5Stream::connect_with_password(
-                            socks_server,
-                            target_addr,
-                            target_port,
-                            proxy_url.username().to_string(),
-                            proxy_url.password().unwrap_or("").to_string(),
-                            socks_client::Config::default(),
-                        );
-                        let sock = timeout(Duration::from_millis(TIMEOUT), fut)
-                            .await?
-                            .map_err(to_io_err)?;
-                        return Ok(sock.get_socket());
-                    }
-                }
+                let sock = if proxy_url.username().is_empty() {
+                    let fut = socks_client::Socks5Stream::connect(
+                        socks_server,
+                        target_addr,
+                        target_port,
+                        socks_client::Config::default(),
+                    );
+                    timeout(Duration::from_millis(TIMEOUT), fut)
+                        .await?
+                        .map_err(to_io_err)?
+                } else {
+                    let fut = socks_client::Socks5Stream::connect_with_password(
+                        socks_server,
+                        target_addr,
+                        target_port,
+                        proxy_url.username().to_string(),
+                        proxy_url.password().unwrap_or("").to_string(),
+                        socks_client::Config::default(),
+                    );
+                    timeout(Duration::from_millis(TIMEOUT), fut)
+                        .await?
+                        .map_err(to_io_err)?
+                };
+                Ok(sock.get_socket())
             }
-            _ => {
-                panic!("only socks5 scheme is implemented.");
-            }
+            scheme => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("unsupported proxy scheme: {}", scheme),
+            )),
         }
     }
 
@@ -344,7 +340,7 @@ impl RouteTable {
         context: &RouteContext,
     ) -> tokio::io::Result<Box<dyn ProxyDgram>> {
         let start = Instant::now();
-        let outbound_index = self.match_route(context);
+        let outbound_index = self.match_route(context)?;
         let outbound = &self.outbounds[outbound_index as usize];
         let duration = start.elapsed();
         info!(
@@ -368,26 +364,25 @@ impl RouteTable {
                 None,
             )?;
 
-            raw_sock
-                .set_nonblocking(true)
-                .expect("set nonblocking failed");
-            match context.inbound_proto.as_ref().unwrap() {
-                InboundProtocol::TPROXY => {
-                    if let Some(bind_range) = &outbound.bind_range {
-                        if bind_range
-                            .contains(context.src_addr.ip().to_ipv6_net().as_ref().unwrap())
-                        {
+            raw_sock.set_nonblocking(true)?;
+
+            let inbound_proto = context.inbound_proto.as_ref().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "inbound_proto is None")
+            })?;
+
+            if let InboundProtocol::TPROXY = inbound_proto {
+                if let Some(bind_range) = &outbound.bind_range {
+                    if let Ok(ipv6_net) = context.src_addr.ip().to_ipv6_net() {
+                        if bind_range.contains(&ipv6_net) {
                             crate::tproxy::tproxy_bind_src(
                                 SockRef::from(&raw_sock),
                                 context.src_addr,
-                            )
-                            .expect("tproxy_bind_src failed");
+                            )?;
                         }
                     }
-
-                    prepare_socket_bypass_mangle(raw_sock.as_raw_fd()).await?;
                 }
-                _ => {}
+
+                prepare_socket_bypass_mangle(raw_sock.as_raw_fd()).await?;
             }
 
             let sock = UdpSocket::from_std(unsafe {
@@ -402,50 +397,53 @@ impl RouteTable {
         let proxy_url = outbound.url.as_ref().unwrap();
         match proxy_url.scheme() {
             "drop" => {
-                return Err(std::io::Error::new(
+                Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "Connection dropped",
-                ));
+                ))
             }
             "socks" | "socks5" => {
                 let socks_server = format!(
                     "{}:{}",
-                    proxy_url.host_str().unwrap(),
-                    proxy_url
-                        .port_or_known_default()
-                        .expect("Not found default fault for this scheme.")
+                    proxy_url.host_str().ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing proxy host")
+                    })?,
+                    proxy_url.port_or_known_default().ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing proxy port")
+                    })?
                 );
 
-                let backing_socket = TcpStream::connect(socks_server).await?;
+                let backing_socket = timeout(
+                    Duration::from_millis(TIMEOUT),
+                    TcpStream::connect(&socks_server),
+                )
+                .await??;
 
-                match proxy_url.username().is_empty() {
-                    true => {
-                        let fut = socks_client::Socks5Datagram::bind(
-                            backing_socket,
-                            rfor_bind_addr().await,
-                        );
-                        let sock = timeout(Duration::from_millis(TIMEOUT), fut)
-                            .await?
-                            .map_err(to_io_err)?;
-                        return Ok(Box::new(sock));
-                    }
-                    false => {
-                        let fut = socks_client::Socks5Datagram::bind_with_password(
-                            backing_socket,
-                            rfor_bind_addr().await,
-                            proxy_url.username(),
-                            proxy_url.password().unwrap_or(""),
-                        );
-                        let sock = timeout(Duration::from_millis(TIMEOUT), fut)
-                            .await?
-                            .map_err(to_io_err)?;
-                        return Ok(Box::new(sock));
-                    }
-                }
+                let sock = if proxy_url.username().is_empty() {
+                    let fut = socks_client::Socks5Datagram::bind(
+                        backing_socket,
+                        rfor_bind_addr().await,
+                    );
+                    timeout(Duration::from_millis(TIMEOUT), fut)
+                        .await?
+                        .map_err(to_io_err)?
+                } else {
+                    let fut = socks_client::Socks5Datagram::bind_with_password(
+                        backing_socket,
+                        rfor_bind_addr().await,
+                        proxy_url.username(),
+                        proxy_url.password().unwrap_or(""),
+                    );
+                    timeout(Duration::from_millis(TIMEOUT), fut)
+                        .await?
+                        .map_err(to_io_err)?
+                };
+                Ok(Box::new(sock))
             }
-            _ => {
-                panic!("only socks5 scheme is implemented.");
-            }
+            scheme => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("unsupported proxy scheme: {}", scheme),
+            )),
         }
     }
 }
@@ -466,7 +464,12 @@ async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr
                     let sock = tokio::net::lookup_host((domain.as_str(), port))
                         .await?
                         .next()
-                        .expect("unreachable");
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!("DNS lookup returned no results for {}:{}", domain, port),
+                            )
+                        })?;
                     match get_settings().read().await.disable_ipv6 {
                         false => sock.to_ipv6_sockaddr(),
                         true => sock,
@@ -518,7 +521,12 @@ impl ProxyDgram for UdpSocket {
                         let sock = tokio::net::lookup_host((domain.as_str(), port))
                             .await?
                             .next()
-                            .expect("unreachable");
+                            .ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    format!("DNS lookup returned no results for {}:{}", domain, port),
+                                )
+                            })?;
                         match get_settings().read().await.disable_ipv6 {
                             false => sock.to_ipv6_sockaddr(),
                             true => sock,
