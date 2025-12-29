@@ -17,8 +17,8 @@ use url::Url;
 
 use tracing::info;
 
-use crate::utils::{rfor_bind_addr, to_io_err, ToV6Net, ToV6SockAddr};
 use crate::get_settings;
+use crate::utils::{rfor_bind_addr, to_io_err, ToV6Net, ToV6SockAddr};
 
 use fast_socks5::client as socks_client;
 
@@ -52,7 +52,8 @@ impl Condition {
         if let Some(ref domains) = self.domains {
             if domains.is_match(&name.to_owned())
                 || domains.is_match(&format!(".{name}{RULE_DOMAIN_SUFFIX_TAG}"))
-                || domains.is_match(&format!("^{}$", name)) {
+                || domains.is_match(&format!("^{}$", name))
+            {
                 return true;
             }
         }
@@ -281,12 +282,10 @@ impl RouteTable {
 
         let proxy_url = outbound.url.as_ref().unwrap();
         match proxy_url.scheme() {
-            "drop" => {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Connection dropped",
-                ))
-            }
+            "drop" => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Connection dropped",
+            )),
             "socks" | "socks5" => {
                 let socks_server = format!(
                     "{}:{}",
@@ -404,12 +403,10 @@ impl RouteTable {
 
         let proxy_url = outbound.url.as_ref().unwrap();
         match proxy_url.scheme() {
-            "drop" => {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Connection dropped",
-                ))
-            }
+            "drop" => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Connection dropped",
+            )),
             "socks" | "socks5" => {
                 let socks_server = format!(
                     "{}:{}",
@@ -428,10 +425,8 @@ impl RouteTable {
                 .await??;
 
                 let sock = if proxy_url.username().is_empty() {
-                    let fut = socks_client::Socks5Datagram::bind(
-                        backing_socket,
-                        rfor_bind_addr().await,
-                    );
+                    let fut =
+                        socks_client::Socks5Datagram::bind(backing_socket, rfor_bind_addr().await);
                     timeout(Duration::from_millis(TIMEOUT), fut)
                         .await?
                         .map_err(to_io_err)?
@@ -540,7 +535,10 @@ impl ProxyDgram for UdpSocket {
                             .ok_or_else(|| {
                                 std::io::Error::new(
                                     std::io::ErrorKind::NotFound,
-                                    format!("DNS lookup returned no results for {}:{}", domain, port),
+                                    format!(
+                                        "DNS lookup returned no results for {}:{}",
+                                        domain, port
+                                    ),
                                 )
                             })?;
                         match get_settings().read().await.disable_ipv6 {

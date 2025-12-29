@@ -3,10 +3,10 @@ use socket2::{SockAddr, SockRef};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 
-use tracing::{error, info, warn, debug};
+use tracing::{debug, error, info, warn};
 
-use crate::{rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr, get_settings};
 use crate::stats::UDP_STATS;
+use crate::{get_settings, rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr};
 use std::{collections::hash_map, mem::MaybeUninit, os::fd::BorrowedFd, sync::Arc, time::Instant};
 
 use dashmap::DashMap;
@@ -25,8 +25,7 @@ struct UdpSessionEntry {
 const UDP_SESSION_CHANNEL_SIZE: usize = 32;
 
 /// Global map to track active UDP sessions with packet forwarding channels
-static UDP_SESSIONS: Lazy<DashMap<UdpSessionKey, UdpSessionEntry>> = 
-    Lazy::new(|| DashMap::new());
+static UDP_SESSIONS: Lazy<DashMap<UdpSessionKey, UdpSessionEntry>> = Lazy::new(|| DashMap::new());
 
 fn setup_iptransparent_opts(sock: &SockRef) -> std::io::Result<()> {
     use nix::sys::socket::sockopt::IpTransparent;
@@ -257,9 +256,9 @@ fn recvmsg_wrapper(
 }
 
 async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
+    use dashmap::mapref::entry::Entry;
     use std::os::unix::io::AsRawFd;
     use tokio::io::Interest;
-    use dashmap::mapref::entry::Entry;
 
     let settings = get_settings().read().await;
     if !settings.udp_enable {
@@ -342,24 +341,21 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
                             continue;
                         }
 
-                        entry.insert(UdpSessionEntry {
-                            packet_tx: tx,
-                        });
+                        entry.insert(UdpSessionEntry { packet_tx: tx });
 
                         // Track UDP session start
                         UDP_STATS.session_start();
 
                         info!(
                             "udp relay: create tunnel {:?} <-> {:?} (active sessions: {})",
-                            source_sockaddr, target_sockaddr, UDP_SESSIONS.len()
+                            source_sockaddr,
+                            target_sockaddr,
+                            UDP_SESSIONS.len()
                         );
 
                         tokio::spawn(async move {
-                            let result = relay_udp_packet(
-                                rx,
-                                source_sockaddr,
-                                target_sockaddr,
-                            ).await;
+                            let result =
+                                relay_udp_packet(rx, source_sockaddr, target_sockaddr).await;
 
                             // Always remove the session when done (DashMap remove is lock-free)
                             UDP_SESSIONS.remove(&(
@@ -402,8 +398,15 @@ async fn udp_socket_bind_to_any_with_flag(
 
     let fd;
     unsafe {
-        fd = libc::socket(if disable_ipv6 {libc::AF_INET} else {libc::AF_INET6},
-            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0);
+        fd = libc::socket(
+            if disable_ipv6 {
+                libc::AF_INET
+            } else {
+                libc::AF_INET6
+            },
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK,
+            0,
+        );
         if fd < 0 {
             return Err(anyhow!(
                 "failed to create socket: {}",
@@ -511,7 +514,7 @@ async fn relay_udp_packet(
     target_socket
         .send_to(&init_packet, crate::rules::TargetAddr::Ip(target_sockaddr))
         .await?;
-    
+
     // Track first packet bytes
     UDP_STATS.add_bytes(init_packet.len() as u64);
 
@@ -625,7 +628,7 @@ async fn relay_udp_packet(
                                 // Domain without resolved IP - this typically comes from SOCKS5 proxy
                                 // responses. Full-cone NAT requires IP addresses for proper mapping,
                                 // so we cannot reliably handle this case.
-                                // 
+                                //
                                 // Note: We intentionally avoid DNS resolution here because:
                                 // 1. DNS results are unstable (load balancing, CDN, etc.)
                                 // 2. The resolved IP may differ from the actual source
@@ -837,7 +840,6 @@ fn __setup_iptables(
     udp_enable: bool,
     reserved_ip: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
-
     let table = "mangle";
     ipt.new_chain(table, proxy_chain)?;
     for ip in reserved_ip {
@@ -863,9 +865,7 @@ fn __setup_iptables(
         proxy_chain,
         &format!(
             "-p tcp --match multiport --dports {} -j TPROXY --tproxy-mark {} --on-port {}",
-            ports,
-            xmark,
-            tproxy_port,
+            ports, xmark, tproxy_port,
         ),
     )?;
 
@@ -875,9 +875,7 @@ fn __setup_iptables(
             proxy_chain,
             &format!(
                 "-p udp --match multiport --dports {} -j TPROXY --tproxy-mark {} --on-port {}",
-                ports,
-                xmark,
-                tproxy_port,
+                ports, xmark, tproxy_port,
             ),
         )?;
     }
@@ -887,8 +885,7 @@ fn __setup_iptables(
         proxy_chain,
         &format!(
             "-p tcp --match multiport --sports {} -j MARK --set-mark {}",
-            ports,
-            xmark,
+            ports, xmark,
         ),
     )?;
 
@@ -919,8 +916,7 @@ fn __setup_iptables(
             mark_chain,
             &format!(
                 "-p tcp --match multiport --dports {} -j MARK --set-mark {}",
-                ports,
-                xmark,
+                ports, xmark,
             ),
         )?;
 
@@ -930,8 +926,7 @@ fn __setup_iptables(
                 mark_chain,
                 &format!(
                     "-p udp --match multiport --dports {} -j MARK --set-mark {}",
-                    ports,
-                    xmark,
+                    ports, xmark,
                 ),
             )?;
         }
@@ -1075,9 +1070,9 @@ async fn get_link_by_name(
 }
 
 async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use netlink_packet_route::route::{RouteScope, RouteType};
     use netlink_packet_route::rule::RuleAttribute;
-    use netlink_packet_route::route::{RouteType, RouteScope};
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     use rtnetlink::new_connection;
 
@@ -1091,7 +1086,9 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
         .v4()
         .table_id(route_table_index.into())
         .action(netlink_packet_route::rule::RuleAction::ToTable);
-    rule.message_mut().attributes.push(RuleAttribute::FwMark(fwmark));
+    rule.message_mut()
+        .attributes
+        .push(RuleAttribute::FwMark(fwmark));
     rule.execute().await?;
 
     if !get_settings().read().await.disable_ipv6 {
@@ -1101,7 +1098,9 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
             .v6()
             .table_id(route_table_index.into())
             .action(netlink_packet_route::rule::RuleAction::ToTable);
-        rule.message_mut().attributes.push(RuleAttribute::FwMark(fwmark));
+        rule.message_mut()
+            .attributes
+            .push(RuleAttribute::FwMark(fwmark));
         rule.execute().await?;
     }
 

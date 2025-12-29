@@ -1,16 +1,16 @@
-mod rules;
 mod protos;
-mod sniffer;
+mod rules;
 mod settings;
+mod sniffer;
 mod socks5;
 mod stats;
 
-mod tproxy;
 mod redirect;
+mod tproxy;
 mod utils;
 
-use std::sync::OnceLock;
 use redirect::redirect_worker;
+use std::sync::OnceLock;
 use tokio::task::JoinHandle;
 use tokio::try_join;
 
@@ -28,7 +28,9 @@ static SETTINGS: OnceLock<Arc<RwLock<Settings>>> = OnceLock::new();
 
 pub fn get_settings() -> &'static Arc<RwLock<Settings>> {
     SETTINGS.get_or_init(|| {
-        Arc::new(RwLock::const_new(Settings::new().expect("Failed to load settings")))
+        Arc::new(RwLock::const_new(
+            Settings::new().expect("Failed to load settings"),
+        ))
     })
 }
 

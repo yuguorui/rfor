@@ -1,14 +1,14 @@
 #![allow(dead_code)]
 
 use ipnet::{IpNet, Ipv6Net, PrefixLenError};
-use tokio::io::AsyncWriteExt;
 use std::net::{IpAddr, SocketAddr};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use anyhow::Result;
 
-use crate::rules::RouteContext;
 use crate::get_settings;
+use crate::rules::RouteContext;
 use crate::stats::TCP_STATS;
 
 use std::io;
@@ -139,13 +139,16 @@ struct CopyError {
  * both the original error and the bytes transferred before the error occurred.
  */
 #[cfg(target_os = "linux")]
-async fn _copy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) -> Result<u64, CopyError> {
-    use tokio::io::Interest;
-    use tokio::net::tcp::{ReadHalf, WriteHalf};
-    use std::os::unix::io::AsRawFd;
+async fn _copy_bidirectional(
+    inbound: &mut TcpStream,
+    outbound: &mut TcpStream,
+) -> Result<u64, CopyError> {
     use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+    use std::os::unix::io::AsRawFd;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use tokio::io::Interest;
+    use tokio::net::tcp::{ReadHalf, WriteHalf};
 
     const PIPE_BUF_SIZE: usize = 512 * 1024;
 
@@ -161,7 +164,12 @@ async fn _copy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) 
     }
 
     #[inline]
-    fn splice_n<Fd1: AsFd, Fd2: AsFd>(r: Fd1, w: Fd2, n: usize, has_more_data: bool) -> std::io::Result<usize> {
+    fn splice_n<Fd1: AsFd, Fd2: AsFd>(
+        r: Fd1,
+        w: Fd2,
+        n: usize,
+        has_more_data: bool,
+    ) -> std::io::Result<usize> {
         let flags = nix::fcntl::SpliceFFlags::SPLICE_F_NONBLOCK
             | if has_more_data {
                 nix::fcntl::SpliceFFlags::SPLICE_F_MORE
@@ -175,7 +183,11 @@ async fn _copy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) 
         }
     }
 
-    async fn zero_copy(r: ReadHalf<'_>, mut w: WriteHalf<'_>, total_bytes: Arc<AtomicU64>) -> io::Result<()> {
+    async fn zero_copy(
+        r: ReadHalf<'_>,
+        mut w: WriteHalf<'_>,
+        total_bytes: Arc<AtomicU64>,
+    ) -> io::Result<()> {
         // create pipe
         let pipe = Pipe::create()?;
         let (ref rpipe, ref wpipe) = (pipe.0, pipe.1);
@@ -189,10 +201,12 @@ async fn _copy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) 
         loop {
             // SAFETY: The raw fd is valid for the duration of the async_io closure
             // since rx is borrowed for the entire call
-            let mut n = rx.async_io(Interest::READABLE, || {
-                let borrowed_rfd = unsafe { BorrowedFd::borrow_raw(rfd) };
-                splice_n(borrowed_rfd, wpipe, PIPE_BUF_SIZE, false)
-            }).await?;
+            let mut n = rx
+                .async_io(Interest::READABLE, || {
+                    let borrowed_rfd = unsafe { BorrowedFd::borrow_raw(rfd) };
+                    splice_n(borrowed_rfd, wpipe, PIPE_BUF_SIZE, false)
+                })
+                .await?;
 
             if n == 0 {
                 let _ = w.shutdown().await;
@@ -204,10 +218,12 @@ async fn _copy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) 
             while n > 0 {
                 // SAFETY: The raw fd is valid for the duration of the async_io closure
                 // since wx is borrowed for the entire call
-                n -= wx.async_io(Interest::WRITABLE, || {
-                    let borrowed_wfd = unsafe { BorrowedFd::borrow_raw(wfd) };
-                    splice_n(rpipe, borrowed_wfd, n, false)
-                }).await?;
+                n -= wx
+                    .async_io(Interest::WRITABLE, || {
+                        let borrowed_wfd = unsafe { BorrowedFd::borrow_raw(wfd) };
+                        splice_n(rpipe, borrowed_wfd, n, false)
+                    })
+                    .await?;
             }
         }
     }
@@ -278,10 +294,16 @@ pub async fn receive_signal() -> Result<()> {
     Err(anyhow!("Received signal: CTRL_C"))
 }
 
-pub fn to_target_addr(target_addr: fast_socks5::util::target_addr::TargetAddr) -> crate::rules::TargetAddr {
+pub fn to_target_addr(
+    target_addr: fast_socks5::util::target_addr::TargetAddr,
+) -> crate::rules::TargetAddr {
     match target_addr {
-        fast_socks5::util::target_addr::TargetAddr::Ip(sock_addr) => crate::rules::TargetAddr::Ip(sock_addr),
-        fast_socks5::util::target_addr::TargetAddr::Domain(domain, port) => crate::rules::TargetAddr::Domain(domain, port, None),
+        fast_socks5::util::target_addr::TargetAddr::Ip(sock_addr) => {
+            crate::rules::TargetAddr::Ip(sock_addr)
+        }
+        fast_socks5::util::target_addr::TargetAddr::Domain(domain, port) => {
+            crate::rules::TargetAddr::Domain(domain, port, None)
+        }
     }
 }
 

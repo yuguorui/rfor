@@ -9,7 +9,7 @@ mod linux_impl {
     use nix::sys::socket::GetSockOpt;
     use tracing::{error, info, warn};
 
-    use crate::{utils::rfor_bind_addr, get_settings};
+    use crate::{get_settings, utils::rfor_bind_addr};
     use std::net::{IpAddr, SocketAddr};
     use tokio::net::TcpListener;
 
@@ -146,7 +146,6 @@ mod linux_impl {
         local_traffic: bool,
         reserved_ip: &[&str],
     ) -> Result<(), Box<dyn std::error::Error>> {
-
         let table = "nat";
 
         ipt.new_chain(table, proxy_chain)?;
@@ -173,8 +172,7 @@ mod linux_impl {
             proxy_chain,
             &format!(
                 "-p tcp --match multiport --dports {} -j REDIRECT --to-ports {}",
-                ports,
-                redirect_port,
+                ports, redirect_port,
             ),
         )?;
 
