@@ -1,6 +1,10 @@
 mod http_parse;
-mod tls_parse;
 mod quic_parser;
+mod tls_parse;
+
+// Re-export QUIC aggregator for cross-packet SNI parsing
+#[cfg(target_os = "linux")]
+pub use quic_parser::{QuicParseResult, QuicSniAggregator};
 
 pub fn parse_host(remaining: &[u8]) -> Option<String> {
     if let Some(host) = http_parse::parse_host(remaining) {

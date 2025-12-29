@@ -25,7 +25,7 @@ struct UdpSessionEntry {
 const UDP_SESSION_CHANNEL_SIZE: usize = 32;
 
 /// Global map to track active UDP sessions with packet forwarding channels
-static UDP_SESSIONS: Lazy<DashMap<UdpSessionKey, UdpSessionEntry>> = 
+static UDP_SESSIONS: Lazy<DashMap<UdpSessionKey, UdpSessionEntry>> =
     Lazy::new(|| DashMap::new());
 
 fn setup_iptransparent_opts(sock: &SockRef) -> std::io::Result<()> {
@@ -460,6 +460,122 @@ async fn udp_socket_bind_to_any_with_flag(
     return Ok(source_socket);
 }
 
+/// Maximum number of packets to buffer while waiting for QUIC SNI aggregation
+const QUIC_SNI_MAX_BUFFERED_PACKETS: usize = 16;
+
+/// Timeout for QUIC SNI aggregation (milliseconds)
+const QUIC_SNI_AGGREGATION_TIMEOUT_MS: u64 = 300;
+
+/// Sniff host from UDP packets, supporting QUIC SNI aggregation across multiple packets.
+///
+/// This function first tries to parse the host from the initial packet using HTTP, TLS, and QUIC parsers.
+/// If QUIC parsing indicates that more packets are needed (fragmented ClientHello), it will
+/// wait for additional packets and aggregate CRYPTO frames to extract the SNI.
+///
+/// Returns:
+/// - The parsed hostname (if found)
+/// - A vector of all buffered packets that should be forwarded
+async fn sniff_host_with_quic_aggregation(
+    packet_rx: &mut mpsc::Receiver<bytes::Bytes>,
+) -> (Option<String>, Vec<bytes::Bytes>) {
+    use crate::sniffer::{QuicParseResult, QuicSniAggregator};
+
+    let mut buffered_packets = Vec::new();
+
+    // Wait for the first packet to determine the destination address (for domain sniffing)
+    let init_packet = match packet_rx.recv().await {
+        Some(packet) => packet,
+        None => {
+            return (None, buffered_packets);
+        }
+    };
+
+    buffered_packets.push(init_packet.clone());
+
+    let mut aggregator = QuicSniAggregator::new();
+    match aggregator.process_packet(&init_packet) {
+        QuicParseResult::Success(host) => {
+            debug!("QUIC SNI parsed from first packet: {}", host);
+            return (Some(host), buffered_packets);
+        }
+        QuicParseResult::NeedMoreData(dest_cid) => {
+            debug!(
+                "QUIC SNI needs more packets, dest_cid: {:x?}, waiting for additional packets",
+                dest_cid
+            );
+            // Continue to aggregate more packets
+        }
+        QuicParseResult::Failed(e) => {
+            debug!("QUIC parsing failed: {}, trying other protocols", e);
+            // Not a valid QUIC Initial packet, or parsing failed.
+            // Fallback to legacy parsers for HTTP/TLS (e.g. DTLS or other UDP protocols)
+            if let Some(host) = crate::sniffer::parse_host(&init_packet) {
+                return (Some(host), buffered_packets);
+            }
+            return (None, buffered_packets);
+        }
+    }
+
+    // Set up timeout for aggregation
+    let timeout = tokio::time::sleep(std::time::Duration::from_millis(QUIC_SNI_AGGREGATION_TIMEOUT_MS));
+    tokio::pin!(timeout);
+
+    // Try to receive more packets for aggregation
+    loop {
+        if buffered_packets.len() >= QUIC_SNI_MAX_BUFFERED_PACKETS {
+            debug!(
+                "QUIC SNI aggregation: reached max buffered packets ({}), giving up",
+                QUIC_SNI_MAX_BUFFERED_PACKETS
+            );
+            break;
+        }
+
+        tokio::select! {
+            Some(packet) = packet_rx.recv() => {
+                buffered_packets.push(packet.clone());
+
+                match aggregator.process_packet(&packet) {
+                    QuicParseResult::Success(host) => {
+                        debug!(
+                            "QUIC SNI parsed after {} packets: {}",
+                            buffered_packets.len(),
+                            host
+                        );
+                        return (Some(host), buffered_packets);
+                    }
+                    QuicParseResult::NeedMoreData(_) => {
+                        debug!(
+                            "QUIC SNI still needs more packets after {} packets",
+                            buffered_packets.len()
+                        );
+                        // Continue waiting for more packets
+                    }
+                    QuicParseResult::Failed(e) => {
+                        debug!(
+                            "QUIC parsing failed after {} packets: {}",
+                            buffered_packets.len(),
+                            e
+                        );
+                        // This packet caused parsing to fail permanently
+                        break;
+                    }
+                }
+            }
+            _ = &mut timeout => {
+                debug!(
+                    "QUIC SNI aggregation timeout after {}ms with {} packets",
+                    QUIC_SNI_AGGREGATION_TIMEOUT_MS,
+                    buffered_packets.len()
+                );
+                break;
+            }
+        }
+    }
+
+    // Failed to parse SNI from aggregated packets
+    (None, buffered_packets)
+}
+
 async fn relay_udp_packet(
     mut packet_rx: mpsc::Receiver<bytes::Bytes>,
     source_sockaddr: std::net::SocketAddr,
@@ -474,15 +590,14 @@ async fn relay_udp_packet(
     let disable_ipv6 = settings.disable_ipv6;
     drop(settings);
 
-    // Wait for the first packet to determine the destination address (for domain sniffing)
-    let init_packet = match packet_rx.recv().await {
-        Some(packet) => packet,
-        None => {
-            return Ok(());
-        }
-    };
+    // Try to parse host from packets, supporting QUIC SNI aggregation
+    let (host, buffered_packets) = sniff_host_with_quic_aggregation(&mut packet_rx).await;
 
-    let host = crate::sniffer::parse_host(&init_packet);
+    // If no packets received, just return
+    if buffered_packets.is_empty() {
+        return Ok(());
+    }
+
     let dst_addr = match host {
         None => crate::rules::TargetAddr::Ip(target_sockaddr),
         Some(host) => {
@@ -507,13 +622,15 @@ async fn relay_udp_packet(
     let source_socket = udp_socket_bind_to_any_with_flag(target_sockaddr, disable_ipv6).await?;
     source_socket.connect(source_sockaddr).await?;
 
-    // Send the first packet
-    target_socket
-        .send_to(&init_packet, crate::rules::TargetAddr::Ip(target_sockaddr))
-        .await?;
-    
-    // Track first packet bytes
-    UDP_STATS.add_bytes(init_packet.len() as u64);
+    // Send all buffered packets (including the initial packet)
+    for packet in &buffered_packets {
+        target_socket
+            .send_to(packet, crate::rules::TargetAddr::Ip(target_sockaddr))
+            .await?;
+
+        // Track packet bytes
+        UDP_STATS.add_bytes(packet.len() as u64);
+    }
 
     // FullconeSocketEntry: tracks socket with its last activity time for LRU eviction
     struct FullconeSocketEntry {
@@ -625,7 +742,7 @@ async fn relay_udp_packet(
                                 // Domain without resolved IP - this typically comes from SOCKS5 proxy
                                 // responses. Full-cone NAT requires IP addresses for proper mapping,
                                 // so we cannot reliably handle this case.
-                                // 
+                                //
                                 // Note: We intentionally avoid DNS resolution here because:
                                 // 1. DNS results are unstable (load balancing, CDN, etc.)
                                 // 2. The resolved IP may differ from the actual source

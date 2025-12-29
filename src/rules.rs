@@ -1,6 +1,7 @@
 use iprange::IpRange;
 
 use ipnet::Ipv6Net;
+#[cfg(target_os = "linux")]
 use socket2::SockRef;
 use tokio::net::UdpSocket;
 use tokio::time::Instant;

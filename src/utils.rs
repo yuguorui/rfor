@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use ipnet::{IpNet, Ipv6Net, PrefixLenError};
-use tokio::io::AsyncWriteExt;
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpStream;
 
@@ -11,9 +10,12 @@ use crate::rules::RouteContext;
 use crate::get_settings;
 use crate::stats::TCP_STATS;
 
-use std::io;
 
 use anyhow::anyhow;
+#[cfg(target_os = "linux")]
+use tokio::io::AsyncWriteExt;
+#[cfg(target_os = "linux")]
+use std::io;
 use tracing;
 
 use std::convert::TryInto;
