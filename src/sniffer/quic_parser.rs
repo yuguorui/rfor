@@ -293,7 +293,9 @@ fn parse_frames_for_crypto(payload: &[u8]) -> Result<String, QuicParseError> {
             _ => {
                 // Unknown or unhandled frame type
                 // Try to skip it by reading the frame-specific data
-                // Most frames have a length field as varint
+                // Note: This assumes unknown frames have a length varint, which is not
+                // always true. However, for Initial packets we primarily expect PADDING,
+                // PING, and CRYPTO frames which are all handled above.
                 if let Some(length) = decode_varint(&mut cursor) {
                     let skip_len = length.min(cursor.remaining() as u64) as usize;
                     cursor.set_position(cursor.position() + skip_len as u64);
