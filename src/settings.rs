@@ -405,7 +405,7 @@ fn parse_route_rules(s: &Config, route: &mut RouteTable) -> Result<(), ConfigErr
                     .map_err(|e| ConfigError::Message(format!("Wrong format for IP-CIDR '{}': {}", param, e)))?;
                 let ip_v6 = ip_net.to_ipv6_net()
                     .map_err(|e| ConfigError::Message(format!("Failed to convert IP-CIDR '{}' to IPv6 network: {}", param, e)))?;
-                cond.dst_ip_range.add(ip_v6);
+                cond.dst_ip_table.insert(ip_v6.addr(), ip_v6.prefix_len() as u32, ip_v6.prefix_len());
             }
             "GEOIP" => {
                 let (filename, region) = param
@@ -433,11 +433,10 @@ fn parse_route_rules(s: &Config, route: &mut RouteTable) -> Result<(), ConfigErr
                              .for_each(|geoip| {
                                  geoip.cidr.iter().for_each(|cidr| {
                                      if let Some(net) = cidr_to_ipv6net(cidr) {
-                                         cond.dst_ip_range.add(net);
+                                         cond.dst_ip_table.insert(net.addr(), net.prefix_len() as u32, net.prefix_len());
                                      }
                                  });
                              });
-                        cond.dst_ip_range.simplify();
                     }
                     _ => {
                         return Err(ConfigError::Message(

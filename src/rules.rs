@@ -1,13 +1,13 @@
-use iprange::IpRange;
-
+use crate::utils::ToV6Net;
 use ipnet::Ipv6Net;
+use iprange::IpRange;
 #[cfg(target_os = "linux")]
 use socket2::SockRef;
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
 
 use std::fmt::Display;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 use tokio::{
@@ -18,8 +18,8 @@ use url::Url;
 
 use tracing::info;
 
-use crate::utils::{rfor_bind_addr, to_io_err, ToV6Net, ToV6SockAddr};
 use crate::get_settings;
+use crate::utils::{rfor_bind_addr, to_io_err, ToV6SockAddr};
 
 use fast_socks5::client as socks_client;
 
@@ -33,60 +33,79 @@ pub struct Outbound {
     pub bind_range: Option<IpRange<Ipv6Net>>,
 }
 
-#[derive(Debug)]
 pub struct Condition {
     pub maxmind_regions: Vec<String>,
-    pub dst_ip_range: IpRange<Ipv6Net>,
+    pub dst_ip_table: treebitmap::IpLookupTable<Ipv6Addr, u8>,
     pub domains: Option<aho_corasick::AhoCorasick>,
+}
+
+impl std::fmt::Debug for Condition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Condition")
+            .field("maxmind_regions", &self.maxmind_regions)
+            .field("dst_ip_table", &"IpLookupTable")
+            .field("domains", &self.domains)
+            .finish()
+    }
 }
 
 impl Condition {
     pub fn default() -> Self {
         Self {
             maxmind_regions: Vec::new(),
-            dst_ip_range: IpRange::<Ipv6Net>::new(),
+            dst_ip_table: treebitmap::IpLookupTable::new(),
             domains: None,
         }
     }
 
-    pub fn match_domain(&self, name: &str) -> bool {
-        if let Some(ref domains) = self.domains {
-            if domains.is_match(&name.to_owned())
-                || domains.is_match(&format!(".{name}{RULE_DOMAIN_SUFFIX_TAG}"))
-                || domains.is_match(&format!("^{}$", name)) {
-                return true;
-            }
+    pub fn match_domain(&self, name: &str) -> Option<usize> {
+        let domains = self.domains.as_ref()?;
+        let mut max_match_len = 0;
+
+        if let Some(m) = domains.find(name) {
+            max_match_len = max_match_len.max(m.end() - m.start());
+        }
+        if let Some(m) = domains.find(&format!(".{name}{RULE_DOMAIN_SUFFIX_TAG}")) {
+            max_match_len = max_match_len.max(m.end() - m.start());
+        }
+        if let Some(m) = domains.find(&format!("^{}$", name)) {
+            max_match_len = max_match_len.max(m.end() - m.start());
         }
 
-        false
+        if max_match_len > 0 {
+            Some(max_match_len)
+        } else {
+            None
+        }
     }
 
     pub fn match_sockaddr(
         &self,
         dst_sock: &SocketAddr,
         ip_db: Option<&maxminddb::Reader<Vec<u8>>>,
-    ) -> bool {
+    ) -> Option<u8> {
         let dst_ip = dst_sock.ip();
-        if let Ok(ipv6_net) = dst_ip.to_ipv6_net() {
-            if self.dst_ip_range.contains(&ipv6_net) {
-                return true;
-            }
+
+        let ipv6_addr = match dst_ip {
+             std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+             std::net::IpAddr::V6(v6) => v6,
+        };
+
+        if let Some((_, _, score)) = self.dst_ip_table.longest_match(ipv6_addr) {
+            return Some(*score);
         }
 
         /* Check the maxmind */
-        if let Some(reader) = ip_db {
-            let region: Result<maxminddb::geoip2::Country, maxminddb::MaxMindDBError> =
-                reader.lookup(dst_ip);
-            if let Ok(Some(isocode)) = region.map(|r| r.country.and_then(|c| c.iso_code)) {
-                if self
-                    .maxmind_regions
-                    .contains(&isocode.to_string().to_lowercase())
-                {
-                    return true;
-                }
-            }
+        let reader = ip_db?;
+
+        let region: maxminddb::geoip2::Country = reader.lookup(dst_ip).ok()?;
+        let isocode = region.country.and_then(|c| c.iso_code)?;
+
+        if self.maxmind_regions.contains(&isocode.to_string().to_lowercase()) {
+             return Some(0);
         }
-        false
+
+        None
     }
 }
 
@@ -203,26 +222,44 @@ impl RouteTable {
     }
 
     fn match_route(&self, context: &RouteContext) -> tokio::io::Result<u8> {
+        let mut best_domain_match: Option<(usize, usize)> = None; // (index, score)
+        let mut best_ip_match: Option<(usize, u8)> = None; // (index, score)
+
         for (index, cond) in self.rules.iter().enumerate() {
-            match &context.dst_addr {
-                TargetAddr::Ip(dst_sock) => {
-                    if cond.match_sockaddr(dst_sock, self.ip_db.as_ref()) {
-                        return Ok(index as u8);
+            // Check Domain matches
+            if let TargetAddr::Domain(domain, _, _) = &context.dst_addr {
+                if let Some(score) = cond.match_domain(domain) {
+                    if best_domain_match.map_or(true, |(_, best_score)| score > best_score) {
+                        best_domain_match = Some((index, score));
                     }
+                    // If we matched domain in this rule, this rule is a candidate.
+                    // But we iterate all rules to find the BEST domain match.
+                    continue; 
                 }
+            }
 
-                TargetAddr::Domain(domain, _, dst_sock) => {
-                    if cond.match_domain(domain) {
-                        return Ok(index as u8);
-                    }
+            // Check IP matches (only if no domain match in this rule, or target is IP)
+            // Note: If TargetAddr::Domain, we also check resolved IP (dst_sock).
+            let dst_sock = match &context.dst_addr {
+                TargetAddr::Ip(sock) => Some(sock),
+                TargetAddr::Domain(_, _, sock) => sock.as_ref(),
+            };
 
-                    if let Some(dst_sock) = dst_sock {
-                        if cond.match_sockaddr(dst_sock, self.ip_db.as_ref()) {
-                            return Ok(index as u8);
-                        }
+            if let Some(sock) = dst_sock {
+                if let Some(score) = cond.match_sockaddr(sock, self.ip_db.as_ref()) {
+                    if best_ip_match.map_or(true, |(_, best_score)| score > best_score) {
+                        best_ip_match = Some((index, score));
                     }
                 }
             }
+        }
+
+        if let Some((index, _)) = best_domain_match {
+            return Ok(index as u8);
+        }
+
+        if let Some((index, _)) = best_ip_match {
+            return Ok(index as u8);
         }
 
         self.default_outbound.ok_or_else(|| {
