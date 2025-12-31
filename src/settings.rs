@@ -30,6 +30,10 @@ struct Args {
     /// working directory
     #[arg(short, long, default_value = ".")]
     work_dir: String,
+
+    /// enable pprof
+    #[arg(long, num_args(0..=1), default_missing_value = "flamegraph.svg")]
+    pprof: Option<String>,
 }
 
 pub enum InterceptMode {
@@ -53,6 +57,7 @@ pub enum InterceptMode {
 
 pub struct Settings {
     pub debug: bool,
+    pub pprof: Option<String>,
     pub disable_ipv6: bool,
     pub tproxy_listen: Option<String>,
     pub socks5_listen: Option<String>,
@@ -107,8 +112,22 @@ impl Settings {
             },
         };
 
+        let pprof = if let Some(p) = args.pprof {
+            Some(p)
+        } else {
+            // Check config
+            if let Ok(path) = s.get::<String>("pprof") {
+                Some(path)
+            } else if let Ok(true) = s.get_bool("pprof") {
+                Some("flamegraph.svg".to_string())
+            } else {
+                None
+            }
+        };
+
         let settings = Settings {
             debug: s.get_bool("debug").unwrap_or(false),
+            pprof,
             disable_ipv6: s.get_bool("disable-ipv6").unwrap_or(false),
             tproxy_listen: s.get::<String>("tproxy-listen").ok(),
             socks5_listen: s.get::<String>("socks5-listen").ok(),

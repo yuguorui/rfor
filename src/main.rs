@@ -8,6 +8,7 @@ mod stats;
 mod tproxy;
 mod redirect;
 mod utils;
+mod profiler;
 
 use std::sync::OnceLock;
 use redirect::redirect_worker;
@@ -47,22 +48,41 @@ async fn flatten(handle: JoinHandle<Result<()>>) -> Result<()> {
 async fn main() -> Result<()> {
     init_logging();
 
+    let settings = get_settings().read().await;
+    let profiler = settings.pprof.as_ref().map(|path| profiler::start(path));
+    drop(settings);
+
     let tproxy_worker = tokio::spawn(tproxy::tproxy_worker());
     let socks_worker = tokio::spawn(socks5::socks5_worker());
     let redirect_worker = tokio::spawn(redirect_worker());
     let stats_worker = tokio::spawn(stats::stats_logger_worker());
 
-    match try_join!(
-        flatten(tproxy_worker),
-        flatten(socks_worker),
-        flatten(redirect_worker),
-        flatten(stats_worker)
-    ) {
-        Ok(_) => {
-            unreachable!("shouldn't be here.");
+    tokio::select! {
+        res = async {
+            try_join!(
+                flatten(tproxy_worker),
+                flatten(socks_worker),
+                flatten(redirect_worker),
+                flatten(stats_worker)
+            )
+        } => {
+            match res {
+                Ok(_) => {
+                    unreachable!("shouldn't be here.");
+                }
+                Err(err) => return Err(err),
+            }
         }
-        Err(err) => return Err(err),
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Received Ctrl+C, shutting down...");
+        }
     }
+
+    if let Some(p) = profiler {
+        profiler::generate_flamegraph(p)?;
+    }
+
+    Ok(())
 }
 
 fn init_logging() {

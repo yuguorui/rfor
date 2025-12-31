@@ -34,6 +34,7 @@ dashmap = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 once_cell = "1.19"
+pprof = { version = "0.15.0", features = ["flamegraph"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 iptables = "0.5"
