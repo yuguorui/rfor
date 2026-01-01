@@ -34,14 +34,10 @@ pub fn get_settings() -> &'static Arc<RwLock<Settings>> {
 }
 
 async fn flatten(handle: JoinHandle<Result<()>>) -> Result<()> {
-    match handle.await {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(err)) => Err(err),
-        Err(err) => {
-            error!("Task handling failed: {:?}", err);
-            Err(anyhow!("handling failed with error: {:?}", err))
-        }
-    }
+    handle.await.map_err(|err| {
+        error!("Task handling failed: {:?}", err);
+        anyhow!("handling failed with error: {:?}", err)
+    })?
 }
 
 async fn reload_worker(
