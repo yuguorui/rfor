@@ -257,12 +257,10 @@ pub async fn receive_signal() -> Result<()> {
     use tokio::signal::unix::signal;
     use tokio::signal::unix::SignalKind;
 
-    let mut sighang = signal(SignalKind::hangup())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
 
     let signal_name = tokio::select! {
-        _ = sighang.recv() => "SIGHUP",
         _ = sigint.recv() => "SIGINT",
         _ = sigterm.recv() => "SIGTERM",
     };

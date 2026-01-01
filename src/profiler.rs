@@ -1,9 +1,8 @@
 use std::fs::File;
-use anyhow::Result;
 
 pub struct Profiler {
     guard: pprof::ProfilerGuard<'static>,
-    path: String,
+    pub path: String,
 }
 
 pub fn start(path: &str) -> Profiler {
@@ -20,11 +19,23 @@ pub fn start(path: &str) -> Profiler {
     }
 }
 
-pub fn generate_flamegraph(profiler: Profiler) -> Result<()> {
-    if let Ok(report) = profiler.guard.report().build() {
-        let file = File::create(&profiler.path)?;
-        report.flamegraph(file)?;
-        tracing::info!("Flamegraph generated at {}", profiler.path);
+impl Drop for Profiler {
+    fn drop(&mut self) {
+        tracing::info!("Stopping profiler and generating report...");
+        match self.guard.report().build() {
+            Ok(report) => match File::create(&self.path) {
+                Ok(file) => {
+                    if let Err(e) = report.flamegraph(file) {
+                        tracing::error!("Failed to generate flamegraph: {}", e);
+                    } else {
+                        tracing::info!("Flamegraph generated at {}", self.path);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create flamegraph file '{}': {}", self.path, e)
+                }
+            },
+            Err(e) => tracing::error!("Failed to build pprof report: {}", e),
+        }
     }
-    Ok(())
 }
