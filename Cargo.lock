@@ -538,6 +538,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fqdn"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "019baf8b5cf2863d5e34ac4bc4d128cf27695033f2a422f5897fb77fd34463d9"
+
+[[package]]
+name = "fqdn-trie"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1990ce5b8b1ad7a22dadb8d4b147fafe963be47943664263a25802be0ebdbcaf"
+dependencies = [
+ "fqdn",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1643,6 +1658,8 @@ dependencies = [
  "config",
  "dashmap",
  "fast-socks5",
+ "fqdn",
+ "fqdn-trie",
  "futures",
  "ip_network_table-deps-treebitmap",
  "ipnet",

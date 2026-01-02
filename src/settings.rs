@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use clap::Parser;
+use fqdn::FQDN;
 use itertools::Itertools;
 use tracing::warn;
 
@@ -8,7 +9,7 @@ use config::{Config, ConfigError, Environment, File};
 use ipnet::IpNet;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::rules::{RouteTable, RULE_DOMAIN_SUFFIX_TAG};
+use crate::rules::RouteTable;
 use crate::utils::{vec_to_array, ToV6Net};
 
 const DIRECT_OUTBOUND_NAME: &str = "DIRECT";
@@ -443,7 +444,11 @@ fn parse_optional_string_field(
 }
 
 fn parse_route_rules(s: &Config, route: &mut RouteTable) -> Result<(), ConfigError> {
-    let mut domain_sets: Vec<HashSet<_>> = vec![HashSet::new(); route.outbounds.len()];
+    // Separate storage for different types of domain rules per outbound
+    let num_outbounds = route.outbounds.len();
+    let mut keyword_sets: Vec<HashSet<String>> = vec![HashSet::new(); num_outbounds];
+    let mut suffix_sets: Vec<Vec<(FQDN, u8)>> = vec![Vec::new(); num_outbounds];
+    let mut exact_sets: Vec<HashSet<String>> = vec![HashSet::new(); num_outbounds];
 
     for user_rule in s.get_array("rules").unwrap_or_default() {
         let rule = user_rule.into_string()?;
@@ -563,7 +568,6 @@ fn parse_route_rules(s: &Config, route: &mut RouteTable) -> Result<(), ConfigErr
                         .ok_or_else(|| {
                             ConfigError::Message(format!("Outbound '{}' not found", outbound_name))
                         })?;
-                let domains = &mut domain_sets[outbound_index as usize];
 
                 let mut f = std::fs::File::open(filename).map_err(|e| {
                     ConfigError::Message(format!("Failed to open file '{}': {}", filename, e))
@@ -581,40 +585,63 @@ fn parse_route_rules(s: &Config, route: &mut RouteTable) -> Result<(), ConfigErr
                     .map(|e| &e.domain)
                     .for_each(|ds| {
                         ds.iter().for_each(|d| {
+                            let idx = outbound_index as usize;
                             match d.type_.enum_value() {
                                 Ok(crate::protos::common::domain::Type::Plain) => {
-                                    domains.insert(d.value.to_owned());
+                                    // Plain type -> keyword matching with AC
+                                    keyword_sets[idx].insert(d.value.to_lowercase());
                                 }
-                                Ok(crate::protos::common::domain::Type::Regex) => { /* Not supported. */
+                                Ok(crate::protos::common::domain::Type::Regex) => {
+                                    // Regex not supported, skip
                                 }
                                 Ok(crate::protos::common::domain::Type::RootDomain) => {
-                                    domains.insert(format!(".{}{}", d.value, RULE_DOMAIN_SUFFIX_TAG));
+                                    // RootDomain -> suffix matching with Trie
+                                    if let Ok(fqdn) = d.value.to_lowercase().parse::<FQDN>() {
+                                        let score = d.value.len().min(255) as u8;
+                                        suffix_sets[idx].push((fqdn, score));
+                                    }
                                 }
                                 Ok(crate::protos::common::domain::Type::Full) => {
-                                    domains.insert(format!("^{}$", d.value));
+                                    // Full -> exact match
+                                    exact_sets[idx].insert(d.value.to_lowercase());
                                 }
                                 Err(_) => { /* Unknown type, skip */ }
                             }
                         })
                     });
             }
-            tag @ ("DOMAIN" | "DOMAIN-SUFFIX") => {
+            "DOMAIN" => {
                 let outbound_index =
                     route
                         .get_outbound_index_by_name(outbound_name)
                         .ok_or_else(|| {
                             ConfigError::Message(format!("Outbound '{}' not found", outbound_name))
                         })?;
-                let domains = &mut domain_sets[outbound_index as usize];
-                match tag {
-                    "DOMAIN" => {
-                        domains.insert(param.to_string());
-                    }
-                    "DOMAIN-SUFFIX" => {
-                        domains.insert(param.to_string() + RULE_DOMAIN_SUFFIX_TAG);
-                    }
-                    _ => {}
+                // DOMAIN -> exact match
+                exact_sets[outbound_index as usize].insert(param.to_lowercase());
+            }
+            "DOMAIN-SUFFIX" => {
+                let outbound_index =
+                    route
+                        .get_outbound_index_by_name(outbound_name)
+                        .ok_or_else(|| {
+                            ConfigError::Message(format!("Outbound '{}' not found", outbound_name))
+                        })?;
+                // DOMAIN-SUFFIX -> suffix matching with Trie
+                if let Ok(fqdn) = param.to_lowercase().parse::<FQDN>() {
+                    let score = param.len().min(255) as u8;
+                    suffix_sets[outbound_index as usize].push((fqdn, score));
                 }
+            }
+            "DOMAIN-KEYWORD" => {
+                let outbound_index =
+                    route
+                        .get_outbound_index_by_name(outbound_name)
+                        .ok_or_else(|| {
+                            ConfigError::Message(format!("Outbound '{}' not found", outbound_name))
+                        })?;
+                // DOMAIN-KEYWORD -> keyword matching with AC
+                keyword_sets[outbound_index as usize].insert(param.to_lowercase());
             }
             e @ _ => {
                 return Err(ConfigError::Message(format!(
@@ -625,15 +652,29 @@ fn parse_route_rules(s: &Config, route: &mut RouteTable) -> Result<(), ConfigErr
         }
     }
 
-    for (i, v) in domain_sets.iter().enumerate() {
+    // Build the matchers for each outbound
+    for i in 0..num_outbounds {
         let cond = route
             .rules
             .get_mut(i)
             .ok_or_else(|| ConfigError::Message(format!("Invalid rule index: {}", i)))?;
-        cond.domains =
-            Some(aho_corasick::AhoCorasick::new(v.iter()).map_err(|e| {
-                ConfigError::Message(format!("Failed to build domain matcher: {}", e))
-            })?);
+
+        // Build Aho-Corasick for keyword matching
+        if !keyword_sets[i].is_empty() {
+            cond.domain_keywords = Some(
+                aho_corasick::AhoCorasick::new(keyword_sets[i].iter()).map_err(|e| {
+                    ConfigError::Message(format!("Failed to build keyword matcher: {}", e))
+                })?,
+            );
+        }
+
+        // Build FqdnTrieMap for suffix matching
+        for (fqdn, score) in suffix_sets[i].drain(..) {
+            cond.domain_suffix_trie.insert(fqdn, score);
+        }
+
+        // Set exact domains
+        cond.exact_domains = std::mem::take(&mut exact_sets[i]);
     }
 
     Ok(())

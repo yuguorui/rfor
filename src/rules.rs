@@ -1,4 +1,5 @@
-use crate::utils::ToV6Net;
+use fqdn::FQDN;
+use fqdn_trie::FqdnTrieMap;
 use ipnet::Ipv6Net;
 use iprange::IpRange;
 #[cfg(target_os = "linux")]
@@ -19,11 +20,10 @@ use url::Url;
 use tracing::info;
 
 use crate::get_settings;
-use crate::utils::{rfor_bind_addr, to_io_err, ToV6SockAddr};
+use crate::utils::{rfor_bind_addr, to_io_err, ToV6Net, ToV6SockAddr};
 
 use fast_socks5::client as socks_client;
 
-pub const RULE_DOMAIN_SUFFIX_TAG: &str = "@";
 pub const TIMEOUT: u64 = 3000;
 
 #[derive(Debug, Clone)]
@@ -36,7 +36,13 @@ pub struct Outbound {
 pub struct Condition {
     pub maxmind_regions: Vec<String>,
     pub dst_ip_table: treebitmap::IpLookupTable<Ipv6Addr, u8>,
-    pub domains: Option<aho_corasick::AhoCorasick>,
+    /// Trie for domain suffix matching (DOMAIN-SUFFIX and RootDomain rules)
+    /// Maps domain suffix -> match score (based on domain length)
+    pub domain_suffix_trie: FqdnTrieMap<FQDN, u8>,
+    /// Aho-Corasick for keyword/plain domain matching (Plain type in GEOSITE)
+    pub domain_keywords: Option<aho_corasick::AhoCorasick>,
+    /// Exact domain matches (DOMAIN and Full type in GEOSITE)
+    pub exact_domains: std::collections::HashSet<String>,
 }
 
 impl std::fmt::Debug for Condition {
@@ -44,7 +50,9 @@ impl std::fmt::Debug for Condition {
         f.debug_struct("Condition")
             .field("maxmind_regions", &self.maxmind_regions)
             .field("dst_ip_table", &"IpLookupTable")
-            .field("domains", &self.domains)
+            .field("domain_suffix_trie", &"FqdnTrieMap")
+            .field("domain_keywords", &self.domain_keywords)
+            .field("exact_domains", &self.exact_domains)
             .finish()
     }
 }
@@ -54,22 +62,38 @@ impl Condition {
         Self {
             maxmind_regions: Vec::new(),
             dst_ip_table: treebitmap::IpLookupTable::new(),
-            domains: None,
+            // Initialize with root domain "." mapping to 0 (no match)
+            domain_suffix_trie: FqdnTrieMap::<FQDN, u8>::new(0),
+            domain_keywords: None,
+            exact_domains: std::collections::HashSet::new(),
         }
     }
 
     pub fn match_domain(&self, name: &str) -> Option<usize> {
-        let domains = self.domains.as_ref()?;
-        let mut max_match_len = 0;
+        let mut max_match_len: usize = 0;
+        let name_lower = name.to_lowercase();
 
-        if let Some(m) = domains.find(name) {
-            max_match_len = max_match_len.max(m.end() - m.start());
+        // 1. Check exact domain match first (highest priority)
+        if self.exact_domains.contains(&name_lower) {
+            // Exact match gets full domain length as score
+            return Some(name.len() + 100); // Add bonus for exact match
         }
-        if let Some(m) = domains.find(&format!(".{name}{RULE_DOMAIN_SUFFIX_TAG}")) {
-            max_match_len = max_match_len.max(m.end() - m.start());
+
+        // 2. Check domain suffix match using Trie
+        // fqdn-trie's lookup() returns the longest matching suffix
+        // Note: fqdn crate is case-insensitive by default
+        if let Ok(fqdn) = name_lower.parse::<FQDN>() {
+            let score = *self.domain_suffix_trie.lookup(&fqdn);
+            if score > 0 {
+                max_match_len = max_match_len.max(score as usize);
+            }
         }
-        if let Some(m) = domains.find(&format!("^{}$", name)) {
-            max_match_len = max_match_len.max(m.end() - m.start());
+
+        // 3. Check keyword match using Aho-Corasick
+        if let Some(ref ac) = self.domain_keywords {
+            if let Some(m) = ac.find(&name_lower) {
+                max_match_len = max_match_len.max(m.end() - m.start());
+            }
         }
 
         if max_match_len > 0 {
