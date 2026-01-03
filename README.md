@@ -16,6 +16,8 @@ Features
 - Optional source IP preserving when connects directly
 - Native IPv6 support
 - UDP transparent proxy
+- Performance profiling with pprof/flamegraph 📊
+- SIGHUP configuration reload without restart 🔄
 
 Build
 -----
