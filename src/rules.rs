@@ -318,15 +318,20 @@ impl RouteTable {
             })?;
 
             #[cfg(target_os = "linux")]
-            if let InboundProtocol::TPROXY = inbound_proto {
-                if let Some(bind_range) = &outbound.bind_range {
-                    if let Ok(ipv6_net) = context.src_addr.ip().to_ipv6_net() {
-                        if bind_range.contains(&ipv6_net) {
-                            crate::tproxy::tproxy_bind_src(
-                                socket2::SockRef::from(&sock),
-                                context.src_addr,
-                            )?;
-                            sock.set_reuseaddr(true)?;
+            if matches!(
+                inbound_proto,
+                InboundProtocol::TPROXY | InboundProtocol::REDIRECT
+            ) {
+                if let InboundProtocol::TPROXY = inbound_proto {
+                    if let Some(bind_range) = &outbound.bind_range {
+                        if let Ok(ipv6_net) = context.src_addr.ip().to_ipv6_net() {
+                            if bind_range.contains(&ipv6_net) {
+                                crate::tproxy::tproxy_bind_src(
+                                    socket2::SockRef::from(&sock),
+                                    context.src_addr,
+                                )?;
+                                sock.set_reuseaddr(true)?;
+                            }
                         }
                     }
                 }
