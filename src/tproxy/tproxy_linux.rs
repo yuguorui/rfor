@@ -400,9 +400,8 @@ async fn udp_socket_bind_to_any_with_flag(
         bind_sockaddr.to_ipv6_sockaddr()
     };
 
-    let fd;
-    unsafe {
-        fd = libc::socket(if disable_ipv6 {libc::AF_INET} else {libc::AF_INET6},
+    let owned_fd = unsafe {
+        let fd = libc::socket(if disable_ipv6 {libc::AF_INET} else {libc::AF_INET6},
             libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0);
         if fd < 0 {
             return Err(anyhow!(
@@ -410,9 +409,15 @@ async fn udp_socket_bind_to_any_with_flag(
                 std::io::Error::last_os_error()
             ));
         }
+        // Take ownership immediately so Drop closes the fd on any error below
+        OwnedFd::from_raw_fd(fd)
+    };
+
+    unsafe {
+        let raw_fd = owned_fd.as_raw_fd();
 
         let ret = libc::setsockopt(
-            fd,
+            raw_fd,
             libc::IPPROTO_IP,
             libc::IP_TRANSPARENT,
             &1 as *const _ as *const libc::c_void,
@@ -426,7 +431,7 @@ async fn udp_socket_bind_to_any_with_flag(
         }
 
         let ret = libc::setsockopt(
-            fd,
+            raw_fd,
             libc::SOL_SOCKET,
             libc::SO_REUSEADDR,
             &1 as *const _ as *const libc::c_void,
@@ -442,7 +447,7 @@ async fn udp_socket_bind_to_any_with_flag(
         let addr = socket2::SockAddr::from(bind_sockaddr);
         let addr_stor = addr.as_storage();
         let ret = libc::bind(
-            fd,
+            raw_fd,
             &addr_stor as *const _ as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_storage>() as u32,
         );
@@ -455,7 +460,7 @@ async fn udp_socket_bind_to_any_with_flag(
         }
     }
     let source_socket =
-        unsafe { UdpSocket::from_std(std::net::UdpSocket::from(OwnedFd::from_raw_fd(fd))) }?;
+        UdpSocket::from_std(std::net::UdpSocket::from(owned_fd))?;
     prepare_socket_bypass_mangle(source_socket.as_raw_fd()).await?;
     return Ok(source_socket);
 }

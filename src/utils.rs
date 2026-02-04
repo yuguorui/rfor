@@ -98,6 +98,9 @@ pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> 
         },
     };
 
+    setup_tcp_keepalive(in_sock);
+    setup_tcp_keepalive(&out_sock);
+
     // Track session start
     TCP_STATS.session_start();
 
@@ -276,6 +279,17 @@ pub async fn receive_signal() -> Result<()> {
     tokio::signal::ctrl_c().await?;
     tracing::error!("Received signal: CTRL_C");
     Err(anyhow!("Received signal: CTRL_C"))
+}
+
+fn setup_tcp_keepalive(sock: &TcpStream) {
+    use socket2::SockRef;
+    let sock_ref = SockRef::from(sock);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(10));
+    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+        tracing::warn!("Failed to set TCP keepalive: {}", e);
+    }
 }
 
 pub fn to_target_addr(target_addr: fast_socks5::util::target_addr::TargetAddr) -> crate::rules::TargetAddr {
