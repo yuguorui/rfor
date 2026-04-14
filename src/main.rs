@@ -22,7 +22,7 @@ use settings::Settings;
 
 use anyhow::anyhow;
 use anyhow::Result;
-use tracing::error;
+use tracing::{error, info};
 use tracing_subscriber;
 
 static SETTINGS: OnceLock<Arc<RwLock<Settings>>> = OnceLock::new();
@@ -99,6 +99,24 @@ async fn main() -> Result<()> {
     init_logging();
 
     let settings = get_settings().read().await;
+
+    let exe_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Ok(bytes) = std::fs::read(&exe_path) {
+                bytes.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    };
+    info!(
+        "rfor {} [exe_hash={:016x}], settings:\n{}",
+        env!("CARGO_PKG_VERSION"),
+        exe_hash,
+        settings.to_yaml()
+    );
+
     let profiler = settings.pprof.as_ref().map(|path| profiler::start(path));
     drop(settings);
 

@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use clap::Parser;
 use fqdn::FQDN;
 use itertools::Itertools;
+use serde::Serialize;
 use tracing::warn;
 
 use config::{Config, ConfigError, Environment, File};
@@ -37,6 +38,7 @@ struct Args {
     pprof: Option<String>,
 }
 
+#[derive(Serialize)]
 pub enum InterceptMode {
     TPROXY {
         local_traffic: bool,
@@ -56,6 +58,7 @@ pub enum InterceptMode {
     MANUAL,
 }
 
+#[derive(Serialize)]
 pub struct Settings {
     pub debug: bool,
     pub pprof: Option<String>,
@@ -63,6 +66,7 @@ pub struct Settings {
     pub tproxy_listen: Option<String>,
     pub socks5_listen: Option<String>,
     pub redirect_listen: Option<String>,
+    #[serde(skip)]
     pub routetable: RouteTable,
     pub intercept_mode: InterceptMode,
     pub udp_enable: bool,
@@ -81,6 +85,10 @@ pub struct Settings {
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
         Self::load()
+    }
+
+    pub fn to_yaml(&self) -> String {
+        serde_yaml::to_string(self).unwrap_or_else(|e| format!("<failed to serialize: {}>", e))
     }
 
     pub fn load() -> Result<Self, ConfigError> {
