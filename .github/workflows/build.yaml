@@ -16,7 +16,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             arch: aarch64
             cross: true
-          - target: armv7-unknown-linux-musleabihf
+          - target: armv7-unknown-linux-musleabi
             arch: armv7
             cross: true
           - target: riscv64gc-unknown-linux-musl
