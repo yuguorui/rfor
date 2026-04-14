@@ -355,17 +355,14 @@ impl RouteTable {
                 ))
             }
             "socks" | "socks5" => {
-                let socks_server = format!(
-                    "{}:{}",
-                    proxy_url.host_str().ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing proxy host")
-                    })?,
-                    proxy_url.port_or_known_default().ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing proxy port")
-                    })?
-                );
+                let socks_host = proxy_url.host_str().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing proxy host")
+                })?;
+                let socks_port = proxy_url.port_or_known_default().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing proxy port")
+                })?;
 
-                let target_addr = match &context.dst_addr {
+                let target_host = match &context.dst_addr {
                     TargetAddr::Ip(dst_sock) => dst_sock.ip().to_string(),
                     TargetAddr::Domain(domain, _, _) => domain.to_owned(),
                 };
@@ -374,30 +371,61 @@ impl RouteTable {
                     TargetAddr::Domain(_, port, _) => port,
                 };
 
-                let sock = if proxy_url.username().is_empty() {
-                    let fut = socks_client::Socks5Stream::connect(
-                        socks_server,
-                        target_addr,
-                        target_port,
-                        socks_client::Config::default(),
-                    );
-                    timeout(Duration::from_millis(TIMEOUT), fut)
-                        .await?
-                        .map_err(to_io_err)?
+                // Build the TCP socket to the SOCKS5 server ourselves so we
+                // can set SO_MARK before connect(). Otherwise the SYN to the
+                // proxy server can be caught by our own REDIRECT/TPROXY rules
+                // and loop back into rfor.
+                let auth = if proxy_url.username().is_empty() {
+                    None
                 } else {
-                    let fut = socks_client::Socks5Stream::connect_with_password(
-                        socks_server,
-                        target_addr,
-                        target_port,
-                        proxy_url.username().to_string(),
-                        proxy_url.password().unwrap_or("").to_string(),
-                        socks_client::Config::default(),
-                    );
-                    timeout(Duration::from_millis(TIMEOUT), fut)
-                        .await?
-                        .map_err(to_io_err)?
+                    Some(fast_socks5::AuthenticationMethod::Password {
+                        username: proxy_url.username().to_string(),
+                        password: proxy_url.password().unwrap_or("").to_string(),
+                    })
                 };
-                Ok(sock.get_socket())
+                let socks_host = socks_host.to_owned();
+
+                // Build the TCP socket to the SOCKS5 server ourselves so we
+                // can set SO_MARK before connect(). Otherwise the SYN to the
+                // proxy server can be caught by our own REDIRECT/TPROXY rules
+                // in the OUTPUT chain and loop back into rfor.
+                let connect_and_handshake = async {
+                    let socks_sock_addr = resolve_target_addr(TargetAddr::Domain(
+                        socks_host,
+                        socks_port,
+                        None,
+                    ))
+                    .await?;
+                    let sock = match get_settings().read().await.disable_ipv6 {
+                        false => TcpSocket::new_v6()?,
+                        true => TcpSocket::new_v4()?,
+                    };
+                    #[cfg(target_os = "linux")]
+                    prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
+                    let stream = sock.connect(socks_sock_addr).await?;
+
+                    let mut socks = socks_client::Socks5Stream::use_stream(
+                        stream,
+                        auth,
+                        socks_client::Config::default(),
+                    )
+                    .await
+                    .map_err(to_io_err)?;
+                    socks
+                        .request(
+                            fast_socks5::Socks5Command::TCPConnect,
+                            fast_socks5::util::target_addr::TargetAddr::Domain(
+                                target_host,
+                                target_port,
+                            ),
+                        )
+                        .await
+                        .map_err(to_io_err)?;
+                    Ok::<_, std::io::Error>(socks)
+                };
+                let socks = timeout(Duration::from_millis(TIMEOUT), connect_and_handshake)
+                    .await??;
+                Ok(socks.get_socket())
             }
             scheme => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
