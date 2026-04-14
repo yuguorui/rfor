@@ -49,3 +49,8 @@ netlink-packet-route = "0.19"
 protobuf-codegen = "3"
 protoc-bin-vendored = "3"
 which = "7"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
