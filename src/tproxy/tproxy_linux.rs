@@ -111,11 +111,104 @@ pub async fn tproxy_worker() -> Result<()> {
             clean_environment().await?;
             return Err(err);
         },
+        _ = reconcile_environment_loop() => {},
         Err(err) = crate::utils::receive_signal() => {
             clean_environment().await?;
             return Err(err);
         },
     };
+}
+
+fn mangle_iptables_healthy(
+    ipt: &iptables::IPTables,
+    proxy_chain: &str,
+    mark_chain: &str,
+    local_traffic: bool,
+) -> bool {
+    // Both custom chains must exist and still contain their rules.
+    for chain in [proxy_chain, mark_chain] {
+        if !ipt.chain_exists("mangle", chain).unwrap_or(false) {
+            return false;
+        }
+        match ipt.list("mangle", chain) {
+            Ok(rules) if rules.len() > 1 => {}
+            _ => return false,
+        }
+    }
+    let proxy_jump = format!("-j {}", proxy_chain);
+    let mark_jump = format!("-j {}", mark_chain);
+    let jumped_from = |chain: &str, pat: &str| {
+        ipt.list("mangle", chain)
+            .map(|rs| rs.iter().any(|r| r.contains(pat)))
+            .unwrap_or(false)
+    };
+    if !jumped_from("PREROUTING", &proxy_jump) {
+        return false;
+    }
+    if local_traffic && !jumped_from("OUTPUT", &mark_jump) {
+        return false;
+    }
+    true
+}
+
+async fn reconcile_environment_loop() {
+    use std::time::Duration;
+    let period = Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(period).await;
+
+        let settings = get_settings().read().await;
+        let (proxy_chain, mark_chain, local_traffic, check_v6) = match &settings.intercept_mode {
+            crate::settings::InterceptMode::TPROXY {
+                proxy_chain,
+                mark_chain,
+                local_traffic,
+                ..
+            } => (
+                proxy_chain.clone(),
+                mark_chain.clone(),
+                *local_traffic,
+                !settings.disable_ipv6,
+            ),
+            _ => return,
+        };
+        drop(settings);
+
+        let ipt4 = match iptables::new(false) {
+            Ok(i) => i,
+            Err(e) => {
+                warn!("reconcile: failed to open ipv4 iptables: {}", e);
+                continue;
+            }
+        };
+        let v4_ok = mangle_iptables_healthy(&ipt4, &proxy_chain, &mark_chain, local_traffic);
+        let v6_ok = if check_v6 {
+            match iptables::new(true) {
+                Ok(ipt6) => {
+                    mangle_iptables_healthy(&ipt6, &proxy_chain, &mark_chain, local_traffic)
+                }
+                Err(e) => {
+                    warn!("reconcile: failed to open ipv6 iptables: {}", e);
+                    true
+                }
+            }
+        } else {
+            true
+        };
+
+        if v4_ok && v6_ok {
+            continue;
+        }
+
+        warn!(
+            "tproxy mangle rules missing or incomplete (v4_ok={}, v6_ok={}), rebuilding",
+            v4_ok, v6_ok
+        );
+        match environment_setup().await {
+            Ok(()) => info!("tproxy mangle rules rebuilt"),
+            Err(e) => error!("reconcile rebuild failed: {:#}", e),
+        }
+    }
 }
 
 async fn accept_socket_loop(listen_addr: &str) -> Result<()> {
