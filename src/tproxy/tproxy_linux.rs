@@ -1094,6 +1094,7 @@ async fn set_iptables(
         ],
     )
     .map_err(|e| {
+        error!("failed adding ipv4 iptable rules: {}", e);
         tokio::io::Error::new(
             tokio::io::ErrorKind::Other,
             format!("failed adding ipv4 iptable rules, {}.", e.to_string()),
@@ -1123,6 +1124,7 @@ async fn set_iptables(
             ],
         )
         .map_err(|e| {
+            error!("failed adding ipv6 iptable rules: {}", e);
             tokio::io::Error::new(
                 tokio::io::ErrorKind::Other,
                 format!("failed adding ipv6 iptable rules, {}.", e.to_string()),
