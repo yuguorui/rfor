@@ -111,7 +111,10 @@ pub async fn tproxy_worker() -> Result<()> {
             clean_environment().await?;
             return Err(err);
         },
-        _ = reconcile_environment_loop() => {},
+        _ = reconcile_environment_loop() => {
+            clean_environment().await?;
+            return Ok(());
+        },
         Err(err) = crate::utils::receive_signal() => {
             clean_environment().await?;
             return Err(err);
