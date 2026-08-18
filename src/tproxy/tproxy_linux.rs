@@ -3,11 +3,17 @@ use socket2::{SockAddr, SockRef};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 
-use tracing::{error, info, warn, debug};
+use tracing::{debug, error, info, warn};
 
-use crate::{rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr, get_settings};
 use crate::stats::UDP_STATS;
-use std::{collections::hash_map, mem::MaybeUninit, os::fd::BorrowedFd, sync::Arc, time::{Duration, Instant}};
+use crate::{get_settings, rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr};
+use std::{
+    collections::hash_map,
+    mem::MaybeUninit,
+    os::fd::BorrowedFd,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
@@ -25,8 +31,7 @@ struct UdpSessionEntry {
 const UDP_SESSION_CHANNEL_SIZE: usize = 32;
 
 /// Global map to track active UDP sessions with packet forwarding channels
-static UDP_SESSIONS: Lazy<DashMap<UdpSessionKey, UdpSessionEntry>> =
-    Lazy::new(|| DashMap::new());
+static UDP_SESSIONS: Lazy<DashMap<UdpSessionKey, UdpSessionEntry>> = Lazy::new(|| DashMap::new());
 
 fn setup_iptransparent_opts(sock: &SockRef) -> std::io::Result<()> {
     use nix::sys::socket::sockopt::IpTransparent;
@@ -355,9 +360,9 @@ fn recvmsg_wrapper(
 }
 
 async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
+    use dashmap::mapref::entry::Entry;
     use std::os::unix::io::AsRawFd;
     use tokio::io::Interest;
-    use dashmap::mapref::entry::Entry;
 
     let settings = get_settings().read().await;
     if !settings.udp_enable {
@@ -440,24 +445,21 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
                             continue;
                         }
 
-                        entry.insert(UdpSessionEntry {
-                            packet_tx: tx,
-                        });
+                        entry.insert(UdpSessionEntry { packet_tx: tx });
 
                         // Track UDP session start
                         UDP_STATS.session_start();
 
                         info!(
                             "udp relay: create tunnel {:?} <-> {:?} (active sessions: {})",
-                            source_sockaddr, target_sockaddr, UDP_SESSIONS.len()
+                            source_sockaddr,
+                            target_sockaddr,
+                            UDP_SESSIONS.len()
                         );
 
                         tokio::spawn(async move {
-                            let result = relay_udp_packet(
-                                rx,
-                                source_sockaddr,
-                                target_sockaddr,
-                            ).await;
+                            let result =
+                                relay_udp_packet(rx, source_sockaddr, target_sockaddr).await;
 
                             // Always remove the session when done (DashMap remove is lock-free)
                             UDP_SESSIONS.remove(&(
@@ -499,8 +501,15 @@ async fn udp_socket_bind_to_any_with_flag(
     };
 
     let owned_fd = unsafe {
-        let fd = libc::socket(if disable_ipv6 {libc::AF_INET} else {libc::AF_INET6},
-            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0);
+        let fd = libc::socket(
+            if disable_ipv6 {
+                libc::AF_INET
+            } else {
+                libc::AF_INET6
+            },
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK,
+            0,
+        );
         if fd < 0 {
             return Err(anyhow!(
                 "failed to create socket: {}",
@@ -557,8 +566,7 @@ async fn udp_socket_bind_to_any_with_flag(
             ));
         }
     }
-    let source_socket =
-        UdpSocket::from_std(std::net::UdpSocket::from(owned_fd))?;
+    let source_socket = UdpSocket::from_std(std::net::UdpSocket::from(owned_fd))?;
     prepare_socket_bypass_mangle(source_socket.as_raw_fd()).await?;
     return Ok(source_socket);
 }
@@ -620,7 +628,9 @@ async fn sniff_host_with_quic_aggregation(
     }
 
     // Set up timeout for aggregation
-    let timeout = tokio::time::sleep(std::time::Duration::from_millis(QUIC_SNI_AGGREGATION_TIMEOUT_MS));
+    let timeout = tokio::time::sleep(std::time::Duration::from_millis(
+        QUIC_SNI_AGGREGATION_TIMEOUT_MS,
+    ));
     tokio::pin!(timeout);
 
     // Try to receive more packets for aggregation
@@ -1059,7 +1069,6 @@ fn __setup_iptables(
     udp_enable: bool,
     reserved_ip: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
-
     let table = "mangle";
     ipt.new_chain(table, proxy_chain)?;
     for ip in reserved_ip {
@@ -1085,9 +1094,7 @@ fn __setup_iptables(
         proxy_chain,
         &format!(
             "-p tcp --match multiport --dports {} -j TPROXY --tproxy-mark {} --on-port {}",
-            ports,
-            xmark,
-            tproxy_port,
+            ports, xmark, tproxy_port,
         ),
     )?;
 
@@ -1097,9 +1104,7 @@ fn __setup_iptables(
             proxy_chain,
             &format!(
                 "-p udp --match multiport --dports {} -j TPROXY --tproxy-mark {} --on-port {}",
-                ports,
-                xmark,
-                tproxy_port,
+                ports, xmark, tproxy_port,
             ),
         )?;
     }
@@ -1109,8 +1114,7 @@ fn __setup_iptables(
         proxy_chain,
         &format!(
             "-p tcp --match multiport --sports {} -j MARK --set-mark {}",
-            ports,
-            xmark,
+            ports, xmark,
         ),
     )?;
 
@@ -1141,8 +1145,7 @@ fn __setup_iptables(
             mark_chain,
             &format!(
                 "-p tcp --match multiport --dports {} -j MARK --set-mark {}",
-                ports,
-                xmark,
+                ports, xmark,
             ),
         )?;
 
@@ -1152,8 +1155,7 @@ fn __setup_iptables(
                 mark_chain,
                 &format!(
                     "-p udp --match multiport --dports {} -j MARK --set-mark {}",
-                    ports,
-                    xmark,
+                    ports, xmark,
                 ),
             )?;
         }
@@ -1173,8 +1175,7 @@ async fn set_iptables(
     local_traffic: bool,
 ) -> Result<()> {
     __setup_iptables(
-        &iptables::new(false)
-            .map_err(|e| anyhow!("command iptables not found: {}", e))?,
+        &iptables::new(false).map_err(|e| anyhow!("command iptables not found: {}", e))?,
         proxy_chain,
         mark_chain,
         tproxy_port,
@@ -1204,8 +1205,7 @@ async fn set_iptables(
 
     if !get_settings().read().await.disable_ipv6 {
         __setup_iptables(
-            &iptables::new(true)
-                .map_err(|e| anyhow!("command ip6tables not found: {}", e))?,
+            &iptables::new(true).map_err(|e| anyhow!("command ip6tables not found: {}", e))?,
             proxy_chain,
             mark_chain,
             tproxy_port,
@@ -1302,9 +1302,9 @@ async fn get_link_by_name(
 }
 
 async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use netlink_packet_route::route::{RouteScope, RouteType};
     use netlink_packet_route::rule::RuleAttribute;
-    use netlink_packet_route::route::{RouteType, RouteScope};
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     use rtnetlink::new_connection;
 
@@ -1318,7 +1318,9 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
         .v4()
         .table_id(route_table_index.into())
         .action(netlink_packet_route::rule::RuleAction::ToTable);
-    rule.message_mut().attributes.push(RuleAttribute::FwMark(fwmark));
+    rule.message_mut()
+        .attributes
+        .push(RuleAttribute::FwMark(fwmark));
     rule.execute().await?;
 
     if !get_settings().read().await.disable_ipv6 {
@@ -1328,7 +1330,9 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
             .v6()
             .table_id(route_table_index.into())
             .action(netlink_packet_route::rule::RuleAction::ToTable);
-        rule.message_mut().attributes.push(RuleAttribute::FwMark(fwmark));
+        rule.message_mut()
+            .attributes
+            .push(RuleAttribute::FwMark(fwmark));
         rule.execute().await?;
     }
 

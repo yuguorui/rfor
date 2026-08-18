@@ -3,9 +3,9 @@
 //! This module provides global statistics tracking for TCP and UDP sessions,
 //! including active/total session counts and bytes transferred.
 
+use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
-use once_cell::sync::Lazy;
 use tracing::info;
 
 /// Global statistics for sessions (TCP or UDP)

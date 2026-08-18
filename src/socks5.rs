@@ -9,9 +9,9 @@ use tracing::{error, info, warn};
 
 use crate::rules::ProxyDgram;
 use crate::{
+    get_settings,
     rules::{InboundProtocol, RouteContext},
     utils::transfer_tcp,
-    get_settings,
 };
 
 pub async fn socks5_worker() -> Result<()> {
@@ -41,8 +41,10 @@ pub async fn socks5_worker() -> Result<()> {
 }
 
 async fn socks5_instance(socket: TcpStream) -> Result<()> {
-    let (proto, cmd, target_addr) = Socks5ServerProtocol::accept_no_auth(socket).await?
-        .read_command().await?;
+    let (proto, cmd, target_addr) = Socks5ServerProtocol::accept_no_auth(socket)
+        .await?
+        .read_command()
+        .await?;
 
     let empty_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0));
     let empty_sockaddr = std::net::SocketAddr::new(empty_ip, 0);
@@ -70,9 +72,9 @@ async fn socks5_instance(socket: TcpStream) -> Result<()> {
                 },
             };
 
-            transfer_tcp(&mut inner, context.clone()).await.with_context(
-                || format!("failed to relay {}", context),
-            )?;
+            transfer_tcp(&mut inner, context.clone())
+                .await
+                .with_context(|| format!("failed to relay {}", context))?;
         }
         fast_socks5::Socks5Command::TCPBind => {
             proto.reply_error(&ReplyError::CommandNotSupported).await?;
@@ -105,7 +107,9 @@ async fn handle_udp_request(inbound: &UdpSocket, outbound: &dyn ProxyDgram) -> R
             return Ok(());
         }
 
-        outbound.send_to(&data, crate::utils::to_target_addr(target_addr)).await?;
+        outbound
+            .send_to(&data, crate::utils::to_target_addr(target_addr))
+            .await?;
     }
 }
 
@@ -116,13 +120,12 @@ async fn handle_udp_response(inbound: &UdpSocket, outbound: &dyn ProxyDgram) -> 
 
         // 1. prepare the response header
         let mut data = match remote_addr {
-            crate::rules::TargetAddr::Ip(sockaddr) => {
-                fast_socks5::new_udp_header(sockaddr)
-            }
+            crate::rules::TargetAddr::Ip(sockaddr) => fast_socks5::new_udp_header(sockaddr),
             crate::rules::TargetAddr::Domain(domain, port, _) => {
                 fast_socks5::new_udp_header((domain.as_str(), port))
             }
-        }.context("target address is not a valid domain or ip")?;
+        }
+        .context("target address is not a valid domain or ip")?;
 
         // 2. append the data to the response header
         data.extend_from_slice(&buf[..size]);
@@ -157,18 +160,19 @@ async fn transfer_udp<T: AsyncRead + AsyncWrite + Unpin + Send>(
         },
         fast_socks5::util::target_addr::TargetAddr::Domain(domain, port) => RouteContext {
             src_addr: client_addr,
-            dst_addr: crate::rules::TargetAddr::Domain(
-                domain.to_owned(),
-                port.to_owned(),
-                None,
-            ),
+            dst_addr: crate::rules::TargetAddr::Domain(domain.to_owned(), port.to_owned(), None),
             inbound_proto: Some(InboundProtocol::SOCKS5),
             socket_type: crate::rules::SocketType::DGRAM,
         },
     };
 
     // 2. Do the routing decision and send the data to the target
-    let dgram_sock = get_settings().read().await.routetable.get_dgram_sock(&context).await?;
+    let dgram_sock = get_settings()
+        .read()
+        .await
+        .routetable
+        .get_dgram_sock(&context)
+        .await?;
     dgram_sock.send_to(&data, context.dst_addr).await?;
 
     // 3. Start the UDP request/response loop

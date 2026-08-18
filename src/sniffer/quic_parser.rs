@@ -235,7 +235,10 @@ impl QuicSniAggregator {
     }
 
     /// Internal packet processing with detailed error handling
-    fn process_packet_internal(&mut self, packet: &[u8]) -> Result<QuicParseResult, QuicParseError> {
+    fn process_packet_internal(
+        &mut self,
+        packet: &[u8],
+    ) -> Result<QuicParseResult, QuicParseError> {
         // Parse the QUIC header and extract crypto frames
         let parsed = parse_initial_packet(packet)?;
 
@@ -243,7 +246,8 @@ impl QuicSniAggregator {
         let dest_cid = parsed.dest_conn_id.clone();
 
         // Limit number of tracked connections using strict LRU eviction
-        if !self.connections.contains_key(&dest_cid) && self.connections.len() >= MAX_TRACKED_CONNECTIONS
+        if !self.connections.contains_key(&dest_cid)
+            && self.connections.len() >= MAX_TRACKED_CONNECTIONS
         {
             self.evict_lru();
         }
@@ -597,8 +601,9 @@ fn try_parse_sni(crypto_data: &[u8]) -> Result<String, QuicParseError> {
     }
 
     // Get handshake message length (3 bytes, big-endian)
-    let handshake_len =
-        ((crypto_data[1] as usize) << 16) | ((crypto_data[2] as usize) << 8) | (crypto_data[3] as usize);
+    let handshake_len = ((crypto_data[1] as usize) << 16)
+        | ((crypto_data[2] as usize) << 8)
+        | (crypto_data[3] as usize);
 
     // Check if we have enough data for the complete handshake message
     if crypto_data.len() < 4 + handshake_len {
@@ -726,22 +731,19 @@ mod tests {
         let cid2 = vec![2, 2, 2];
         let cid3 = vec![3, 3, 3];
 
-        aggregator.connections.insert(
-            cid1.clone(),
-            CryptoBuffer::new(),
-        );
+        aggregator
+            .connections
+            .insert(cid1.clone(), CryptoBuffer::new());
         sleep(Duration::from_millis(10));
 
-        aggregator.connections.insert(
-            cid2.clone(),
-            CryptoBuffer::new(),
-        );
+        aggregator
+            .connections
+            .insert(cid2.clone(), CryptoBuffer::new());
         sleep(Duration::from_millis(10));
 
-        aggregator.connections.insert(
-            cid3.clone(),
-            CryptoBuffer::new(),
-        );
+        aggregator
+            .connections
+            .insert(cid3.clone(), CryptoBuffer::new());
 
         assert_eq!(aggregator.connection_count(), 3);
 

@@ -5,10 +5,7 @@ pub async fn handle_intercept_sock(_sock: &tokio::net::TcpSocket) -> tokio::io::
     Ok(())
 }
 
-pub fn tproxy_bind_src(
-    _sock: SockRef,
-    _src_sock: std::net::SocketAddr,
-) -> tokio::io::Result<()> {
+pub fn tproxy_bind_src(_sock: SockRef, _src_sock: std::net::SocketAddr) -> tokio::io::Result<()> {
     Ok(())
 }
 

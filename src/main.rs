@@ -1,17 +1,17 @@
-mod rules;
 mod protos;
-mod sniffer;
+mod rules;
 mod settings;
+mod sniffer;
 mod socks5;
 mod stats;
 
-mod tproxy;
-mod redirect;
-mod utils;
 mod profiler;
+mod redirect;
+mod tproxy;
+mod utils;
 
-use std::sync::OnceLock;
 use redirect::redirect_worker;
+use std::sync::OnceLock;
 use tokio::task::JoinHandle;
 use tokio::try_join;
 
@@ -80,7 +80,6 @@ async fn reload_worker(
 
             *get_settings().write().await = new_settings;
             tracing::info!("Settings reloaded successfully.");
-
 
             // Handle Profiler update
             let mut store = profiler_store
