@@ -175,17 +175,22 @@ async fn transfer_udp<T: AsyncRead + AsyncWrite + Unpin + Send>(
     dgram_sock.send_to(&data, context.dst_addr).await?;
 
     // 3. Start the UDP request/response loop
-    match tokio::try_join!(
-        async {
-            let mut buf = [0u8; 0x0];
-            parent_sock.read(&mut buf).await?;
-            Ok(())
-        },
-        handle_udp_request(&inbound, dgram_sock.as_ref()),
-        handle_udp_response(&inbound, dgram_sock.as_ref())
-    ) {
-        Ok(_) => {}
-        Err(error) => return Err(error),
+    //
+    // RFC 1928 keeps the UDP associate alive through the TCP control
+    // connection, so watch it for EOF and tear the session down once the
+    // client disconnects. Any branch finishing ends the session and drops
+    // the other futures, which also releases the inbound UDP socket.
+    tokio::select! {
+        res = async {
+            let mut buf = [0u8; 0x400];
+            loop {
+                if parent_sock.read(&mut buf).await? == 0 {
+                    return Ok::<(), anyhow::Error>(());
+                }
+            }
+        } => res?,
+        res = handle_udp_request(&inbound, dgram_sock.as_ref()) => res?,
+        res = handle_udp_response(&inbound, dgram_sock.as_ref()) => res?,
     }
     Ok(())
 }
