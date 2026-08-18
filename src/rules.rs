@@ -19,12 +19,18 @@ use url::Url;
 
 use tracing::info;
 
-use crate::get_settings;
 use crate::utils::{rfor_bind_addr, to_io_err, ToV6Net, ToV6SockAddr};
 
 use fast_socks5::client as socks_client;
 
 pub const TIMEOUT: u64 = 3000;
+
+#[derive(Debug, Clone, Copy)]
+pub struct RouteOptions {
+    pub debug: bool,
+    pub disable_ipv6: bool,
+    pub direct_mark: Option<u32>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Outbound {
@@ -294,7 +300,11 @@ impl RouteTable {
         })
     }
 
-    pub async fn get_tcp_sock(&self, context: &RouteContext) -> tokio::io::Result<TcpStream> {
+    pub async fn get_tcp_sock(
+        &self,
+        context: &RouteContext,
+        options: RouteOptions,
+    ) -> tokio::io::Result<TcpStream> {
         let start = Instant::now();
         let outbound_index = self.match_route(context)?;
         let outbound = &self.outbounds[outbound_index as usize];
@@ -303,7 +313,7 @@ impl RouteTable {
             "{} -> Outbound({}){}",
             context,
             outbound.name,
-            if get_settings().read().await.debug {
+            if options.debug {
                 format!(", time: {}us", duration.as_micros())
             } else {
                 "".to_owned()
@@ -311,7 +321,7 @@ impl RouteTable {
         );
 
         if outbound.url.is_none() {
-            let sock = match get_settings().read().await.disable_ipv6 {
+            let sock = match options.disable_ipv6 {
                 false => TcpSocket::new_v6()?,
                 true => TcpSocket::new_v4()?,
             };
@@ -339,13 +349,14 @@ impl RouteTable {
                     }
                 }
 
-                prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
+                prepare_socket_bypass_mangle(sock.as_raw_fd(), options.direct_mark)?;
             }
 
             #[cfg(not(target_os = "linux"))]
             let _ = inbound_proto; // Suppress unused variable warning
 
-            let sock_addr = resolve_target_addr(context.dst_addr.clone()).await?;
+            let sock_addr =
+                resolve_target_addr(context.dst_addr.clone(), options.disable_ipv6).await?;
             return timeout(Duration::from_millis(TIMEOUT), sock.connect(sock_addr)).await?;
         }
 
@@ -412,15 +423,17 @@ impl RouteTable {
                 // proxy server can be caught by our own REDIRECT/TPROXY rules
                 // in the OUTPUT chain and loop back into rfor.
                 let connect_and_handshake = async {
-                    let socks_sock_addr =
-                        resolve_target_addr(TargetAddr::Domain(socks_host, socks_port, None))
-                            .await?;
-                    let sock = match get_settings().read().await.disable_ipv6 {
+                    let socks_sock_addr = resolve_target_addr(
+                        TargetAddr::Domain(socks_host, socks_port, None),
+                        options.disable_ipv6,
+                    )
+                    .await?;
+                    let sock = match options.disable_ipv6 {
                         false => TcpSocket::new_v6()?,
                         true => TcpSocket::new_v4()?,
                     };
                     #[cfg(target_os = "linux")]
-                    prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
+                    prepare_socket_bypass_mangle(sock.as_raw_fd(), options.direct_mark)?;
                     let stream = sock.connect(socks_sock_addr).await?;
 
                     let mut socks = socks_client::Socks5Stream::use_stream(
@@ -453,6 +466,7 @@ impl RouteTable {
     pub async fn get_dgram_sock(
         &self,
         context: &RouteContext,
+        options: RouteOptions,
     ) -> tokio::io::Result<Box<dyn ProxyDgram>> {
         let start = Instant::now();
         let outbound_index = self.match_route(context)?;
@@ -462,7 +476,7 @@ impl RouteTable {
             "{} -> Outbound({}){}",
             context,
             outbound.name,
-            if get_settings().read().await.debug {
+            if options.debug {
                 format!(", time: {}us", duration.as_micros())
             } else {
                 "".to_owned()
@@ -471,7 +485,7 @@ impl RouteTable {
 
         if outbound.url.is_none() {
             let raw_sock = socket2::Socket::new(
-                match get_settings().read().await.disable_ipv6 {
+                match options.disable_ipv6 {
                     false => socket2::Domain::IPV6,
                     true => socket2::Domain::IPV4,
                 },
@@ -498,7 +512,7 @@ impl RouteTable {
                     }
                 }
 
-                prepare_socket_bypass_mangle(raw_sock.as_raw_fd()).await?;
+                prepare_socket_bypass_mangle(raw_sock.as_raw_fd(), options.direct_mark)?;
             }
 
             #[cfg(not(target_os = "linux"))]
@@ -510,7 +524,10 @@ impl RouteTable {
             })?;
 
             core::mem::forget(raw_sock);
-            return Ok(Box::new(sock));
+            return Ok(Box::new(DirectUdpSocket {
+                socket: sock,
+                disable_ipv6: options.disable_ipv6,
+            }));
         }
 
         let proxy_url = outbound.url.as_ref().ok_or_else(|| {
@@ -542,15 +559,17 @@ impl RouteTable {
                 .await??;
 
                 let sock = if proxy_url.username().is_empty() {
-                    let fut =
-                        socks_client::Socks5Datagram::bind(backing_socket, rfor_bind_addr().await);
+                    let fut = socks_client::Socks5Datagram::bind(
+                        backing_socket,
+                        rfor_bind_addr(options.disable_ipv6),
+                    );
                     timeout(Duration::from_millis(TIMEOUT), fut)
                         .await?
                         .map_err(to_io_err)?
                 } else {
                     let fut = socks_client::Socks5Datagram::bind_with_password(
                         backing_socket,
-                        rfor_bind_addr().await,
+                        rfor_bind_addr(options.disable_ipv6),
                         proxy_url.username(),
                         proxy_url.password().unwrap_or(""),
                     );
@@ -568,10 +587,13 @@ impl RouteTable {
     }
 }
 
-async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr> {
+async fn resolve_target_addr(
+    target: TargetAddr,
+    disable_ipv6: bool,
+) -> tokio::io::Result<SocketAddr> {
     match target {
         TargetAddr::Ip(addr) => {
-            let sock = match get_settings().read().await.disable_ipv6 {
+            let sock = match disable_ipv6 {
                 false => addr.to_ipv6_sockaddr(),
                 true => addr,
             };
@@ -590,7 +612,7 @@ async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr
                                 format!("DNS lookup returned no results for {}:{}", domain, port),
                             )
                         })?;
-                    match get_settings().read().await.disable_ipv6 {
+                    match disable_ipv6 {
                         false => sock.to_ipv6_sockaddr(),
                         true => sock,
                     }
@@ -601,25 +623,24 @@ async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr
     }
 }
 
-pub async fn prepare_socket_bypass_mangle(sockfd: i32) -> tokio::io::Result<()> {
+pub fn prepare_socket_bypass_mangle(
+    sockfd: i32,
+    direct_mark: Option<u32>,
+) -> tokio::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::BorrowedFd;
-        match &get_settings().read().await.intercept_mode {
-            crate::settings::InterceptMode::TPROXY { direct_mark, .. }
-            | crate::settings::InterceptMode::REDIRECT { direct_mark, .. } => {
-                // Avoid local traffic looping
-                // SAFETY: sockfd is a valid file descriptor for the duration of this call
-                let fd = unsafe { BorrowedFd::borrow_raw(sockfd) };
-                nix::sys::socket::setsockopt(&fd, nix::sys::socket::sockopt::Mark, &direct_mark)?;
-            }
-            crate::settings::InterceptMode::MANUAL => {}
+        if let Some(direct_mark) = direct_mark {
+            // Avoid local traffic looping
+            // SAFETY: sockfd is a valid file descriptor for the duration of this call
+            let fd = unsafe { BorrowedFd::borrow_raw(sockfd) };
+            nix::sys::socket::setsockopt(&fd, nix::sys::socket::sockopt::Mark, &direct_mark)?;
         }
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = sockfd; // Suppress unused variable warning
+        let _ = (sockfd, direct_mark); // Suppress unused variable warnings
     }
 
     Ok(())
@@ -631,17 +652,23 @@ pub trait ProxyDgram: Send + Sync {
     async fn send_to(&self, buf: &[u8], target: TargetAddr) -> tokio::io::Result<usize>;
 }
 
+struct DirectUdpSocket {
+    socket: UdpSocket,
+    disable_ipv6: bool,
+}
+
 #[async_trait::async_trait]
-impl ProxyDgram for UdpSocket {
+impl ProxyDgram for DirectUdpSocket {
     async fn recv_from(&self, buf: &mut [u8]) -> tokio::io::Result<(usize, TargetAddr)> {
-        self.recv_from(buf)
+        self.socket
+            .recv_from(buf)
             .await
             .map(|(size, addr)| (size, TargetAddr::Ip(addr)))
     }
 
     async fn send_to(&self, buf: &[u8], target: TargetAddr) -> tokio::io::Result<usize> {
         match target {
-            TargetAddr::Ip(addr) => self.send_to(buf, addr).await,
+            TargetAddr::Ip(addr) => self.socket.send_to(buf, addr).await,
             TargetAddr::Domain(domain, port, osock) => {
                 let sock = match osock {
                     Some(sock) => sock,
@@ -658,13 +685,13 @@ impl ProxyDgram for UdpSocket {
                                     ),
                                 )
                             })?;
-                        match get_settings().read().await.disable_ipv6 {
+                        match self.disable_ipv6 {
                             false => sock.to_ipv6_sockaddr(),
                             true => sock,
                         }
                     }
                 };
-                self.send_to(buf, sock).await
+                self.socket.send_to(buf, sock).await
             }
         }
     }

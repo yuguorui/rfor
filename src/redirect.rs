@@ -14,55 +14,61 @@ mod linux_impl {
     use tokio::net::TcpListener;
 
     pub async fn redirect_worker() -> Result<()> {
-        match &get_settings().read().await.intercept_mode {
-            crate::settings::InterceptMode::REDIRECT {
-                local_traffic,
-                ports,
+        let (local_traffic, ports, direct_mark, proxy_chain, disable_ipv6, redirect_listen) = {
+            let settings = get_settings().read().await;
+            match &settings.intercept_mode {
+                crate::settings::InterceptMode::REDIRECT {
+                    local_traffic,
+                    ports,
+                    direct_mark,
+                    proxy_chain,
+                } => (
+                    *local_traffic,
+                    ports.clone(),
+                    *direct_mark,
+                    proxy_chain.clone(),
+                    settings.disable_ipv6,
+                    settings.redirect_listen.clone(),
+                ),
+                _ => return Ok(()),
+            }
+        };
+
+        let listen_addr = rfor_bind_addr(disable_ipv6);
+        let listener = match redirect_listen {
+            Some(addr) => TcpListener::bind(addr).await?,
+            None => TcpListener::bind(format!("{}:0", listen_addr)).await?,
+        };
+
+        let port = listener.local_addr()?.port();
+        info!("redirect listen: {}", listener.local_addr()?);
+
+        if let Err(err) = set_nat_iptables(
+            &proxy_chain,
+            port,
+            direct_mark,
+            &ports,
+            local_traffic,
+            disable_ipv6,
+        ) {
+            cleanup_nat_iptables(&proxy_chain).unwrap_or(());
+            return Err(err);
+        }
+
+        tokio::select! {
+            _ = accept_socket_loop(listener) => {},
+            _ = reconcile_nat_iptables_loop(
+                proxy_chain.clone(),
+                port,
                 direct_mark,
-                proxy_chain,
-            } => {
-                let listen_addr = rfor_bind_addr().await;
-
-                let listener = match &get_settings().read().await.redirect_listen {
-                    Some(addr) => TcpListener::bind(addr).await?,
-                    None => TcpListener::bind(format!("{}:0", listen_addr)).await?,
-                };
-
-                let port = listener.local_addr()?.port();
-                info!("redirect listen: {}", listener.local_addr()?);
-
-                if let Err(err) =
-                    set_nat_iptables(proxy_chain, port, *direct_mark, ports, *local_traffic).await
-                {
-                    cleanup_nat_iptables(proxy_chain).unwrap_or(());
-                    return Err(err);
-                }
-
-                // Capture owned copies for the reconcile loop so they outlive
-                // the borrow on `get_settings()`.
-                let reconcile_chain = proxy_chain.clone();
-                let reconcile_ports = ports.clone();
-                let reconcile_direct_mark = *direct_mark;
-                let reconcile_local_traffic = *local_traffic;
-
-                tokio::select! {
-                    _ = accept_socket_loop(listener) => {},
-                    _ = reconcile_nat_iptables_loop(
-                        reconcile_chain,
-                        port,
-                        reconcile_direct_mark,
-                        reconcile_ports,
-                        reconcile_local_traffic,
-                    ) => {},
-                    Err(err) = crate::utils::receive_signal() => {
-                        cleanup_nat_iptables(proxy_chain).unwrap_or(());
-                        return Err(err);
-                    },
-                };
-            }
-            _ => {
-                return Ok(());
-            }
+                ports.clone(),
+                local_traffic,
+                disable_ipv6,
+            ) => {},
+            Err(err) = crate::utils::receive_signal() => {
+                cleanup_nat_iptables(&proxy_chain).unwrap_or(());
+                return Err(err);
+            },
         }
 
         Ok(())
@@ -197,12 +203,13 @@ mod linux_impl {
         Ok(())
     }
 
-    async fn set_nat_iptables(
+    fn set_nat_iptables(
         proxy_chain: &str,
         redirect_port: u16,
         direct_mark: u32,
         ports: &str,
         local_traffic: bool,
+        disable_ipv6: bool,
     ) -> Result<()> {
         __setup_nat_iptables(
             &iptables::new(false)
@@ -231,7 +238,7 @@ mod linux_impl {
             )
         })?;
 
-        if !get_settings().read().await.disable_ipv6 {
+        if !disable_ipv6 {
             __setup_nat_iptables(
                 &iptables::new(true)
                     .map_err(|e| anyhow::anyhow!("command ip6tables not found: {}", e))?,
@@ -300,6 +307,7 @@ mod linux_impl {
         direct_mark: u32,
         ports: String,
         local_traffic: bool,
+        disable_ipv6: bool,
     ) {
         use std::time::Duration;
         let period = Duration::from_secs(10);
@@ -315,8 +323,7 @@ mod linux_impl {
             };
             let v4_ok = nat_iptables_healthy(&ipt4, &proxy_chain, local_traffic);
 
-            let check_v6 = !get_settings().read().await.disable_ipv6;
-            let v6_ok = if check_v6 {
+            let v6_ok = if !disable_ipv6 {
                 match iptables::new(true) {
                     Ok(ipt6) => nat_iptables_healthy(&ipt6, &proxy_chain, local_traffic),
                     Err(e) => {
@@ -343,9 +350,8 @@ mod linux_impl {
                 direct_mark,
                 &ports,
                 local_traffic,
-            )
-            .await
-            {
+                disable_ipv6,
+            ) {
                 Ok(()) => info!("rfor-proxy nat rules rebuilt"),
                 Err(e) => error!("reconcile rebuild failed: {:#}", e),
             }

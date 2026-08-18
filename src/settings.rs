@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use clap::Parser;
 use fqdn::FQDN;
@@ -10,7 +10,7 @@ use config::{Config, ConfigError, Environment, File};
 use ipnet::IpNet;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::rules::RouteTable;
+use crate::rules::{RouteOptions, RouteTable};
 use crate::utils::{vec_to_array, ToV6Net};
 
 const DIRECT_OUTBOUND_NAME: &str = "DIRECT";
@@ -67,7 +67,7 @@ pub struct Settings {
     pub socks5_listen: Option<String>,
     pub redirect_listen: Option<String>,
     #[serde(skip)]
-    pub routetable: RouteTable,
+    pub routetable: Arc<RouteTable>,
     pub intercept_mode: InterceptMode,
     pub udp_enable: bool,
     pub udp_timeout: u64,
@@ -89,6 +89,22 @@ impl Settings {
 
     pub fn to_yaml(&self) -> String {
         serde_yaml_ng::to_string(self).unwrap_or_else(|e| format!("<failed to serialize: {}>", e))
+    }
+
+    pub fn route_snapshot(&self) -> (Arc<RouteTable>, RouteOptions) {
+        let direct_mark = match &self.intercept_mode {
+            InterceptMode::TPROXY { direct_mark, .. }
+            | InterceptMode::REDIRECT { direct_mark, .. } => Some(*direct_mark),
+            InterceptMode::MANUAL => None,
+        };
+        (
+            Arc::clone(&self.routetable),
+            RouteOptions {
+                debug: self.debug,
+                disable_ipv6: self.disable_ipv6,
+                direct_mark,
+            },
+        )
     }
 
     pub fn load() -> Result<Self, ConfigError> {
@@ -160,7 +176,7 @@ impl Settings {
             tproxy_listen: s.get::<String>("tproxy-listen").ok(),
             socks5_listen: s.get::<String>("socks5-listen").ok(),
             redirect_listen: s.get::<String>("redirect-listen").ok(),
-            routetable: route,
+            routetable: Arc::new(route),
             intercept_mode,
             udp_enable,
             udp_timeout: s.get_int("udp-timeout").unwrap_or(60) as u64,

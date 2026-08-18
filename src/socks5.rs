@@ -167,12 +167,9 @@ async fn transfer_udp<T: AsyncRead + AsyncWrite + Unpin + Send>(
     };
 
     // 2. Do the routing decision and send the data to the target
-    let dgram_sock = get_settings()
-        .read()
-        .await
-        .routetable
-        .get_dgram_sock(&context)
-        .await?;
+    let (routetable, route_options) = get_settings().read().await.route_snapshot();
+    let dgram_sock = routetable.get_dgram_sock(&context, route_options).await?;
+    drop(routetable);
     dgram_sock.send_to(&data, context.dst_addr).await?;
 
     // 3. Start the UDP request/response loop

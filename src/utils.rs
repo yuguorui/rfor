@@ -79,13 +79,8 @@ pub fn to_io_err(sock_err: fast_socks5::SocksError) -> std::io::Error {
 }
 
 pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> Result<()> {
-    let mut out_sock = match get_settings()
-        .read()
-        .await
-        .routetable
-        .get_tcp_sock(&rt_context)
-        .await
-    {
+    let (routetable, route_options) = get_settings().read().await.route_snapshot();
+    let mut out_sock = match routetable.get_tcp_sock(&rt_context, route_options).await {
         Ok(sock) => sock,
         Err(err) => match err.kind() {
             std::io::ErrorKind::PermissionDenied => {
@@ -96,6 +91,7 @@ pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> 
             }
         },
     };
+    drop(routetable);
 
     setup_tcp_keepalive(in_sock);
     setup_tcp_keepalive(&out_sock);
@@ -320,8 +316,8 @@ pub fn to_target_addr(
     }
 }
 
-pub async fn rfor_bind_addr() -> String {
-    match crate::get_settings().read().await.disable_ipv6 {
+pub fn rfor_bind_addr(disable_ipv6: bool) -> String {
+    match disable_ipv6 {
         false => "[::]:0".to_owned(),
         true => "0.0.0.0:0".to_owned(),
     }

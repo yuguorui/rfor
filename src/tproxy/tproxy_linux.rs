@@ -487,6 +487,7 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
 async fn udp_socket_bind_to_any_with_flag(
     bind_sockaddr: std::net::SocketAddr,
     disable_ipv6: bool,
+    direct_mark: Option<u32>,
 ) -> Result<tokio::net::UdpSocket> {
     use nix::libc;
     use std::os::fd::AsRawFd;
@@ -567,7 +568,7 @@ async fn udp_socket_bind_to_any_with_flag(
         }
     }
     let source_socket = UdpSocket::from_std(std::net::UdpSocket::from(owned_fd))?;
-    prepare_socket_bypass_mangle(source_socket.as_raw_fd()).await?;
+    prepare_socket_bypass_mangle(source_socket.as_raw_fd(), direct_mark)?;
     return Ok(source_socket);
 }
 
@@ -700,7 +701,9 @@ async fn relay_udp_packet(
     let fullcone_max_sockets = settings.udp_fullcone_max_sockets;
     let fullcone_socket_timeout = settings.udp_fullcone_socket_timeout;
     let fullcone_rate_limit = settings.udp_fullcone_rate_limit;
-    let disable_ipv6 = settings.disable_ipv6;
+    let (routetable, route_options) = settings.route_snapshot();
+    let disable_ipv6 = route_options.disable_ipv6;
+    let direct_mark = route_options.direct_mark;
     drop(settings);
 
     // Try to parse host from packets, supporting QUIC SNI aggregation
@@ -718,21 +721,23 @@ async fn relay_udp_packet(
         }
     };
 
-    let target_socket = get_settings()
-        .read()
-        .await
-        .routetable
-        .get_dgram_sock(&crate::rules::RouteContext {
-            src_addr: source_sockaddr,
-            dst_addr: dst_addr.clone(),
-            inbound_proto: Some(crate::rules::InboundProtocol::TPROXY),
-            socket_type: crate::rules::SocketType::DGRAM,
-        })
+    let target_socket = routetable
+        .get_dgram_sock(
+            &crate::rules::RouteContext {
+                src_addr: source_sockaddr,
+                dst_addr: dst_addr.clone(),
+                inbound_proto: Some(crate::rules::InboundProtocol::TPROXY),
+                socket_type: crate::rules::SocketType::DGRAM,
+            },
+            route_options,
+        )
         .await?;
+    drop(routetable);
 
     // Prepare the intermediate socket which is connected to the source, which should bind to the target address,
     // and pretend to be the target.
-    let source_socket = udp_socket_bind_to_any_with_flag(target_sockaddr, disable_ipv6).await?;
+    let source_socket =
+        udp_socket_bind_to_any_with_flag(target_sockaddr, disable_ipv6, direct_mark).await?;
     source_socket.connect(source_sockaddr).await?;
 
     // Send all buffered packets (including the initial packet)
@@ -905,7 +910,11 @@ async fn relay_udp_packet(
                                                     }
 
                                                 // Create new socket with graceful error handling
-                                                match udp_socket_bind_to_any_with_flag(resp_ip, disable_ipv6).await {
+                                                match udp_socket_bind_to_any_with_flag(
+                                                    resp_ip,
+                                                    disable_ipv6,
+                                                    direct_mark,
+                                                ).await {
                                                     Ok(sock) => {
                                                         match sock.connect(source_sockaddr).await {
                                                             Ok(_) => {
@@ -1164,7 +1173,7 @@ fn __setup_iptables(
     Ok(())
 }
 
-async fn set_iptables(
+fn set_iptables(
     proxy_chain: &str,
     mark_chain: &str,
     tproxy_port: u16,
@@ -1172,6 +1181,8 @@ async fn set_iptables(
     direct_mark: u32,
     ports: &str,
     local_traffic: bool,
+    udp_enable: bool,
+    disable_ipv6: bool,
 ) -> Result<()> {
     __setup_iptables(
         &iptables::new(false).map_err(|e| anyhow!("command iptables not found: {}", e))?,
@@ -1182,7 +1193,7 @@ async fn set_iptables(
         direct_mark,
         ports,
         local_traffic,
-        get_settings().read().await.udp_enable,
+        udp_enable,
         &[
             "0.0.0.0/8",
             "127.0.0.0/8",
@@ -1202,7 +1213,7 @@ async fn set_iptables(
         )
     })?;
 
-    if !get_settings().read().await.disable_ipv6 {
+    if !disable_ipv6 {
         __setup_iptables(
             &iptables::new(true).map_err(|e| anyhow!("command ip6tables not found: {}", e))?,
             proxy_chain,
@@ -1212,7 +1223,7 @@ async fn set_iptables(
             direct_mark,
             ports,
             local_traffic,
-            get_settings().read().await.udp_enable,
+            udp_enable,
             &[
                 "::1/128",
                 "100::/64",
@@ -1300,7 +1311,7 @@ async fn get_link_by_name(
     }
 }
 
-async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
+async fn set_ip_rule(route_table_index: u8, fwmark: u32, disable_ipv6: bool) -> Result<()> {
     use netlink_packet_route::route::{RouteScope, RouteType};
     use netlink_packet_route::rule::RuleAttribute;
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -1322,7 +1333,7 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
         .push(RuleAttribute::FwMark(fwmark));
     rule.execute().await?;
 
-    if !get_settings().read().await.disable_ipv6 {
+    if !disable_ipv6 {
         let mut rule = handle
             .rule()
             .add()
@@ -1355,7 +1366,7 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
     route.message_mut().header.kind = RouteType::Local;
     route.execute().await?;
 
-    if !get_settings().read().await.disable_ipv6 {
+    if !disable_ipv6 {
         // Add default IPv6 route.
         let mut route = handle
             .route()
@@ -1375,84 +1386,100 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
 async fn environment_setup() -> Result<()> {
     use std::net::SocketAddr;
 
-    let settings = get_settings().read().await;
-    match &settings.intercept_mode {
-        crate::settings::InterceptMode::MANUAL => return Ok(()),
-        crate::settings::InterceptMode::TPROXY {
-            local_traffic,
-            ports,
-            proxy_mark: tproxy_mark,
-            direct_mark,
-            proxy_chain,
-            rule_table_index,
-            mark_chain,
-        } => {
-            if crate::utils::geteuid() != 0 {
-                return Err(anyhow!("Must be root to set the iptables."));
-            }
-
-            match cleanup_iptables(proxy_chain, mark_chain) {
-                Ok(()) => {}
-                Err(err) => {
-                    return Err(anyhow!("Failed on cleaning up iptables rules: {}", err));
-                }
-            };
-
-            match set_iptables(
-                proxy_chain,
-                mark_chain,
-                settings
-                    .tproxy_listen
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("tproxy-listen is not configured"))?
-                    .parse::<SocketAddr>()
-                    .map_err(|e| anyhow!("invalid tproxy-listen address: {}", e))?
-                    .port(),
-                *tproxy_mark,
-                *direct_mark,
+    let (
+        local_traffic,
+        ports,
+        tproxy_mark,
+        direct_mark,
+        proxy_chain,
+        rule_table_index,
+        mark_chain,
+        tproxy_listen,
+        udp_enable,
+        disable_ipv6,
+    ) = {
+        let settings = get_settings().read().await;
+        match &settings.intercept_mode {
+            crate::settings::InterceptMode::TPROXY {
+                local_traffic,
                 ports,
+                proxy_mark,
+                direct_mark,
+                proxy_chain,
+                rule_table_index,
+                mark_chain,
+            } => (
                 *local_traffic,
-            )
-            .await
-            {
-                Ok(_) => {}
-                Err(err) => {
-                    return Err(anyhow!("Failed on setting up iptables rules: {}", err));
-                }
-            };
-
-            cleanup_ip_rule(*rule_table_index, *tproxy_mark).await?;
-            set_ip_rule(*rule_table_index, *tproxy_mark).await?;
-            return Ok(());
+                ports.clone(),
+                *proxy_mark,
+                *direct_mark,
+                proxy_chain.clone(),
+                *rule_table_index,
+                mark_chain.clone(),
+                settings.tproxy_listen.clone(),
+                settings.udp_enable,
+                settings.disable_ipv6,
+            ),
+            crate::settings::InterceptMode::MANUAL
+            | crate::settings::InterceptMode::REDIRECT { .. } => return Ok(()),
         }
-        crate::settings::InterceptMode::REDIRECT { .. } => return Ok(()),
+    };
+
+    if crate::utils::geteuid() != 0 {
+        return Err(anyhow!("Must be root to set the iptables."));
     }
+
+    cleanup_iptables(&proxy_chain, &mark_chain)
+        .map_err(|err| anyhow!("Failed on cleaning up iptables rules: {}", err))?;
+
+    let tproxy_port = tproxy_listen
+        .as_ref()
+        .ok_or_else(|| anyhow!("tproxy-listen is not configured"))?
+        .parse::<SocketAddr>()
+        .map_err(|e| anyhow!("invalid tproxy-listen address: {}", e))?
+        .port();
+    set_iptables(
+        &proxy_chain,
+        &mark_chain,
+        tproxy_port,
+        tproxy_mark,
+        direct_mark,
+        &ports,
+        local_traffic,
+        udp_enable,
+        disable_ipv6,
+    )
+    .map_err(|err| anyhow!("Failed on setting up iptables rules: {}", err))?;
+
+    cleanup_ip_rule(rule_table_index, tproxy_mark).await?;
+    set_ip_rule(rule_table_index, tproxy_mark, disable_ipv6).await?;
+    Ok(())
 }
 
 async fn clean_environment() -> Result<()> {
-    let settings = get_settings().read().await;
-    match &settings.intercept_mode {
-        crate::settings::InterceptMode::MANUAL => return Ok(()),
-        crate::settings::InterceptMode::TPROXY {
-            local_traffic: _,
-            ports: _,
-            proxy_mark: tproxy_mark,
-            direct_mark: _,
-            proxy_chain: table_name,
-            rule_table_index,
-            mark_chain,
-        } => {
-            let proxy_chain = table_name.to_owned();
-            let mark_chain = mark_chain.to_owned();
-            let tproxy_mark = *tproxy_mark;
-            let rule_table_index = *rule_table_index;
-
-            cleanup_iptables(&proxy_chain, &mark_chain)
-                .map_err(|e| anyhow!("failed to clean iptables rules: {}", e))?;
-            cleanup_ip_rule(rule_table_index, tproxy_mark).await?;
-
-            Ok(())
+    let (proxy_chain, mark_chain, tproxy_mark, rule_table_index) = {
+        let settings = get_settings().read().await;
+        match &settings.intercept_mode {
+            crate::settings::InterceptMode::TPROXY {
+                proxy_mark,
+                proxy_chain,
+                rule_table_index,
+                mark_chain,
+                ..
+            } => (
+                proxy_chain.clone(),
+                mark_chain.clone(),
+                *proxy_mark,
+                *rule_table_index,
+            ),
+            crate::settings::InterceptMode::MANUAL
+            | crate::settings::InterceptMode::REDIRECT { .. } => return Ok(()),
         }
-        crate::settings::InterceptMode::REDIRECT { .. } => return Ok(()),
-    }
+    };
+
+    cleanup_iptables(&proxy_chain, &mark_chain)
+        .map_err(|e| anyhow!("failed to clean iptables rules: {}", e))?;
+    cleanup_ip_rule(rule_table_index, tproxy_mark).await?;
+
+    Ok(())
 }
