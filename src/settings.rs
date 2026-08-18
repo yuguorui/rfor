@@ -130,7 +130,16 @@ impl Settings {
         /* 6. Parse the UDP enabling */
         let udp_enable = match &intercept_mode {
             InterceptMode::TPROXY { .. } | InterceptMode::MANUAL => {
-                s.get_bool("udp-enable").unwrap_or(true)
+                // The canonical key is `udp-enabled`; keep `udp-enable` as a
+                // deprecated alias so existing configs keep working.
+                match (s.get_bool("udp-enabled"), s.get_bool("udp-enable")) {
+                    (Ok(enabled), _) => enabled,
+                    (Err(_), Ok(enabled)) => {
+                        warn!("config key `udp-enable` is deprecated, use `udp-enabled` instead");
+                        enabled
+                    }
+                    (Err(_), Err(_)) => true,
+                }
             }
             InterceptMode::REDIRECT { .. } => {
                 warn!("UDP is not supported in REDIRECT mode, disabling it.");
