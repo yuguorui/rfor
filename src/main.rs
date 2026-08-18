@@ -29,8 +29,24 @@ static SETTINGS: OnceLock<Arc<RwLock<Settings>>> = OnceLock::new();
 
 pub fn get_settings() -> &'static Arc<RwLock<Settings>> {
     SETTINGS.get_or_init(|| {
-        Arc::new(RwLock::const_new(Settings::new().expect("Failed to load settings")))
+        // main() runs init_settings() first; this fallback only guards
+        // against get_settings() being called before initialization and
+        // cannot return a Result from a static initializer.
+        match Settings::new() {
+            Ok(settings) => Arc::new(RwLock::new(settings)),
+            Err(err) => {
+                error!("Failed to load settings: {}", err);
+                std::process::exit(1);
+            }
+        }
     })
+}
+
+pub fn init_settings() -> Result<()> {
+    let settings = Arc::new(RwLock::new(Settings::new()?));
+    SETTINGS
+        .set(settings)
+        .map_err(|_| anyhow!("settings already initialized"))
 }
 
 async fn flatten(handle: JoinHandle<Result<()>>) -> Result<()> {
@@ -67,7 +83,9 @@ async fn reload_worker(
 
 
             // Handle Profiler update
-            let mut store = profiler_store.lock().unwrap();
+            let mut store = profiler_store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let current_path = store.as_ref().map(|p| p.path.clone());
 
             if current_path != new_pprof_config {
@@ -80,7 +98,7 @@ async fn reload_worker(
                 // 2. Start new profiler if enabled
                 if let Some(path) = new_pprof_config {
                     tracing::info!("Starting profiler at {}", path);
-                    *store = Some(profiler::start(&path));
+                    *store = Some(profiler::start(&path)?);
                 }
             }
         }
@@ -97,6 +115,7 @@ async fn reload_worker(
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
+    init_settings()?;
 
     let settings = get_settings().read().await;
 
@@ -117,7 +136,11 @@ async fn main() -> Result<()> {
         settings.to_yaml()
     );
 
-    let profiler = settings.pprof.as_ref().map(|path| profiler::start(path));
+    let profiler = settings
+        .pprof
+        .as_ref()
+        .map(|path| profiler::start(path))
+        .transpose()?;
     drop(settings);
 
     let profiler_store = Arc::new(std::sync::Mutex::new(profiler));
@@ -139,9 +162,7 @@ async fn main() -> Result<()> {
             )
         } => {
             match res {
-                Ok(_) => {
-                    unreachable!("shouldn't be here.");
-                }
+                Ok(_) => return Ok(()),
                 Err(err) => return Err(err),
             }
         }

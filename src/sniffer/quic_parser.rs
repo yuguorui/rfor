@@ -39,6 +39,8 @@ pub enum QuicParseError {
     NoCryptoFrame,
     #[error("TLS handshake parsing failed")]
     TlsParseError,
+    #[error("QUIC cipher suite is unavailable")]
+    QuicSuiteUnavailable,
     #[error("Insufficient data to parse")]
     InsufficientData,
     #[error("CRYPTO buffer overflow")]
@@ -353,14 +355,14 @@ fn decode_varint<B: Buf>(r: &mut B) -> Option<u64> {
                 return None;
             }
             r.copy_to_slice(&mut buf[1..2]);
-            u64::from(u16::from_be_bytes(buf[..2].try_into().unwrap()))
+            u64::from(u16::from_be_bytes([buf[0], buf[1]]))
         }
         0b10 => {
             if r.remaining() < 3 {
                 return None;
             }
             r.copy_to_slice(&mut buf[1..4]);
-            u64::from(u32::from_be_bytes(buf[..4].try_into().unwrap()))
+            u64::from(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]))
         }
         0b11 => {
             if r.remaining() < 7 {
@@ -369,7 +371,7 @@ fn decode_varint<B: Buf>(r: &mut B) -> Option<u64> {
             r.copy_to_slice(&mut buf[1..8]);
             u64::from_be_bytes(buf)
         }
-        _ => unreachable!(),
+        _ => return None,
     };
     Some(x)
 }
@@ -452,9 +454,9 @@ fn parse_initial_packet(remaining: &[u8]) -> Result<ParsedInitialPacket, QuicPar
     let key_len = 16; // AES-128-GCM sample length
     let keys = TLS13_AES_128_GCM_SHA256
         .tls13()
-        .unwrap()
+        .ok_or(QuicParseError::QuicSuiteUnavailable)?
         .quic_suite()
-        .unwrap()
+        .ok_or(QuicParseError::QuicSuiteUnavailable)?
         .keys(&dest_conn_id, rustls::Side::Client, rustls_version);
 
     // Decrypt header to get actual packet number length

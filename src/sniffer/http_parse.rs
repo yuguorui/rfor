@@ -125,7 +125,7 @@ pub fn parse_host(remaining: &[u8]) -> Option<String> {
                                 .flat_map(ToOwned::to_owned)
                                 .collect(),
                         )
-                        .map(|d| d.split(":").next().unwrap().to_owned())
+                        .map(|d| d.split(':').next().unwrap_or("").to_owned())
                         .ok();
                     }
                     _ => (),

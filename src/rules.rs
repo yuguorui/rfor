@@ -346,7 +346,12 @@ impl RouteTable {
             return timeout(Duration::from_millis(TIMEOUT), sock.connect(sock_addr)).await?;
         }
 
-        let proxy_url = outbound.url.as_ref().unwrap();
+        let proxy_url = outbound.url.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "outbound has no proxy url",
+            )
+        })?;
         match proxy_url.scheme() {
             "drop" => {
                 Err(std::io::Error::new(
@@ -497,7 +502,12 @@ impl RouteTable {
             return Ok(Box::new(sock));
         }
 
-        let proxy_url = outbound.url.as_ref().unwrap();
+        let proxy_url = outbound.url.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "outbound has no proxy url",
+            )
+        })?;
         match proxy_url.scheme() {
             "drop" => {
                 Err(std::io::Error::new(
