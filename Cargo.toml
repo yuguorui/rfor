@@ -11,7 +11,7 @@ nix = { version = "0.29", features = ["socket", "ioctl", "net", "fs", "user", "f
 futures = "0.3"
 config = "0.15"
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde_yaml_ng = "0.10"
 iprange = "0.6"
 ipnet = "2.10"
 url = "2.5"

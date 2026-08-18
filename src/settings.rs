@@ -88,7 +88,7 @@ impl Settings {
     }
 
     pub fn to_yaml(&self) -> String {
-        serde_yaml::to_string(self).unwrap_or_else(|e| format!("<failed to serialize: {}>", e))
+        serde_yaml_ng::to_string(self).unwrap_or_else(|e| format!("<failed to serialize: {}>", e))
     }
 
     pub fn load() -> Result<Self, ConfigError> {
