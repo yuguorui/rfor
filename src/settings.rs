@@ -99,13 +99,6 @@ impl Settings {
                 args.work_dir, e
             ))
         })?;
-        let args = Args::parse();
-        std::env::set_current_dir(&args.work_dir).map_err(|e| {
-            ConfigError::Message(format!(
-                "Failed to set working directory '{}': {}",
-                args.work_dir, e
-            ))
-        })?;
 
         let s = Config::builder()
             .add_source(File::with_name(&args.config))
