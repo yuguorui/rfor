@@ -92,9 +92,8 @@ mod linux_impl {
         use std::time::Duration;
 
         let mut buffer = [0u8; 0x800];
-        // Bound the peek so a silent client cannot pin this fd forever.
-        // On timeout we fall through with an empty buffer and route by IP.
-        let _ = tokio::time::timeout(Duration::from_secs(5), inbound.peek(&mut buffer)).await;
+        // Give client-first protocols a short sniffing window, then route by IP.
+        let _ = tokio::time::timeout(Duration::from_millis(10), inbound.peek(&mut buffer)).await;
 
         let domain = crate::sniffer::parse_host(&buffer).filter(|s| is_valid_domain(s.as_str()));
 
