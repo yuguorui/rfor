@@ -7,7 +7,7 @@ use tracing::{error, info, warn, debug};
 
 use crate::{rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr, get_settings};
 use crate::stats::UDP_STATS;
-use std::{collections::hash_map, mem::MaybeUninit, os::fd::BorrowedFd, sync::Arc, time::Instant};
+use std::{collections::hash_map, mem::MaybeUninit, os::fd::BorrowedFd, sync::Arc, time::{Duration, Instant}};
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
@@ -979,7 +979,9 @@ async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
     use crate::utils::{is_valid_domain, transfer_tcp};
 
     let mut buffer = [0u8; 0x800];
-    inbound.peek(&mut buffer).await?;
+    // Bound the peek so a silent client cannot pin this fd forever.
+    // On timeout we fall through with an empty buffer and route by IP.
+    let _ = tokio::time::timeout(Duration::from_secs(5), inbound.peek(&mut buffer)).await;
 
     let domain = crate::sniffer::parse_host(&buffer).filter(|s| is_valid_domain(s.as_str()));
 
