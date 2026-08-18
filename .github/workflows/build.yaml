@@ -12,16 +12,12 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             arch: x86_64
-            cross: false
           - target: aarch64-unknown-linux-musl
             arch: aarch64
-            cross: true
           - target: armv7-unknown-linux-musleabi
             arch: armv7
-            cross: true
           - target: riscv64gc-unknown-linux-musl
             arch: riscv64
-            cross: true
 
     steps:
       - uses: actions/checkout@v4
@@ -31,23 +27,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install musl-tools (x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
       - name: Install cross
-        if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build with cargo (native)
-        if: "!matrix.cross"
-        run: |
-          RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target ${{ matrix.target }}
-
-      - name: Build with cross (cross-compile)
-        if: matrix.cross
+      - name: Build with cross
         env:
           RUSTFLAGS: '-C target-feature=+crt-static'
         run: |
