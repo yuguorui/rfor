@@ -28,10 +28,7 @@ mod linux_impl {
                     None => TcpListener::bind(format!("{}:0", listen_addr)).await?,
                 };
 
-                let port = listener
-                    .local_addr()
-                    .expect("TCP socket should have local_addr")
-                    .port();
+                let port = listener.local_addr()?.port();
                 info!("redirect listen: {}", listener.local_addr()?);
 
                 if let Err(err) =
@@ -104,10 +101,10 @@ mod linux_impl {
         let origin_addr = match inbound.peer_addr()? {
             SocketAddr::V4(v4) => SocketAddr::V4(v4),
             SocketAddr::V6(v6) => {
-                if v6.ip().to_ipv4_mapped().is_none() {
-                    SocketAddr::V6(v6)
+                if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                    SocketAddr::new(IpAddr::V4(v4), v6.port())
                 } else {
-                    SocketAddr::new(IpAddr::V4(v6.ip().to_ipv4().unwrap()), v6.port())
+                    SocketAddr::V6(v6)
                 }
             }
         };
@@ -211,7 +208,8 @@ mod linux_impl {
         local_traffic: bool,
     ) -> Result<()> {
         __setup_nat_iptables(
-            &iptables::new(false).unwrap(),
+            &iptables::new(false)
+                .map_err(|e| anyhow::anyhow!("command iptables not found: {}", e))?,
             proxy_chain,
             redirect_port,
             direct_mark,
@@ -238,7 +236,8 @@ mod linux_impl {
 
         if !get_settings().read().await.disable_ipv6 {
             __setup_nat_iptables(
-                &iptables::new(true).unwrap(),
+                &iptables::new(true)
+                    .map_err(|e| anyhow::anyhow!("command ip6tables not found: {}", e))?,
                 proxy_chain,
                 redirect_port,
                 direct_mark,
@@ -357,7 +356,10 @@ mod linux_impl {
     }
 
     fn cleanup_nat_iptables(proxy_chain: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let ipts = [iptables::new(false).unwrap(), iptables::new(true).unwrap()];
+        let ipts = [
+            iptables::new(false).map_err(|e| format!("command iptables not found: {}", e))?,
+            iptables::new(true).map_err(|e| format!("command ip6tables not found: {}", e))?,
+        ];
         let chains = ["OUTPUT", "PREROUTING"];
         let table = "nat";
 

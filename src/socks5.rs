@@ -19,13 +19,9 @@ pub async fn socks5_worker() -> Result<()> {
         return Ok(());
     }
 
-    let listen_addr = get_settings()
-        .read()
-        .await
-        .socks5_listen
-        .as_ref()
-        .unwrap()
-        .to_owned();
+    let Some(listen_addr) = get_settings().read().await.socks5_listen.clone() else {
+        return Ok(());
+    };
     info!("socks5 listen: {}", listen_addr);
 
     let listener = TcpListener::bind(listen_addr).await?;
@@ -87,9 +83,10 @@ async fn socks5_instance(socket: TcpStream) -> Result<()> {
             // IPv4 or IPv6.
             let peer_sock = UdpSocket::bind("[::]:0").await?;
 
-            let mut inner = proto.reply_success(std::net::SocketAddr::new(
-                empty_ip, peer_sock.local_addr().unwrap().port())
-            ).await?;
+            let udp_port = peer_sock.local_addr()?.port();
+            let mut inner = proto
+                .reply_success(std::net::SocketAddr::new(empty_ip, udp_port))
+                .await?;
 
             transfer_udp(&mut inner, peer_sock).await?;
         }

@@ -99,7 +99,9 @@ pub async fn tproxy_worker() -> Result<()> {
         return Err(err);
     }
 
-    let listen_addr = get_settings().read().await.tproxy_listen.clone().unwrap();
+    let Some(listen_addr) = get_settings().read().await.tproxy_listen.clone() else {
+        return Ok(());
+    };
     info!("tproxy listen: {}", listen_addr);
 
     tokio::select! {
@@ -1010,8 +1012,8 @@ async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
 
 fn cleanup_iptables(proxy_chain: &str, mark_chain: &str) -> Result<(), Box<dyn std::error::Error>> {
     let ipts = [
-        iptables::new(false).expect("command iptables not found"),
-        iptables::new(true).expect("command ip6tables not found"),
+        iptables::new(false).map_err(|e| format!("command iptables not found: {}", e))?,
+        iptables::new(true).map_err(|e| format!("command ip6tables not found: {}", e))?,
     ];
 
     for ipt in ipts {
@@ -1171,7 +1173,8 @@ async fn set_iptables(
     local_traffic: bool,
 ) -> Result<()> {
     __setup_iptables(
-        &iptables::new(false).unwrap(),
+        &iptables::new(false)
+            .map_err(|e| anyhow!("command iptables not found: {}", e))?,
         proxy_chain,
         mark_chain,
         tproxy_port,
@@ -1201,7 +1204,8 @@ async fn set_iptables(
 
     if !get_settings().read().await.disable_ipv6 {
         __setup_iptables(
-            &iptables::new(true).unwrap(),
+            &iptables::new(true)
+                .map_err(|e| anyhow!("command ip6tables not found: {}", e))?,
             proxy_chain,
             mark_chain,
             tproxy_port,
@@ -1269,7 +1273,8 @@ async fn __cleanup_ip_rule(
 async fn cleanup_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
     use rtnetlink::new_connection;
 
-    let (connection, handle, _) = new_connection().unwrap();
+    let (connection, handle, _) =
+        new_connection().context("failed to open rtnetlink connection")?;
     tokio::spawn(connection);
 
     __cleanup_ip_rule(&handle, rtnetlink::IpVersion::V4, route_table_index, fwmark)
@@ -1331,7 +1336,7 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
     // Scope host for local routes, see also /etc/iproute2/rt_scopes
     let lo_link_index = get_link_by_name(&handle, "lo".to_owned())
         .await?
-        .unwrap()
+        .ok_or_else(|| anyhow!("no loopback interface found"))?
         .header
         .index;
 
@@ -1396,9 +1401,9 @@ async fn environment_setup() -> Result<()> {
                 settings
                     .tproxy_listen
                     .as_ref()
-                    .unwrap()
+                    .ok_or_else(|| anyhow!("tproxy-listen is not configured"))?
                     .parse::<SocketAddr>()
-                    .unwrap()
+                    .map_err(|e| anyhow!("invalid tproxy-listen address: {}", e))?
                     .port(),
                 *tproxy_mark,
                 *direct_mark,
@@ -1439,7 +1444,8 @@ async fn clean_environment() -> Result<()> {
             let tproxy_mark = *tproxy_mark;
             let rule_table_index = *rule_table_index;
 
-            cleanup_iptables(&proxy_chain, &mark_chain).unwrap();
+            cleanup_iptables(&proxy_chain, &mark_chain)
+                .map_err(|e| anyhow!("failed to clean iptables rules: {}", e))?;
             cleanup_ip_rule(rule_table_index, tproxy_mark).await?;
 
             Ok(())

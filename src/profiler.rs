@@ -10,7 +10,7 @@ pub struct Profiler {
     pub path: String,
 }
 
-pub fn start(path: &str) -> Profiler {
+pub fn start(path: &str) -> anyhow::Result<Profiler> {
     tracing::info!("Pprof enabled, output path: {}", path);
 
     #[cfg(any(
@@ -24,12 +24,14 @@ pub fn start(path: &str) -> Profiler {
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         let builder = builder.blocklist(&["libc", "libgcc", "pthread", "vdso"]);
 
-        let guard = builder.build().unwrap();
+        let guard = builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to start profiler: {}", e))?;
 
-        Profiler {
+        Ok(Profiler {
             guard,
             path: path.to_string(),
-        }
+        })
     }
 
     #[cfg(not(any(
@@ -39,9 +41,9 @@ pub fn start(path: &str) -> Profiler {
     )))]
     {
         tracing::warn!("Pprof is not supported on this architecture.");
-        Profiler {
+        Ok(Profiler {
             path: path.to_string(),
-        }
+        })
     }
 }
 
