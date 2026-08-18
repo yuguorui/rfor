@@ -368,13 +368,29 @@ impl RouteTable {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing proxy port")
                 })?;
 
-                let target_host = match &context.dst_addr {
-                    TargetAddr::Ip(dst_sock) => dst_sock.ip().to_string(),
-                    TargetAddr::Domain(domain, _, _) => domain.to_owned(),
-                };
-                let target_port = match context.dst_addr {
-                    TargetAddr::Ip(dst_sock) => dst_sock.port(),
-                    TargetAddr::Domain(_, port, _) => port,
+                // TPROXY hands us IPv4-mapped IPv6 addresses
+                // (::ffff:1.2.3.4). Normalize them back to plain IPv4 so
+                // the SOCKS5 request uses ATYP=1; sending "::ffff:1.2.3.4"
+                // as a domain name makes servers drop the connection.
+                let target = match &context.dst_addr {
+                    TargetAddr::Ip(dst_sock) => {
+                        let ip = match dst_sock.ip() {
+                            std::net::IpAddr::V6(v6) => v6
+                                .to_ipv4_mapped()
+                                .map(std::net::IpAddr::V4)
+                                .unwrap_or(std::net::IpAddr::V6(v6)),
+                            ip => ip,
+                        };
+                        fast_socks5::util::target_addr::TargetAddr::Ip(
+                            std::net::SocketAddr::new(ip, dst_sock.port()),
+                        )
+                    }
+                    TargetAddr::Domain(domain, port, _) => {
+                        fast_socks5::util::target_addr::TargetAddr::Domain(
+                            domain.to_owned(),
+                            *port,
+                        )
+                    }
                 };
 
                 // Build the TCP socket to the SOCKS5 server ourselves so we
@@ -417,10 +433,7 @@ impl RouteTable {
                     socks
                         .request(
                             fast_socks5::Socks5Command::TCPConnect,
-                            fast_socks5::util::target_addr::TargetAddr::Domain(
-                                target_host,
-                                target_port,
-                            ),
+                            target,
                         )
                         .await
                         .map_err(to_io_err)?;
