@@ -57,14 +57,6 @@ mod linux_impl {
 
         tokio::select! {
             _ = accept_socket_loop(listener) => {},
-            _ = reconcile_nat_iptables_loop(
-                proxy_chain.clone(),
-                port,
-                direct_mark,
-                ports.clone(),
-                local_traffic,
-                disable_ipv6,
-            ) => {},
             Err(err) = crate::utils::receive_signal() => {
                 cleanup_nat_iptables(&proxy_chain).unwrap_or(());
                 return Err(err);
@@ -267,95 +259,6 @@ mod linux_impl {
             })?;
         }
         Ok(())
-    }
-
-    fn nat_iptables_healthy(
-        ipt: &iptables::IPTables,
-        proxy_chain: &str,
-        local_traffic: bool,
-    ) -> bool {
-        // Our chain must still exist and still contain rules. Merlin's
-        // firewall-restart often flushes the nat table, which either deletes
-        // our chain outright or leaves it empty without a PREROUTING jump.
-        if !ipt.chain_exists("nat", proxy_chain).unwrap_or(false) {
-            return false;
-        }
-        match ipt.list("nat", proxy_chain) {
-            // list() returns the chain header "-N rfor-proxy" plus one entry
-            // per rule, so an intact setup has len > 1.
-            Ok(rules) if rules.len() > 1 => {}
-            _ => return false,
-        }
-        let jump = format!("-j {}", proxy_chain);
-        let referenced_from = |chain: &str| {
-            ipt.list("nat", chain)
-                .map(|rs| rs.iter().any(|r| r.contains(&jump)))
-                .unwrap_or(false)
-        };
-        if !referenced_from("PREROUTING") {
-            return false;
-        }
-        if local_traffic && !referenced_from("OUTPUT") {
-            return false;
-        }
-        true
-    }
-
-    async fn reconcile_nat_iptables_loop(
-        proxy_chain: String,
-        redirect_port: u16,
-        direct_mark: u32,
-        ports: String,
-        local_traffic: bool,
-        disable_ipv6: bool,
-    ) {
-        use std::time::Duration;
-        let period = Duration::from_secs(10);
-        loop {
-            tokio::time::sleep(period).await;
-
-            let ipt4 = match iptables::new(false) {
-                Ok(i) => i,
-                Err(e) => {
-                    warn!("reconcile: failed to open ipv4 iptables: {}", e);
-                    continue;
-                }
-            };
-            let v4_ok = nat_iptables_healthy(&ipt4, &proxy_chain, local_traffic);
-
-            let v6_ok = if !disable_ipv6 {
-                match iptables::new(true) {
-                    Ok(ipt6) => nat_iptables_healthy(&ipt6, &proxy_chain, local_traffic),
-                    Err(e) => {
-                        warn!("reconcile: failed to open ipv6 iptables: {}", e);
-                        true // don't trigger a rebuild just because ip6tables is broken
-                    }
-                }
-            } else {
-                true
-            };
-
-            if v4_ok && v6_ok {
-                continue;
-            }
-
-            warn!(
-                "rfor-proxy nat rules missing or incomplete (v4_ok={}, v6_ok={}), rebuilding",
-                v4_ok, v6_ok
-            );
-            cleanup_nat_iptables(&proxy_chain).unwrap_or(());
-            match set_nat_iptables(
-                &proxy_chain,
-                redirect_port,
-                direct_mark,
-                &ports,
-                local_traffic,
-                disable_ipv6,
-            ) {
-                Ok(()) => info!("rfor-proxy nat rules rebuilt"),
-                Err(e) => error!("reconcile rebuild failed: {:#}", e),
-            }
-        }
     }
 
     fn cleanup_nat_iptables(proxy_chain: &str) -> Result<(), Box<dyn std::error::Error>> {
