@@ -1,0 +1,17 @@
+debug: false
+disable-ipv6: true
+redirect-listen: 0.0.0.0:15081
+
+traffic-intercept:
+  mode: redirect
+  local-traffic: true
+  ports: ["18080-18081"]
+  tproxy-proxy-chain: rfor-it-redirect
+
+outbounds:
+  - name: PROXY
+    url: socks5://198.18.0.30:1080
+
+rules:
+  - DEFAULT,,PROXY
+
