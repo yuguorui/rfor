@@ -37,4 +37,7 @@ clean:
 	@rm -f geoip.dat
 	@rm -f geosite.dat
 
-.PHONY: rfor clean release
+integration-test:
+	./tests/integration/run.sh
+
+.PHONY: rfor clean release integration-test

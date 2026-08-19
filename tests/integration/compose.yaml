@@ -1,0 +1,63 @@
+services:
+  origin:
+    image: rfor-integration:local
+    build:
+      context: ../..
+      dockerfile: tests/integration/Dockerfile
+    command: ["python3", "/integration/origin.py"]
+    init: true
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:18080/health"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    networks:
+      integration:
+        ipv4_address: 198.18.0.10
+
+  socks:
+    image: rfor-integration:local
+    pull_policy: never
+    command:
+      - python3
+      - /integration/slow_socks.py
+      - --listen
+      - 0.0.0.0
+      - --port
+      - "1080"
+      - --delay-ms
+      - "75"
+    init: true
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 1080), 1).close()"
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    networks:
+      integration:
+        ipv4_address: 198.18.0.30
+
+  test:
+    image: rfor-integration:local
+    pull_policy: never
+    command: ["/integration/test.sh"]
+    init: true
+    privileged: true
+    depends_on:
+      origin:
+        condition: service_healthy
+      socks:
+        condition: service_healthy
+    networks:
+      integration:
+        ipv4_address: 198.18.0.20
+
+networks:
+  integration:
+    ipam:
+      config:
+        - subnet: 198.18.0.0/24
