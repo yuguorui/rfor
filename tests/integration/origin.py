@@ -2,6 +2,7 @@
 
 import http.server
 import signal
+import socket
 import ssl
 import socketserver
 import subprocess
@@ -15,9 +16,23 @@ CORRUPTED_TLS_PROBE = b"\x16\x04\x00\x00\x04BAD!"
 CORRUPTED_TLS_BODY = b"corrupted-tls-forwarded-ok\n"
 
 
-class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
+class DualStackServerMixin:
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
+class ReusableThreadingTCPServer(DualStackServerMixin, socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+
+class DualStackThreadingHTTPServer(
+    DualStackServerMixin, http.server.ThreadingHTTPServer
+):
+    pass
 
 
 class HttpHandler(http.server.BaseHTTPRequestHandler):
@@ -89,13 +104,11 @@ def create_tls_context():
 
 
 def main():
-    http_server = http.server.ThreadingHTTPServer(("0.0.0.0", 18080), HttpHandler)
-    https_server = http.server.ThreadingHTTPServer(("0.0.0.0", 18443), HttpsHandler)
+    http_server = DualStackThreadingHTTPServer(("::", 18080), HttpHandler)
+    https_server = DualStackThreadingHTTPServer(("::", 18443), HttpsHandler)
     https_server.socket = create_tls_context().wrap_socket(https_server.socket, server_side=True)
-    tcp_server = ReusableThreadingTCPServer(("0.0.0.0", 18081), ServerFirstHandler)
-    corrupted_tls_server = ReusableThreadingTCPServer(
-        ("0.0.0.0", 18444), CorruptedTlsHandler
-    )
+    tcp_server = ReusableThreadingTCPServer(("::", 18081), ServerFirstHandler)
+    corrupted_tls_server = ReusableThreadingTCPServer(("::", 18444), CorruptedTlsHandler)
     stopped = threading.Event()
 
     for server in (http_server, https_server, tcp_server, corrupted_tls_server):

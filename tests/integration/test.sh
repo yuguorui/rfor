@@ -2,8 +2,8 @@
 
 set -Eeuo pipefail
 
-readonly ORIGIN_HOST=198.18.0.10
-readonly HTTP_URL="http://${ORIGIN_HOST}:18080/test"
+readonly ORIGIN_IPV4=198.18.0.10
+readonly ORIGIN_IPV6=2001:db8:198:18::10
 readonly EXPECTED_HTTP_BODY=rfor-integration-ok
 readonly EXPECTED_HTTPS_BODY=rfor-tls-integration-ok
 readonly EXPECTED_CORRUPTED_TLS_BODY=corrupted-tls-forwarded-ok
@@ -13,6 +13,7 @@ readonly WORK_DIR=/tmp/rfor-integration
 
 RFOR_PID=
 RFOR_LOG=
+RFOR_MODE=
 
 log() {
     printf '[integration] %s\n' "$*"
@@ -65,17 +66,44 @@ wait_for_log_after() {
     fail "timed out waiting for new log: ${pattern}"
 }
 
+format_target() {
+    local host=$1
+    local port=$2
+    if [[ $host == *:* ]]; then
+        printf '[%s]:%s' "$host" "$port"
+    else
+        printf '%s:%s' "$host" "$port"
+    fi
+}
+
+format_route_target() {
+    local host=$1
+    local port=$2
+    if [[ $RFOR_MODE == TPROXY && $host != *:* ]]; then
+        printf '[::ffff:%s]:%s' "$host" "$port"
+    else
+        format_target "$host" "$port"
+    fi
+}
+
+http_url() {
+    printf 'http://%s/test' "$(format_target "$1" 18080)"
+}
+
 assert_http_forwarding() {
+    local host=$1
     local body
-    body=$(curl --noproxy '*' --fail --silent --show-error --max-time 5 "$HTTP_URL") ||
+    body=$(curl --noproxy '*' --fail --silent --show-error --max-time 5 "$(http_url "$host")") ||
         fail "HTTP forwarding failed"
     [[ $body == "$EXPECTED_HTTP_BODY" ]] || fail "unexpected HTTP response: ${body}"
 }
 
 assert_timed_http_forwarding() {
+    local host=$1
     local direct_count
+    local fallback_target
     local first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
-    python3 - "$ORIGIN_HOST" "$EXPECTED_HTTP_BODY" <<'PY' || fail "timed HTTP forwarding failed"
+    python3 - "$host" "$EXPECTED_HTTP_BODY" <<'PY' || fail "timed HTTP forwarding failed"
 import socket
 import sys
 import time
@@ -113,7 +141,8 @@ for initial_delay, fragments in cases:
             raise RuntimeError(f"unexpected response body: {body!r}")
 PY
     wait_for_log_after '-> split.test:18080 -> Outbound(DIRECT)' "$first_line"
-    wait_for_log_after '-> 198.18.0.10:18080 -> Outbound(PROXY)' "$first_line"
+    fallback_target=$(format_route_target "$host" 18080)
+    wait_for_log_after "-> ${fallback_target} -> Outbound(PROXY)" "$first_line"
     direct_count=$(tail -n "+${first_line}" "$RFOR_LOG" 2>/dev/null |
         grep --fixed-strings --count -- '-> split.test:18080 -> Outbound(DIRECT)' || true)
     [[ $direct_count -eq 3 ]] ||
@@ -121,9 +150,10 @@ PY
 }
 
 assert_timed_tls_forwarding() {
+    local host=$1
     local direct_count
     local first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
-    python3 - "$ORIGIN_HOST" "$EXPECTED_HTTPS_BODY" <<'PY' || fail "timed TLS forwarding failed"
+    python3 - "$host" "$EXPECTED_HTTPS_BODY" <<'PY' || fail "timed TLS forwarding failed"
 import socket
 import ssl
 import sys
@@ -222,9 +252,11 @@ PY
 }
 
 assert_corrupted_tls_fallback() {
+    local host=$1
     local body
+    local fallback_target
     local first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
-    body=$(python3 - "$ORIGIN_HOST" <<'PY'
+    body=$(python3 - "$host" <<'PY'
 import socket
 import sys
 import time
@@ -240,12 +272,14 @@ PY
     ) || fail "corrupted TLS did not fall back within two seconds"
     [[ $body == "$EXPECTED_CORRUPTED_TLS_BODY" ]] ||
         fail "unexpected corrupted TLS response: ${body}"
-    wait_for_log_after '-> 198.18.0.10:18444 -> Outbound(PROXY)' "$first_line"
+    fallback_target=$(format_route_target "$host" 18444)
+    wait_for_log_after "-> ${fallback_target} -> Outbound(PROXY)" "$first_line"
 }
 
 assert_server_first_forwarding() {
+    local host=$1
     local body
-    body=$(python3 - "$ORIGIN_HOST" "$SERVER_FIRST_TIMEOUT_SECONDS" <<'PY'
+    body=$(python3 - "$host" "$SERVER_FIRST_TIMEOUT_SECONDS" <<'PY'
 import socket
 import sys
 
@@ -259,17 +293,34 @@ PY
         fail "unexpected server-first response: ${body}"
 }
 
+assert_family_forwarding() {
+    local host=$1
+    assert_http_forwarding "$host"
+    assert_timed_http_forwarding "$host"
+    assert_timed_tls_forwarding "$host"
+    assert_corrupted_tls_fallback "$host"
+    assert_server_first_forwarding "$host"
+}
+
 stress_reload() {
     local mode=$1
     local request_count=32
     local -a request_pids=()
     local request_id
+    local request_host
+    local request_url
     local failed=0
 
     log "${mode}: starting ${request_count} concurrent requests with SIGHUP reloads"
     for request_id in $(seq 1 "$request_count"); do
+        if (( request_id % 2 == 0 )); then
+            request_host=$ORIGIN_IPV6
+        else
+            request_host=$ORIGIN_IPV4
+        fi
+        request_url="$(http_url "$request_host")?request=${request_id}"
         curl --noproxy '*' --fail --silent --show-error --max-time 10 \
-            "$HTTP_URL?request=${request_id}" \
+            "$request_url" \
             --output "$WORK_DIR/${mode}-${request_id}.out" &
         request_pids+=("$!")
     done
@@ -291,28 +342,33 @@ stress_reload() {
 
     [[ $failed == 0 ]] || fail "${mode}: one or more concurrent requests failed"
     wait_for_log "Settings reloaded successfully."
-    assert_http_forwarding
+    assert_http_forwarding "$ORIGIN_IPV4"
+    assert_http_forwarding "$ORIGIN_IPV6"
 }
 
 assert_route_reload() {
     local config_file=$1
     local backup_file="$WORK_DIR/$(basename "$config_file").route-backup"
     local first_line
+    local host
 
     cp "$config_file" "$backup_file"
     sed -i 's/^  - DEFAULT,,PROXY$/  - DEFAULT,,DROP/' "$config_file"
     first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
     kill -HUP "$RFOR_PID"
     wait_for_log_after 'Settings reloaded successfully.' "$first_line"
-    if curl --noproxy '*' --fail --silent --max-time 2 "$HTTP_URL" >/dev/null; then
-        fail "route reload did not activate the DROP outbound"
-    fi
+    for host in "$ORIGIN_IPV4" "$ORIGIN_IPV6"; do
+        if curl --noproxy '*' --fail --silent --max-time 2 "$(http_url "$host")" >/dev/null; then
+            fail "route reload did not activate the DROP outbound for ${host}"
+        fi
+    done
 
     cp "$backup_file" "$config_file"
     first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
     kill -HUP "$RFOR_PID"
     wait_for_log_after 'Settings reloaded successfully.' "$first_line"
-    assert_http_forwarding
+    assert_http_forwarding "$ORIGIN_IPV4"
+    assert_http_forwarding "$ORIGIN_IPV6"
 }
 
 assert_immutable_reload_rejected() {
@@ -320,13 +376,14 @@ assert_immutable_reload_rejected() {
     local backup_file="$WORK_DIR/$(basename "$config_file").backup"
 
     cp "$config_file" "$backup_file"
-    sed -i 's/^disable-ipv6: true$/disable-ipv6: false/' "$config_file"
+    sed -i 's/^disable-ipv6: false$/disable-ipv6: true/' "$config_file"
     sed -i 's/^  - DEFAULT,,PROXY$/  - DEFAULT,,DROP/' "$config_file"
     kill -HUP "$RFOR_PID"
     wait_for_log 'Settings reload rejected; restart required for changes to: disable-ipv6'
     cp "$backup_file" "$config_file"
 
-    assert_http_forwarding
+    assert_http_forwarding "$ORIGIN_IPV4"
+    assert_http_forwarding "$ORIGIN_IPV6"
 }
 
 stop_rfor() {
@@ -346,13 +403,21 @@ stop_rfor() {
 assert_tproxy_rules() {
     iptables --wait 5 --table mangle --check OUTPUT --jump rfor-it-mark ||
         fail "TPROXY OUTPUT jump is missing"
+    ip6tables --wait 5 --table mangle --check OUTPUT --jump rfor-it-mark ||
+        fail "TPROXY IPv6 OUTPUT jump is missing"
     iptables --wait 5 --table mangle --list-rules rfor-it-proxy >/dev/null ||
         fail "TPROXY proxy chain is missing"
+    ip6tables --wait 5 --table mangle --list-rules rfor-it-proxy >/dev/null ||
+        fail "TPROXY IPv6 proxy chain is missing"
     iptables --wait 5 --table mangle --list-rules rfor-it-mark >/dev/null ||
         fail "TPROXY mark chain is missing"
+    ip6tables --wait 5 --table mangle --list-rules rfor-it-mark >/dev/null ||
+        fail "TPROXY IPv6 mark chain is missing"
     for _attempt in $(seq 1 100); do
         if ip rule show | grep --quiet 'fwmark 0xff42 lookup 66' &&
-            ip route show table 66 | grep --quiet 'local default dev lo'; then
+            ip route show table 66 | grep --quiet 'local default dev lo' &&
+            ip -6 rule show | grep --quiet 'fwmark 0xff42 lookup 66' &&
+            ip -6 route show table 66 | grep --quiet 'local default dev lo'; then
             return
         fi
         sleep 0.05
@@ -367,24 +432,43 @@ assert_tproxy_cleanup() {
     if iptables --wait 5 --table mangle --list-rules rfor-it-mark >/dev/null 2>&1; then
         fail "TPROXY mark chain remained after shutdown"
     fi
+    if ip6tables --wait 5 --table mangle --list-rules rfor-it-proxy >/dev/null 2>&1; then
+        fail "TPROXY IPv6 proxy chain remained after shutdown"
+    fi
+    if ip6tables --wait 5 --table mangle --list-rules rfor-it-mark >/dev/null 2>&1; then
+        fail "TPROXY IPv6 mark chain remained after shutdown"
+    fi
     if ip rule show | grep --quiet 'fwmark 0xff42 lookup 66'; then
         fail "TPROXY policy rule remained after shutdown"
     fi
     if ip route show table 66 | grep --quiet .; then
         fail "TPROXY route table remained after shutdown"
     fi
+    if ip -6 rule show | grep --quiet 'fwmark 0xff42 lookup 66'; then
+        fail "TPROXY IPv6 policy rule remained after shutdown"
+    fi
+    if ip -6 route show table 66 | grep --quiet .; then
+        fail "TPROXY IPv6 route table remained after shutdown"
+    fi
 }
 
 assert_redirect_rules() {
     iptables --wait 5 --table nat --check OUTPUT --jump rfor-it-redirect ||
         fail "REDIRECT OUTPUT jump is missing"
+    ip6tables --wait 5 --table nat --check OUTPUT --jump rfor-it-redirect ||
+        fail "REDIRECT IPv6 OUTPUT jump is missing"
     iptables --wait 5 --table nat --list-rules rfor-it-redirect >/dev/null ||
         fail "REDIRECT chain is missing"
+    ip6tables --wait 5 --table nat --list-rules rfor-it-redirect >/dev/null ||
+        fail "REDIRECT IPv6 chain is missing"
 }
 
 assert_redirect_cleanup() {
     if iptables --wait 5 --table nat --list-rules rfor-it-redirect >/dev/null 2>&1; then
         fail "REDIRECT chain remained after shutdown"
+    fi
+    if ip6tables --wait 5 --table nat --list-rules rfor-it-redirect >/dev/null 2>&1; then
+        fail "REDIRECT IPv6 chain remained after shutdown"
     fi
 }
 
@@ -403,16 +487,14 @@ assert_not_reconciled() {
 
 run_tproxy_test() {
     log 'TPROXY: starting rfor'
+    RFOR_MODE=TPROXY
     RFOR_LOG=$WORK_DIR/tproxy.log
     rfor --config /integration/config-tproxy.yaml >"$RFOR_LOG" 2>&1 &
     RFOR_PID=$!
-    wait_for_log 'tproxy listen: 0.0.0.0:15080'
+    wait_for_log 'tproxy listen: [::]:15080'
     assert_tproxy_rules
-    assert_http_forwarding
-    assert_timed_http_forwarding
-    assert_timed_tls_forwarding
-    assert_corrupted_tls_fallback
-    assert_server_first_forwarding
+    assert_family_forwarding "$ORIGIN_IPV4"
+    assert_family_forwarding "$ORIGIN_IPV6"
     stress_reload TPROXY
     assert_route_reload /integration/config-tproxy.yaml
     assert_immutable_reload_rejected /integration/config-tproxy.yaml
@@ -425,16 +507,14 @@ run_tproxy_test() {
 
 run_redirect_test() {
     log 'REDIRECT: starting rfor'
+    RFOR_MODE=REDIRECT
     RFOR_LOG=$WORK_DIR/redirect.log
     rfor --config /integration/config-redirect.yaml >"$RFOR_LOG" 2>&1 &
     RFOR_PID=$!
     wait_for_log 'redirect listen:'
     assert_redirect_rules
-    assert_http_forwarding
-    assert_timed_http_forwarding
-    assert_timed_tls_forwarding
-    assert_corrupted_tls_fallback
-    assert_server_first_forwarding
+    assert_family_forwarding "$ORIGIN_IPV4"
+    assert_family_forwarding "$ORIGIN_IPV6"
     stress_reload REDIRECT
     assert_route_reload /integration/config-redirect.yaml
     assert_immutable_reload_rejected /integration/config-redirect.yaml

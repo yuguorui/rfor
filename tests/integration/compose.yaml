@@ -14,6 +14,7 @@ services:
     networks:
       integration:
         ipv4_address: 198.18.0.10
+        ipv6_address: 2001:db8:198:18::10
 
   socks:
     image: rfor-integration:local
@@ -22,7 +23,7 @@ services:
       - python3
       - /integration/slow_socks.py
       - --listen
-      - 0.0.0.0
+      - "::"
       - --port
       - "1080"
       - --delay-ms
@@ -40,6 +41,7 @@ services:
     networks:
       integration:
         ipv4_address: 198.18.0.30
+        ipv6_address: 2001:db8:198:18::30
 
   test:
     image: rfor-integration:local
@@ -55,9 +57,12 @@ services:
     networks:
       integration:
         ipv4_address: 198.18.0.20
+        ipv6_address: 2001:db8:198:18::20
 
 networks:
   integration:
+    enable_ipv6: true
     ipam:
       config:
         - subnet: 198.18.0.0/24
+        - subnet: 2001:db8:198:18::/64

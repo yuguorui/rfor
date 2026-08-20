@@ -81,6 +81,11 @@ class SocksServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def server_bind(self):
+        if self.address_family == socket.AF_INET6:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -89,6 +94,7 @@ def main():
     parser.add_argument("--delay-ms", type=int, default=75)
     args = parser.parse_args()
 
+    SocksServer.address_family = socket.AF_INET6 if ":" in args.listen else socket.AF_INET
     with SocksServer((args.listen, args.port), SocksHandler) as server:
         server.delay_seconds = args.delay_ms / 1000
         server.serve_forever()

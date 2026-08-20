@@ -1,7 +1,7 @@
 debug: false
-disable-ipv6: true
+disable-ipv6: false
 tcp-sniff-timeout: 0.5
-tproxy-listen: 0.0.0.0:15080
+tproxy-listen: '[::]:15080'
 udp-enabled: false
 
 traffic-intercept:
