@@ -54,3 +54,6 @@ which = "7"
 codegen-units = 1
 lto = "fat"
 panic = "abort"
+
+[profile.dev.package.fqdn-trie]
+debug-assertions = false
