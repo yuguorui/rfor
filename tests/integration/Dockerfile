@@ -24,6 +24,7 @@ RUN apt-get update && \
         iproute2 \
         iptables \
         netcat-openbsd \
+        openssl \
         python3 && \
     rm -rf /var/lib/apt/lists/*
 

@@ -5,6 +5,8 @@ set -Eeuo pipefail
 readonly ORIGIN_HOST=198.18.0.10
 readonly HTTP_URL="http://${ORIGIN_HOST}:18080/test"
 readonly EXPECTED_HTTP_BODY=rfor-integration-ok
+readonly EXPECTED_HTTPS_BODY=rfor-tls-integration-ok
+readonly EXPECTED_CORRUPTED_TLS_BODY=corrupted-tls-forwarded-ok
 readonly EXPECTED_SERVER_FIRST_BODY=server-first-ok
 readonly SERVER_FIRST_TIMEOUT_SECONDS=8
 readonly WORK_DIR=/tmp/rfor-integration
@@ -116,6 +118,129 @@ PY
         grep --fixed-strings --count -- '-> split.test:18080 -> Outbound(DIRECT)' || true)
     [[ $direct_count -eq 3 ]] ||
         fail "expected three domain-routed timed requests, observed ${direct_count}"
+}
+
+assert_timed_tls_forwarding() {
+    local direct_count
+    local first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
+    python3 - "$ORIGIN_HOST" "$EXPECTED_HTTPS_BODY" <<'PY' || fail "timed TLS forwarding failed"
+import socket
+import ssl
+import sys
+import time
+
+host = sys.argv[1]
+expected = sys.argv[2].encode()
+request = b"GET /test HTTP/1.1\r\nHost: split.test\r\nConnection: close\r\n\r\n"
+
+
+def flush_outgoing(raw_sock, outgoing, fragment_client_hello):
+    first_flight = True
+    while True:
+        encrypted = outgoing.read()
+        if not encrypted:
+            return
+        if fragment_client_hello and first_flight:
+            offsets = [1, 5, 23, len(encrypted)]
+            start = 0
+            for end in offsets:
+                raw_sock.sendall(encrypted[start:end])
+                start = end
+                if end != len(encrypted):
+                    time.sleep(0.05)
+        else:
+            raw_sock.sendall(encrypted)
+        first_flight = False
+
+
+def tls_request(tls_version, expected_version, initial_delay, fragment_client_hello):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.minimum_version = tls_version
+    context.maximum_version = tls_version
+    incoming = ssl.MemoryBIO()
+    outgoing = ssl.MemoryBIO()
+    tls = context.wrap_bio(incoming, outgoing, server_hostname="split.test")
+
+    with socket.create_connection((host, 18443), timeout=2) as raw_sock:
+        raw_sock.settimeout(10)
+        time.sleep(initial_delay)
+        first_flight = fragment_client_hello
+
+        while True:
+            try:
+                tls.do_handshake()
+                flush_outgoing(raw_sock, outgoing, first_flight)
+                break
+            except ssl.SSLWantReadError:
+                flush_outgoing(raw_sock, outgoing, first_flight)
+                first_flight = False
+                encrypted = raw_sock.recv(16384)
+                if not encrypted:
+                    raise RuntimeError("TLS peer closed during handshake")
+                incoming.write(encrypted)
+            except ssl.SSLWantWriteError:
+                flush_outgoing(raw_sock, outgoing, first_flight)
+                first_flight = False
+
+        if tls.version() != expected_version:
+            raise RuntimeError(f"negotiated {tls.version()}, expected {expected_version}")
+        tls.write(request)
+        flush_outgoing(raw_sock, outgoing, False)
+        response = bytearray()
+        while expected not in response:
+            try:
+                decrypted = tls.read(4096)
+                if not decrypted:
+                    break
+                response.extend(decrypted)
+            except ssl.SSLWantReadError:
+                encrypted = raw_sock.recv(16384)
+                if not encrypted:
+                    break
+                incoming.write(encrypted)
+        body = bytes(response).split(b"\r\n\r\n", 1)[-1].strip()
+        if body != expected:
+            raise RuntimeError(f"unexpected TLS response body: {body!r}")
+
+
+versions = [
+    (ssl.TLSVersion.TLSv1_2, "TLSv1.2"),
+    (ssl.TLSVersion.TLSv1_3, "TLSv1.3"),
+]
+timings = [(0, False), (0.2, False), (0, True)]
+for tls_version, expected_version in versions:
+    for timing in timings:
+        tls_request(tls_version, expected_version, *timing)
+PY
+    wait_for_log_after '-> split.test:18443 -> Outbound(DIRECT)' "$first_line"
+    direct_count=$(tail -n "+${first_line}" "$RFOR_LOG" 2>/dev/null |
+        grep --fixed-strings --count -- '-> split.test:18443 -> Outbound(DIRECT)' || true)
+    [[ $direct_count -eq 6 ]] ||
+        fail "expected six domain-routed TLS requests, observed ${direct_count}"
+}
+
+assert_corrupted_tls_fallback() {
+    local body
+    local first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
+    body=$(python3 - "$ORIGIN_HOST" <<'PY'
+import socket
+import sys
+import time
+
+payload = b"\x16\x04\x00\x00\x04BAD!"
+with socket.create_connection((sys.argv[1], 18444), timeout=2) as sock:
+    sock.settimeout(2)
+    sock.sendall(payload[:1])
+    time.sleep(0.05)
+    sock.sendall(payload[1:])
+    print(sock.recv(128).decode().strip())
+PY
+    ) || fail "corrupted TLS did not fall back within two seconds"
+    [[ $body == "$EXPECTED_CORRUPTED_TLS_BODY" ]] ||
+        fail "unexpected corrupted TLS response: ${body}"
+    wait_for_log_after '-> 198.18.0.10:18444 -> Outbound(PROXY)' "$first_line"
 }
 
 assert_server_first_forwarding() {
@@ -281,6 +406,8 @@ run_tproxy_test() {
     assert_tproxy_rules
     assert_http_forwarding
     assert_timed_http_forwarding
+    assert_timed_tls_forwarding
+    assert_corrupted_tls_fallback
     assert_server_first_forwarding
     stress_reload TPROXY
     assert_route_reload /integration/config-tproxy.yaml
@@ -301,6 +428,8 @@ run_redirect_test() {
     assert_redirect_rules
     assert_http_forwarding
     assert_timed_http_forwarding
+    assert_timed_tls_forwarding
+    assert_corrupted_tls_fallback
     assert_server_first_forwarding
     stress_reload REDIRECT
     assert_route_reload /integration/config-redirect.yaml

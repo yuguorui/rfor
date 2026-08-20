@@ -51,7 +51,7 @@ protoc-bin-vendored = "3"
 which = "7"
 
 [dev-dependencies]
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [profile.release]
 codegen-units = 1

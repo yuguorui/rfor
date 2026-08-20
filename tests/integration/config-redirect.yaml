@@ -5,7 +5,7 @@ redirect-listen: 0.0.0.0:15081
 traffic-intercept:
   mode: redirect
   local-traffic: true
-  ports: ["18080-18081"]
+  ports: ["18080-18081", "18443-18444"]
   tproxy-proxy-chain: rfor-it-redirect
 
 outbounds:

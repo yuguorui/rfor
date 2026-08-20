@@ -95,8 +95,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    fn client_hello(host: &str) -> Vec<u8> {
-        let config = rustls::ClientConfig::builder()
+    fn client_hello(host: &str, version: &'static rustls::SupportedProtocolVersion) -> Vec<u8> {
+        let config = rustls::ClientConfig::builder_with_protocol_versions(&[version])
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
@@ -126,24 +126,63 @@ mod tests {
     }
 
     #[test]
-    fn parses_fragmented_client_hello() {
-        let hello = client_hello("fragmented.example");
+    fn parses_fragmented_client_hello_for_tls12_and_tls13() {
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let hello = client_hello("fragmented.example", version);
+            assert_eq!(
+                parse_host_result(&hello[..hello.len() - 1]),
+                HostParseResult::NeedMore
+            );
+            assert_eq!(
+                parse_host_result(&hello),
+                HostParseResult::Found("fragmented.example".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn parses_client_hello_across_records_for_tls12_and_tls13() {
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let hello = client_hello("records.example", version);
+            assert_eq!(
+                parse_host_result(&split_record(&hello)),
+                HostParseResult::Found("records.example".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_corrupted_tls_records() {
         assert_eq!(
-            parse_host_result(&hello[..hello.len() - 1]),
-            HostParseResult::NeedMore
+            parse_host_result(&[TLS_HANDSHAKE_CONTENT_TYPE, 4]),
+            HostParseResult::NotProtocol
         );
         assert_eq!(
-            parse_host_result(&hello),
-            HostParseResult::Found("fragmented.example".to_string())
+            parse_host_result(&[TLS_HANDSHAKE_CONTENT_TYPE, 3, 3, 0, 4, 2, 0, 0, 0,]),
+            HostParseResult::NotProtocol
+        );
+        assert_eq!(
+            parse_host_result(&[
+                TLS_HANDSHAKE_CONTENT_TYPE,
+                3,
+                3,
+                0,
+                5,
+                TLS_CLIENT_HELLO_TYPE,
+                0,
+                0,
+                1,
+                0xff,
+            ]),
+            HostParseResult::NotProtocol
         );
     }
 
     #[test]
-    fn parses_client_hello_across_records() {
-        let hello = client_hello("records.example");
+    fn waits_for_a_truncated_tls_record() {
         assert_eq!(
-            parse_host_result(&split_record(&hello)),
-            HostParseResult::Found("records.example".to_string())
+            parse_host_result(&[TLS_HANDSHAKE_CONTENT_TYPE, 3, 3, 0, 16, 1, 0]),
+            HostParseResult::NeedMore
         );
     }
 }
