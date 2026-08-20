@@ -438,15 +438,13 @@ impl RouteTable {
                                 .unwrap_or(std::net::IpAddr::V6(v6)),
                             ip => ip,
                         };
-                        fast_socks5::util::target_addr::TargetAddr::Ip(
-                            std::net::SocketAddr::new(ip, dst_sock.port()),
-                        )
+                        fast_socks5::util::target_addr::TargetAddr::Ip(std::net::SocketAddr::new(
+                            ip,
+                            dst_sock.port(),
+                        ))
                     }
                     TargetAddr::Domain(domain, port, _) => {
-                        fast_socks5::util::target_addr::TargetAddr::Domain(
-                            domain.to_owned(),
-                            *port,
-                        )
+                        fast_socks5::util::target_addr::TargetAddr::Domain(domain.to_owned(), *port)
                     }
                 };
 
@@ -500,10 +498,7 @@ impl RouteTable {
                     .await
                     .map_err(to_io_err)?;
                     socks
-                        .request(
-                            fast_socks5::Socks5Command::TCPConnect,
-                            target,
-                        )
+                        .request(fast_socks5::Socks5Command::TCPConnect, target)
                         .await
                         .map_err(to_io_err)?;
                     Ok::<_, std::io::Error>(socks)
