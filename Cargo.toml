@@ -57,3 +57,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 codegen-units = 1
 lto = "fat"
 panic = "abort"
+
+[profile.dev.package.fqdn-trie]
+debug-assertions = false
