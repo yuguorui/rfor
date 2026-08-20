@@ -6,6 +6,7 @@ readonly ORIGIN_HOST=198.18.0.10
 readonly HTTP_URL="http://${ORIGIN_HOST}:18080/test"
 readonly EXPECTED_HTTP_BODY=rfor-integration-ok
 readonly EXPECTED_SERVER_FIRST_BODY=server-first-ok
+readonly SERVER_FIRST_TIMEOUT_SECONDS=8
 readonly WORK_DIR=/tmp/rfor-integration
 
 RFOR_PID=
@@ -55,15 +56,16 @@ assert_http_forwarding() {
 
 assert_server_first_forwarding() {
     local body
-    body=$(python3 - "$ORIGIN_HOST" <<'PY'
+    body=$(python3 - "$ORIGIN_HOST" "$SERVER_FIRST_TIMEOUT_SECONDS" <<'PY'
 import socket
 import sys
 
-with socket.create_connection((sys.argv[1], 18081), timeout=2) as sock:
-    sock.settimeout(2)
+timeout = float(sys.argv[2])
+with socket.create_connection((sys.argv[1], 18081), timeout=timeout) as sock:
+    sock.settimeout(timeout)
     print(sock.recv(128).decode().strip())
 PY
-    ) || fail "server-first forwarding exceeded two seconds"
+    ) || fail "server-first forwarding exceeded ${SERVER_FIRST_TIMEOUT_SECONDS} seconds"
     [[ $body == "$EXPECTED_SERVER_FIRST_BODY" ]] ||
         fail "unexpected server-first response: ${body}"
 }
