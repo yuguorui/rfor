@@ -31,4 +31,4 @@ RUN apt-get update && \
 COPY --from=builder /tmp/rfor /usr/local/bin/rfor
 COPY tests/integration /integration
 
-RUN chmod +x /integration/run.sh /integration/test.sh
+RUN chmod +x /integration/run.sh /integration/test.sh /integration/udp_origin.py

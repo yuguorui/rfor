@@ -43,6 +43,31 @@ services:
         ipv4_address: 198.18.0.30
         ipv6_address: 2001:db8:198:18::30
 
+  udp-origin:
+    image: rfor-integration:local
+    pull_policy: never
+    command:
+      - python3
+      - /integration/udp_origin.py
+      - --listen
+      - "::"
+      - --port
+      - "18082"
+    init: true
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import socket; s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM); s.settimeout(1); s.sendto(b'health',('::1',18082)); assert s.recvfrom(64)[0] == b'health'"
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    networks:
+      integration:
+        ipv4_address: 198.18.0.11
+        ipv6_address: 2001:db8:198:18::11
+
   test:
     image: rfor-integration:local
     pull_policy: never
@@ -53,6 +78,8 @@ services:
       origin:
         condition: service_healthy
       socks:
+        condition: service_healthy
+      udp-origin:
         condition: service_healthy
     networks:
       integration:

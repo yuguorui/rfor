@@ -4,6 +4,8 @@ set -Eeuo pipefail
 
 readonly ORIGIN_IPV4=198.18.0.10
 readonly ORIGIN_IPV6=2001:db8:198:18::10
+readonly UDP_ORIGIN_IPV4=198.18.0.11
+readonly UDP_ORIGIN_IPV6=2001:db8:198:18::11
 readonly EXPECTED_HTTP_BODY=rfor-integration-ok
 readonly EXPECTED_HTTPS_BODY=rfor-tls-integration-ok
 readonly EXPECTED_CORRUPTED_TLS_BODY=corrupted-tls-forwarded-ok
@@ -302,6 +304,46 @@ assert_family_forwarding() {
     assert_server_first_forwarding "$host"
 }
 
+assert_udp_forwarding() {
+    local host=$1
+    local first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
+    local route_target
+    local session_count
+
+    python3 - "$host" <<'PY' || fail "UDP forwarding failed for ${host}"
+import socket
+import sys
+
+host = sys.argv[1]
+family = socket.AF_INET6 if ":" in host else socket.AF_INET
+messages = [
+    b"udp-single-packet",
+    bytes(range(64)),
+    bytes((index * 31) % 256 for index in range(511)),
+    bytes((index * 17) % 256 for index in range(1400)),
+    bytes((index * 7) % 256 for index in range(4096)),
+]
+
+with socket.socket(family, socket.SOCK_DGRAM) as sock:
+    sock.settimeout(3)
+    sock.connect((host, 18082))
+    for message in messages:
+        sock.send(message)
+        echoed = sock.recv(65535)
+        if echoed != message:
+            raise RuntimeError(
+                f"UDP echo mismatch: sent {len(message)} bytes, received {len(echoed)}"
+            )
+PY
+
+    route_target=$(format_route_target "$host" 18082)
+    wait_for_log_after "DGRAM -> ${route_target} -> Outbound(DIRECT)" "$first_line"
+    session_count=$(tail -n "+${first_line}" "$RFOR_LOG" 2>/dev/null |
+        grep --fixed-strings --count -- 'udp relay: create tunnel' || true)
+    [[ $session_count -eq 1 ]] ||
+        fail "expected one reused UDP session for ${host}, observed ${session_count}"
+}
+
 stress_reload() {
     local mode=$1
     local request_count=32
@@ -413,6 +455,14 @@ assert_tproxy_rules() {
         fail "TPROXY mark chain is missing"
     ip6tables --wait 5 --table mangle --list-rules rfor-it-mark >/dev/null ||
         fail "TPROXY IPv6 mark chain is missing"
+    iptables --wait 5 --table mangle --check rfor-it-proxy \
+        --protocol udp --match multiport --dports '18080:18082,18443:18444' \
+        --jump TPROXY --tproxy-mark 0xff42 --on-port 15080 ||
+        fail "TPROXY UDP rule is missing"
+    ip6tables --wait 5 --table mangle --check rfor-it-proxy \
+        --protocol udp --match multiport --dports '18080:18082,18443:18444' \
+        --jump TPROXY --tproxy-mark 0xff42 --on-port 15080 ||
+        fail "TPROXY IPv6 UDP rule is missing"
     for _attempt in $(seq 1 100); do
         if ip rule show | grep --quiet 'fwmark 0xff42 lookup 66' &&
             ip route show table 66 | grep --quiet 'local default dev lo' &&
@@ -495,6 +545,8 @@ run_tproxy_test() {
     assert_tproxy_rules
     assert_family_forwarding "$ORIGIN_IPV4"
     assert_family_forwarding "$ORIGIN_IPV6"
+    assert_udp_forwarding "$UDP_ORIGIN_IPV4"
+    assert_udp_forwarding "$UDP_ORIGIN_IPV6"
     stress_reload TPROXY
     assert_route_reload /integration/config-tproxy.yaml
     assert_immutable_reload_rejected /integration/config-tproxy.yaml

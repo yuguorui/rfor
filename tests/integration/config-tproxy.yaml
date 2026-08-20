@@ -2,12 +2,12 @@ debug: false
 disable-ipv6: false
 tcp-sniff-timeout: 0.5
 tproxy-listen: '[::]:15080'
-udp-enabled: false
+udp-enabled: true
 
 traffic-intercept:
   mode: tproxy
   local-traffic: true
-  ports: ["18080-18081", "18443-18444"]
+  ports: ["18080-18082", "18443-18444"]
   tproxy-proxy-chain: rfor-it-proxy
   tproxy-mark-chain: rfor-it-mark
   rule-table: 66
@@ -18,4 +18,6 @@ outbounds:
 
 rules:
   - DOMAIN,split.test,DIRECT
+  - IP-CIDR,198.18.0.11/32,DIRECT
+  - IP-CIDR,2001:db8:198:18::11/128,DIRECT
   - DEFAULT,,PROXY
