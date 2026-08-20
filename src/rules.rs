@@ -645,23 +645,20 @@ async fn resolve_target_addr(
         TargetAddr::Domain(domain, port, osock) => {
             let sock = match osock {
                 Some(sock) => sock,
-                None => {
-                    let sock = tokio::net::lookup_host((domain.as_str(), port))
-                        .await?
-                        .next()
-                        .ok_or_else(|| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                format!("DNS lookup returned no results for {}:{}", domain, port),
-                            )
-                        })?;
-                    match disable_ipv6 {
-                        false => sock.to_ipv6_sockaddr(),
-                        true => sock,
-                    }
-                }
+                None => tokio::net::lookup_host((domain.as_str(), port))
+                    .await?
+                    .next()
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("DNS lookup returned no results for {}:{}", domain, port),
+                        )
+                    })?,
             };
-            Ok(sock)
+            Ok(match disable_ipv6 {
+                false => sock.to_ipv6_sockaddr(),
+                true => sock,
+            })
         }
     }
 }
@@ -770,6 +767,21 @@ impl ProxyDgram for fast_socks5::client::Socks5Datagram<tokio::net::TcpStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn domain_original_address_matches_outbound_socket_family() {
+        let ipv4: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let target = TargetAddr::Domain("example.test".to_string(), 443, Some(ipv4));
+
+        assert_eq!(
+            resolve_target_addr(target.clone(), true).await.unwrap(),
+            ipv4
+        );
+        assert_eq!(
+            resolve_target_addr(target, false).await.unwrap(),
+            ipv4.to_ipv6_sockaddr()
+        );
+    }
 
     #[tokio::test]
     async fn tcp_stage_identifies_expired_deadline() {
