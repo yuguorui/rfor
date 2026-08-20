@@ -13,5 +13,5 @@ outbounds:
     url: socks5://198.18.0.30:1080
 
 rules:
+  - DOMAIN,split.test,DIRECT
   - DEFAULT,,PROXY
-

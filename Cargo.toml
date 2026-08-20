@@ -50,6 +50,9 @@ protobuf-codegen = "3"
 protoc-bin-vendored = "3"
 which = "7"
 
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
 [profile.release]
 codegen-units = 1
 lto = "fat"

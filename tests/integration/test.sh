@@ -36,7 +36,7 @@ trap cleanup EXIT INT TERM
 wait_for_log() {
     local pattern=$1
     for _attempt in $(seq 1 100); do
-        if grep --fixed-strings --quiet "$pattern" "$RFOR_LOG" 2>/dev/null; then
+        if grep --fixed-strings --quiet -- "$pattern" "$RFOR_LOG" 2>/dev/null; then
             return 0
         fi
         if ! kill -0 "$RFOR_PID" 2>/dev/null; then
@@ -52,7 +52,7 @@ wait_for_log_after() {
     local first_line=$2
     for _attempt in $(seq 1 100); do
         if tail -n "+${first_line}" "$RFOR_LOG" 2>/dev/null |
-            grep --fixed-strings --quiet "$pattern"; then
+            grep --fixed-strings --quiet -- "$pattern"; then
             return 0
         fi
         if ! kill -0 "$RFOR_PID" 2>/dev/null; then
@@ -68,6 +68,54 @@ assert_http_forwarding() {
     body=$(curl --noproxy '*' --fail --silent --show-error --max-time 5 "$HTTP_URL") ||
         fail "HTTP forwarding failed"
     [[ $body == "$EXPECTED_HTTP_BODY" ]] || fail "unexpected HTTP response: ${body}"
+}
+
+assert_timed_http_forwarding() {
+    local direct_count
+    local first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
+    python3 - "$ORIGIN_HOST" "$EXPECTED_HTTP_BODY" <<'PY' || fail "timed HTTP forwarding failed"
+import socket
+import sys
+import time
+
+host = sys.argv[1]
+expected = sys.argv[2].encode()
+request = b"GET /test HTTP/1.1\r\nHost: split.test\r\nConnection: close\r\n\r\n"
+
+cases = [
+    (0, [(request, 0)]),
+    (0.2, [(request, 0)]),
+    (0, [
+        (b"GE", 0.05),
+        (b"T /test HTTP/1.1\r\nHost: split", 0.1),
+        (b".test\r\nConnection: close\r\n\r\n", 0),
+    ]),
+    (5.5, [(request, 0)]),
+]
+
+for initial_delay, fragments in cases:
+    with socket.create_connection((host, 18080), timeout=2) as sock:
+        sock.settimeout(10)
+        time.sleep(initial_delay)
+        for fragment, delay_after in fragments:
+            sock.sendall(fragment)
+            time.sleep(delay_after)
+        response = bytearray()
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+        body = bytes(response).split(b"\r\n\r\n", 1)[-1].strip()
+        if body != expected:
+            raise RuntimeError(f"unexpected response body: {body!r}")
+PY
+    wait_for_log_after '-> split.test:18080 -> Outbound(DIRECT)' "$first_line"
+    wait_for_log_after '-> 198.18.0.10:18080 -> Outbound(PROXY)' "$first_line"
+    direct_count=$(tail -n "+${first_line}" "$RFOR_LOG" 2>/dev/null |
+        grep --fixed-strings --count -- '-> split.test:18080 -> Outbound(DIRECT)' || true)
+    [[ $direct_count -eq 3 ]] ||
+        fail "expected three domain-routed timed requests, observed ${direct_count}"
 }
 
 assert_server_first_forwarding() {
@@ -232,6 +280,7 @@ run_tproxy_test() {
     wait_for_log 'tproxy listen: 0.0.0.0:15080'
     assert_tproxy_rules
     assert_http_forwarding
+    assert_timed_http_forwarding
     assert_server_first_forwarding
     stress_reload TPROXY
     assert_route_reload /integration/config-tproxy.yaml
@@ -251,6 +300,7 @@ run_redirect_test() {
     wait_for_log 'redirect listen:'
     assert_redirect_rules
     assert_http_forwarding
+    assert_timed_http_forwarding
     assert_server_first_forwarding
     stress_reload REDIRECT
     assert_route_reload /integration/config-redirect.yaml
