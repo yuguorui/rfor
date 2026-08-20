@@ -92,7 +92,7 @@ cases = [
         (b"T /test HTTP/1.1\r\nHost: split", 0.1),
         (b".test\r\nConnection: close\r\n\r\n", 0),
     ]),
-    (5.5, [(request, 0)]),
+    (1.0, [(request, 0)]),
 ]
 
 for initial_delay, fragments in cases:

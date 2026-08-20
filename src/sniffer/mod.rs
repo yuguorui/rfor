@@ -9,7 +9,6 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::time::{timeout_at, Instant};
 
-const TCP_SNIFF_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_SNIFF_MAX_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -48,8 +47,11 @@ pub fn parse_tcp_host(data: &[u8]) -> HostParseResult {
     }
 }
 
-pub async fn sniff_tcp(stream: &mut TcpStream) -> io::Result<Option<SniffedTcp>> {
-    sniff_tcp_with_limits(stream, TCP_SNIFF_TIMEOUT, TCP_SNIFF_MAX_BYTES).await
+pub async fn sniff_tcp(
+    stream: &mut TcpStream,
+    timeout: Duration,
+) -> io::Result<Option<SniffedTcp>> {
+    sniff_tcp_with_limits(stream, timeout, TCP_SNIFF_MAX_BYTES).await
 }
 
 async fn sniff_tcp_with_limits(

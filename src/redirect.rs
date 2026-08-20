@@ -88,7 +88,11 @@ mod linux_impl {
         use crate::rules::{InboundProtocol, RouteContext, TargetAddr};
         use crate::utils::{is_valid_domain, transfer_tcp_with_initial_data};
 
-        let Some(sniffed) = crate::sniffer::sniff_tcp(inbound).await? else {
+        let sniff_timeout = {
+            let settings = get_settings().read().await;
+            settings.tcp_sniff_timeout()
+        };
+        let Some(sniffed) = crate::sniffer::sniff_tcp(inbound, sniff_timeout).await? else {
             return Ok(());
         };
         let domain = sniffed.host.filter(|s| is_valid_domain(s.as_str()));

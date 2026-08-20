@@ -38,6 +38,7 @@ Usage
 ```yaml
 debug: false
 # disable-ipv6: false
+# tcp-sniff-timeout: 2.0
 tproxy-listen: '[::]:50080'
 socks5-listen: '[::]:50081'
 

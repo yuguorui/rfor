@@ -1,5 +1,6 @@
 debug: false
 disable-ipv6: true
+tcp-sniff-timeout: 0.5
 redirect-listen: 0.0.0.0:15081
 
 traffic-intercept:

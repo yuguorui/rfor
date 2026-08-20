@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use clap::Parser;
 use fqdn::FQDN;
@@ -20,6 +20,7 @@ const DEFAULT_IPTABLES_DIRECT_MARK: u32 = 0xff43;
 const DEFAULT_IPTABLES_PROXY_CHAIN_NAME: &str = "rfor-proxy";
 const DEFAULT_IPTABLES_MARK_CHAIN_NAME: &str = "rfor-mark";
 const DEFAULT_IPRULE_TABLE: u8 = 0x42;
+const DEFAULT_TCP_SNIFF_TIMEOUT_SECS: f64 = 2.0;
 
 /// A simple but fast traffic forwarder with routing.
 #[derive(Parser, Debug)]
@@ -66,6 +67,8 @@ pub struct Settings {
     pub tproxy_listen: Option<String>,
     pub socks5_listen: Option<String>,
     pub redirect_listen: Option<String>,
+    /// Maximum time to wait for a recognizable TCP Host/SNI, in seconds.
+    pub tcp_sniff_timeout: f64,
     #[serde(skip)]
     pub routetable: Arc<RouteTable>,
     pub intercept_mode: InterceptMode,
@@ -107,6 +110,11 @@ impl Settings {
         )
     }
 
+    pub fn tcp_sniff_timeout(&self) -> Duration {
+        Duration::try_from_secs_f64(self.tcp_sniff_timeout)
+            .expect("tcp-sniff-timeout is validated while loading settings")
+    }
+
     pub(crate) fn restart_required_changes(&self, new: &Self) -> Vec<&'static str> {
         let mut changes = Vec::new();
 
@@ -139,6 +147,7 @@ impl Settings {
         self.debug = new.debug;
         self.pprof = new.pprof;
         self.routetable = new.routetable;
+        self.tcp_sniff_timeout = new.tcp_sniff_timeout;
         self.udp_timeout = new.udp_timeout;
         self.udp_fullcone = new.udp_fullcone;
         self.udp_fullcone_max_sockets = new.udp_fullcone_max_sockets;
@@ -215,6 +224,7 @@ impl Settings {
             tproxy_listen: s.get::<String>("tproxy-listen").ok(),
             socks5_listen: s.get::<String>("socks5-listen").ok(),
             redirect_listen: s.get::<String>("redirect-listen").ok(),
+            tcp_sniff_timeout: parse_tcp_sniff_timeout(&s)?,
             routetable: Arc::new(route),
             intercept_mode,
             udp_enable,
@@ -337,6 +347,20 @@ fn validate_settings(settings: &Settings) -> Result<(), ConfigError> {
     }
 
     Ok(())
+}
+
+fn parse_tcp_sniff_timeout(config: &Config) -> Result<f64, ConfigError> {
+    let seconds = match config.get_float("tcp-sniff-timeout") {
+        Ok(seconds) => seconds,
+        Err(ConfigError::NotFound(_)) => DEFAULT_TCP_SNIFF_TIMEOUT_SECS,
+        Err(err) => return Err(err),
+    };
+    Duration::try_from_secs_f64(seconds).map_err(|_| {
+        ConfigError::Message(
+            "tcp-sniff-timeout must be a finite, non-negative number of seconds".to_string(),
+        )
+    })?;
+    Ok(seconds)
 }
 
 fn sanitize_port_ranges(s: &Vec<config::Value>) -> Result<Vec<[u16; 2]>, ConfigError> {
@@ -757,6 +781,7 @@ mod tests {
             tproxy_listen: Some("0.0.0.0:50080".to_string()),
             socks5_listen: None,
             redirect_listen: None,
+            tcp_sniff_timeout: DEFAULT_TCP_SNIFF_TIMEOUT_SECS,
             routetable: Arc::new(RouteTable::new()),
             intercept_mode: InterceptMode::TPROXY {
                 local_traffic: true,
@@ -809,6 +834,7 @@ mod tests {
         let mut new = test_settings();
         new.debug = true;
         new.pprof = Some("profile.svg".to_string());
+        new.tcp_sniff_timeout = 0.25;
         new.udp_timeout = 120;
         new.udp_fullcone = true;
         new.udp_fullcone_max_sockets = 128;
@@ -820,6 +846,7 @@ mod tests {
 
         assert!(current.debug);
         assert_eq!(current.pprof.as_deref(), Some("profile.svg"));
+        assert_eq!(current.tcp_sniff_timeout, 0.25);
         assert!(Arc::ptr_eq(&current.routetable, &new_routetable));
         assert_eq!(current.udp_timeout, 120);
         assert!(current.udp_fullcone);
@@ -834,5 +861,37 @@ mod tests {
         ));
         assert!(current.udp_enable);
         assert_eq!(current.udp_max_sessions, 1024);
+    }
+
+    #[test]
+    fn parses_fractional_tcp_sniff_timeout_and_rejects_invalid_values() {
+        let defaults = Config::builder().build().unwrap();
+        assert_eq!(
+            parse_tcp_sniff_timeout(&defaults).unwrap(),
+            DEFAULT_TCP_SNIFF_TIMEOUT_SECS
+        );
+
+        let fractional = Config::builder()
+            .set_override("tcp-sniff-timeout", 0.25)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(parse_tcp_sniff_timeout(&fractional).unwrap(), 0.25);
+
+        let wrong_type = Config::builder()
+            .set_override("tcp-sniff-timeout", "invalid")
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(parse_tcp_sniff_timeout(&wrong_type).is_err());
+
+        for invalid in [-0.1, f64::NAN, f64::INFINITY, f64::MAX] {
+            let config = Config::builder()
+                .set_override("tcp-sniff-timeout", invalid)
+                .unwrap()
+                .build()
+                .unwrap();
+            assert!(parse_tcp_sniff_timeout(&config).is_err());
+        }
     }
 }

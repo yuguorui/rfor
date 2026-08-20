@@ -1,5 +1,6 @@
 tproxy-listen: '[::]:50080'
 socks5-listen: '[::]:1081'
+# tcp-sniff-timeout: 2.0
 
 udp-enabled: true
 # udp-timeout: 60

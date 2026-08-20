@@ -2,6 +2,7 @@ debug: false
 tproxy-listen: '[::]:50080'
 socks5-listen: '[::]:50081'
 redirect-listen: '[::]:50082'
+# tcp-sniff-timeout: 2.0
 
 traffic-intercept:
   mode: redirect        # set to "manual" when you want set iptables by hand.
