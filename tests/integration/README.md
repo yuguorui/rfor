@@ -16,8 +16,9 @@ The test builds rfor in Docker and creates an isolated dual-stack network
 
 Both TPROXY and REDIRECT modes are exercised over IPv4 and IPv6. Each phase
 verifies transparent HTTP forwarding, timed and fragmented TLS ClientHello
-forwarding, corrupted TLS fallback, server-first forwarding, concurrent
-connections during SIGHUP reloads, IPv4/IPv6 policy rules, absence of periodic
-rule reconstruction, and complete rule cleanup after SIGTERM. The TPROXY phase
-also verifies ordinary UDP echo and session reuse over both address families.
-Runtime traffic stays inside the Docker network.
+forwarding, corrupted TLS fallback, server-first forwarding, pre-sniff FIN/RST,
+client and server half-close behavior, concurrent connections during SIGHUP
+reloads, IPv4/IPv6 policy rules, absence of periodic rule reconstruction, and
+complete rule cleanup after SIGTERM. The TPROXY phase also verifies ordinary
+UDP echo and session reuse over both address families. Runtime traffic stays
+inside the Docker network.

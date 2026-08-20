@@ -7,7 +7,7 @@ udp-enabled: true
 traffic-intercept:
   mode: tproxy
   local-traffic: true
-  ports: ["18080-18082", "18443-18444"]
+  ports: ["18080-18084", "18443-18444"]
   tproxy-proxy-chain: rfor-it-proxy
   tproxy-mark-chain: rfor-it-mark
   rule-table: 66

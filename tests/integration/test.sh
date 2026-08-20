@@ -295,13 +295,147 @@ PY
         fail "unexpected server-first response: ${body}"
 }
 
+assert_pre_sniff_disconnects() {
+    local host=$1
+    local first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
+    local ports
+    local fin_port
+    local rst_port
+
+    ports=$(python3 - "$host" <<'PY'
+import socket
+import struct
+import sys
+import time
+
+host = sys.argv[1]
+family = socket.AF_INET6 if ":" in host else socket.AF_INET
+
+fin = socket.socket(family, socket.SOCK_STREAM)
+fin.settimeout(2)
+fin.connect((host, 18083))
+fin_port = fin.getsockname()[1]
+fin.shutdown(socket.SHUT_WR)
+time.sleep(0.05)
+fin.close()
+
+rst = socket.socket(family, socket.SOCK_STREAM)
+rst.settimeout(2)
+rst.connect((host, 18083))
+rst_port = rst.getsockname()[1]
+rst.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+rst.close()
+
+print(fin_port, rst_port)
+PY
+    ) || fail "failed to create pre-sniff FIN/RST connections for ${host}"
+    read -r fin_port rst_port <<<"$ports"
+    sleep 0.2
+
+    if tail -n "+${first_line}" "$RFOR_LOG" |
+        grep --extended-regexp --quiet -- ":(${fin_port}|${rst_port})(:STREAM| ->)"; then
+        fail "pre-sniff FIN/RST produced a routed connection or error for ${host}"
+    fi
+}
+
+assert_client_half_close() {
+    local host=$1
+    local first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
+
+    python3 - "$host" <<'PY' || fail "client half-close failed for ${host}"
+import hashlib
+import socket
+import sys
+
+host = sys.argv[1]
+payload = bytes((index * 13) % 256 for index in range(256 * 1024))
+request = (
+    b"POST /client-half-close HTTP/1.1\r\n"
+    b"Host: split.test\r\n"
+    + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+    + payload
+)
+expected = (
+    f"client-half-close-ok:{len(request)}:{hashlib.sha256(request).hexdigest()}"
+)
+
+with socket.create_connection((host, 18083), timeout=2) as sock:
+    sock.settimeout(10)
+    for offset in range(0, len(request), 8192):
+        sock.sendall(request[offset : offset + 8192])
+    sock.shutdown(socket.SHUT_WR)
+    response = bytearray()
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        response.extend(chunk)
+    if response.decode().strip() != expected:
+        raise RuntimeError(f"unexpected half-close response: {response!r}")
+PY
+    wait_for_log_after '-> split.test:18083 -> Outbound(DIRECT)' "$first_line"
+}
+
+assert_server_half_close() {
+    local host=$1
+    local family_name
+    local token
+    local status_url
+    local status
+    local first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
+
+    if [[ $host == *:* ]]; then
+        family_name=ipv6
+    else
+        family_name=ipv4
+    fi
+    token="${RFOR_MODE}-${family_name}"
+
+    python3 - "$host" "$token" <<'PY' || fail "server half-close failed for ${host}"
+import socket
+import sys
+
+host = sys.argv[1]
+token = sys.argv[2].encode() + b"\n"
+request = b"GET /server-half-close HTTP/1.1\r\nHost: split.test\r\n\r\n"
+
+with socket.create_connection((host, 18084), timeout=2) as sock:
+    sock.settimeout(5)
+    sock.sendall(request)
+    response = bytearray()
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        response.extend(chunk)
+    if bytes(response) != b"server-half-close-ok\n":
+        raise RuntimeError(f"unexpected server half-close response: {response!r}")
+    sock.sendall(token)
+    sock.shutdown(socket.SHUT_WR)
+PY
+    wait_for_log_after '-> split.test:18084 -> Outbound(DIRECT)' "$first_line"
+
+    status_url="http://$(format_target "$host" 18080)/server-half-close-status?token=${token}"
+    for _attempt in $(seq 1 100); do
+        status=$(curl --noproxy '*' --fail --silent --max-time 2 "$status_url") || true
+        if [[ $status == server-half-close-read-ok ]]; then
+            return
+        fi
+        sleep 0.05
+    done
+    fail "origin did not receive data after server half-close for ${host}"
+}
+
 assert_family_forwarding() {
     local host=$1
+    assert_pre_sniff_disconnects "$host"
     assert_http_forwarding "$host"
     assert_timed_http_forwarding "$host"
     assert_timed_tls_forwarding "$host"
     assert_corrupted_tls_fallback "$host"
     assert_server_first_forwarding "$host"
+    assert_client_half_close "$host"
+    assert_server_half_close "$host"
 }
 
 assert_udp_forwarding() {
@@ -456,11 +590,11 @@ assert_tproxy_rules() {
     ip6tables --wait 5 --table mangle --list-rules rfor-it-mark >/dev/null ||
         fail "TPROXY IPv6 mark chain is missing"
     iptables --wait 5 --table mangle --check rfor-it-proxy \
-        --protocol udp --match multiport --dports '18080:18082,18443:18444' \
+        --protocol udp --match multiport --dports '18080:18084,18443:18444' \
         --jump TPROXY --tproxy-mark 0xff42 --on-port 15080 ||
         fail "TPROXY UDP rule is missing"
     ip6tables --wait 5 --table mangle --check rfor-it-proxy \
-        --protocol udp --match multiport --dports '18080:18082,18443:18444' \
+        --protocol udp --match multiport --dports '18080:18084,18443:18444' \
         --jump TPROXY --tproxy-mark 0xff42 --on-port 15080 ||
         fail "TPROXY IPv6 UDP rule is missing"
     for _attempt in $(seq 1 100); do
