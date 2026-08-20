@@ -350,10 +350,14 @@ assert_tproxy_rules() {
         fail "TPROXY proxy chain is missing"
     iptables --wait 5 --table mangle --list-rules rfor-it-mark >/dev/null ||
         fail "TPROXY mark chain is missing"
-    ip rule show | grep --quiet 'fwmark 0xff42 lookup 66' ||
-        fail "TPROXY policy rule is missing"
-    ip route show table 66 | grep --quiet 'local default dev lo' ||
-        fail "TPROXY local route is missing"
+    for _attempt in $(seq 1 100); do
+        if ip rule show | grep --quiet 'fwmark 0xff42 lookup 66' &&
+            ip route show table 66 | grep --quiet 'local default dev lo'; then
+            return
+        fi
+        sleep 0.05
+    done
+    fail "TPROXY policy rule or local route is missing"
 }
 
 assert_tproxy_cleanup() {

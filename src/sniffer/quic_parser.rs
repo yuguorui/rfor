@@ -5,9 +5,11 @@ use std::time::Instant;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-// QUIC version constants (RFC 9000, RFC 9369)
-const VERSION_DRAFT23: u32 = 0xff000017; // Draft 23 (start of range)
-const VERSION_DRAFT29: u32 = 0xff00001d; // Draft 29 (end of range)
+// Supported QUIC wire versions (draft29-32, RFC 9000, RFC 9369)
+const VERSION_DRAFT29: u32 = 0xff00001d;
+const VERSION_DRAFT30: u32 = 0xff00001e;
+const VERSION_DRAFT31: u32 = 0xff00001f;
+const VERSION_DRAFT32: u32 = 0xff000020;
 const VERSION1: u32 = 0x1; // QUIC v1 (RFC 9000)
 const VERSION2: u32 = 0x6b3343cf; // QUIC v2 (RFC 9369)
 
@@ -336,9 +338,11 @@ struct CryptoFrame {
 /// Map QUIC wire version to rustls version
 fn version_to_rustls(version: u32) -> Option<rustls::quic::Version> {
     match version {
-        VERSION_DRAFT23..=VERSION_DRAFT29 => Some(rustls::quic::Version::V1Draft),
+        VERSION_DRAFT29 | VERSION_DRAFT30 | VERSION_DRAFT31 | VERSION_DRAFT32 => {
+            Some(rustls::quic::Version::V1Draft)
+        }
         VERSION1 => Some(rustls::quic::Version::V1),
-        VERSION2 => Some(rustls::quic::Version::V1), // QUIC v2 uses same initial secrets as v1
+        VERSION2 => Some(rustls::quic::Version::V2),
         _ => None,
     }
 }
@@ -414,9 +418,10 @@ fn parse_initial_packet(remaining: &[u8]) -> Result<ParsedInitialPacket, QuicPar
 
     debug!("QUIC version: {:#x}", version_number);
 
-    // Check packet type (bits 4-5) - must be Initial (0x0)
+    // QUIC v2 remaps the long-header packet types; its Initial type is 0x1.
     let packet_type = (type_byte & 0x30) >> 4;
-    if packet_type != 0x0 {
+    let initial_packet_type = if version_number == VERSION2 { 0x1 } else { 0x0 };
+    if packet_type != initial_packet_type {
         return Err(QuicParseError::NotInitialPacket);
     }
 
@@ -511,10 +516,13 @@ fn parse_initial_packet(remaining: &[u8]) -> Result<ParsedInitialPacket, QuicPar
     let payload_end = (packet_len as usize + hdr_len).min(remaining.len());
     let mut payload = remaining[hdr_len + packet_number_len..payload_end].to_vec();
 
-    keys.local
+    let plaintext_len = keys
+        .local
         .packet
         .decrypt_in_place(packet_number, &header, &mut payload)
-        .map_err(|_| QuicParseError::DecryptionFailed)?;
+        .map_err(|_| QuicParseError::DecryptionFailed)?
+        .len();
+    payload.truncate(plaintext_len);
 
     debug!("Decrypted QUIC payload length: {}", payload.len());
 
@@ -656,6 +664,254 @@ pub fn parse_host(remaining: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[derive(Clone, Copy)]
+    struct TestVersion {
+        wire: u32,
+        crypto: rustls::quic::Version,
+        initial_type: u8,
+    }
+
+    fn supported_versions() -> [TestVersion; 6] {
+        [
+            TestVersion {
+                wire: VERSION_DRAFT29,
+                crypto: rustls::quic::Version::V1Draft,
+                initial_type: 0,
+            },
+            TestVersion {
+                wire: VERSION_DRAFT30,
+                crypto: rustls::quic::Version::V1Draft,
+                initial_type: 0,
+            },
+            TestVersion {
+                wire: VERSION_DRAFT31,
+                crypto: rustls::quic::Version::V1Draft,
+                initial_type: 0,
+            },
+            TestVersion {
+                wire: VERSION_DRAFT32,
+                crypto: rustls::quic::Version::V1Draft,
+                initial_type: 0,
+            },
+            TestVersion {
+                wire: VERSION1,
+                crypto: rustls::quic::Version::V1,
+                initial_type: 0,
+            },
+            TestVersion {
+                wire: VERSION2,
+                crypto: rustls::quic::Version::V2,
+                initial_type: 1,
+            },
+        ]
+    }
+
+    fn encode_varint(value: u64, output: &mut Vec<u8>) {
+        if value < (1 << 6) {
+            output.push(value as u8);
+        } else if value < (1 << 14) {
+            output.extend_from_slice(&((value as u16) | 0x4000).to_be_bytes());
+        } else if value < (1 << 30) {
+            output.extend_from_slice(&((value as u32) | 0x8000_0000).to_be_bytes());
+        } else {
+            output.extend_from_slice(&(value | 0xc000_0000_0000_0000).to_be_bytes());
+        }
+    }
+
+    fn client_hello(version: TestVersion, host: &str) -> Vec<u8> {
+        let mut config =
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+        config.alpn_protocols = vec![b"h3".to_vec()];
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+        let mut connection = rustls::quic::ClientConnection::new(
+            Arc::new(config),
+            version.crypto,
+            server_name,
+            Vec::new(),
+        )
+        .unwrap();
+        let mut hello = Vec::new();
+        connection.write_hs(&mut hello);
+        assert!(!hello.is_empty());
+        hello
+    }
+
+    fn initial_packet(
+        version: TestVersion,
+        dest_cid: &[u8],
+        packet_number: u16,
+        crypto_offset: usize,
+        crypto_data: &[u8],
+    ) -> Bytes {
+        const PACKET_NUMBER_LEN: usize = 2;
+
+        let mut payload = vec![FRAME_TYPE_CRYPTO];
+        encode_varint(crypto_offset as u64, &mut payload);
+        encode_varint(crypto_data.len() as u64, &mut payload);
+        payload.extend_from_slice(crypto_data);
+
+        let mut header = vec![0xc0 | (version.initial_type << 4) | 1];
+        header.extend_from_slice(&version.wire.to_be_bytes());
+        header.push(dest_cid.len() as u8);
+        header.extend_from_slice(dest_cid);
+        let source_cid = [0xa5, 0xa6, 0xa7, 0xa8];
+        header.push(source_cid.len() as u8);
+        header.extend_from_slice(&source_cid);
+        encode_varint(0, &mut header);
+        encode_varint((PACKET_NUMBER_LEN + payload.len() + 16) as u64, &mut header);
+        let packet_number_offset = header.len();
+        header.extend_from_slice(&packet_number.to_be_bytes());
+
+        let keys = TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .unwrap()
+            .quic_suite()
+            .unwrap()
+            .keys(dest_cid, rustls::Side::Client, version.crypto);
+        let tag = keys
+            .local
+            .packet
+            .encrypt_in_place(packet_number as u64, &header, &mut payload)
+            .unwrap();
+        payload.extend_from_slice(tag.as_ref());
+
+        let sample_offset = 4 - PACKET_NUMBER_LEN;
+        let sample_len = keys.local.header.sample_len();
+        let sample = &payload[sample_offset..sample_offset + sample_len];
+        let (first, rest) = header.split_at_mut(1);
+        let protected_pn_offset = packet_number_offset - 1;
+        keys.local
+            .header
+            .encrypt_in_place(
+                sample,
+                &mut first[0],
+                &mut rest[protected_pn_offset..protected_pn_offset + PACKET_NUMBER_LEN],
+            )
+            .unwrap();
+
+        header.extend_from_slice(&payload);
+        Bytes::from(header)
+    }
+
+    fn fragmented_packets(version: TestVersion, host: &str) -> (Bytes, Bytes, Vec<u8>) {
+        let dest_cid = vec![
+            0x83,
+            0x94,
+            0xc8,
+            0xf0,
+            version.initial_type,
+            0x51,
+            0x57,
+            0x08,
+        ];
+        let hello = client_hello(version, host);
+        let split = hello.len() / 2;
+        (
+            initial_packet(version, &dest_cid, 0, 0, &hello[..split]),
+            initial_packet(version, &dest_cid, 1, split, &hello[split..]),
+            dest_cid,
+        )
+    }
+
+    #[test]
+    fn parses_single_initial_for_every_supported_version() {
+        for version in supported_versions() {
+            let host = format!("v{:x}.example", version.wire);
+            let dest_cid = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
+            let hello = client_hello(version, &host);
+            let packet = initial_packet(version, &dest_cid, 0, 0, &hello);
+            let mut aggregator = QuicSniAggregator::new();
+
+            assert!(matches!(
+                aggregator.process_packet(&packet),
+                QuicParseResult::Success(parsed) if parsed == host
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_draft23_through_draft28() {
+        for version in 0xff00_0017..=0xff00_001c {
+            assert!(version_to_rustls(version).is_none());
+            let mut packet = vec![0xc0];
+            packet.extend_from_slice(&version.to_be_bytes());
+            let mut aggregator = QuicSniAggregator::new();
+            assert!(matches!(
+                aggregator.process_packet(&packet),
+                QuicParseResult::Failed(QuicParseError::UnsupportedVersion(rejected))
+                    if rejected == version
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregates_delayed_fragments_for_every_supported_version() {
+        for version in supported_versions() {
+            let host = format!("delayed-v{:x}.example", version.wire);
+            let (first, second, _) = fragmented_packets(version, &host);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            tx.send(first).await.unwrap();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                tx.send(second).await.unwrap();
+            });
+
+            let (parsed, buffered) =
+                crate::sniffer::sniff_udp_host_with_limits(&mut rx, Duration::from_millis(100), 4)
+                    .await;
+            assert_eq!(parsed.as_deref(), Some(host.as_str()));
+            assert_eq!(buffered.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregates_out_of_order_and_retransmitted_fragments() {
+        for version in supported_versions() {
+            let host = format!("reordered-v{:x}.example", version.wire);
+            let (first, second, _) = fragmented_packets(version, &host);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            tx.send(second.clone()).await.unwrap();
+            tx.send(second).await.unwrap();
+            tx.send(first).await.unwrap();
+            drop(tx);
+
+            let (parsed, buffered) =
+                crate::sniffer::sniff_udp_host_with_limits(&mut rx, Duration::from_millis(100), 4)
+                    .await;
+            assert_eq!(parsed.as_deref(), Some(host.as_str()));
+            assert_eq!(buffered.len(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregation_honors_timeout_and_packet_limit() {
+        let version = supported_versions()[1];
+        let (first, second, _) = fragmented_packets(version, "limits.example");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.send(first.clone()).await.unwrap();
+        let (parsed, buffered) =
+            crate::sniffer::sniff_udp_host_with_limits(&mut rx, Duration::from_millis(10), 4).await;
+        assert_eq!(parsed, None);
+        assert_eq!(buffered.len(), 1);
+        drop(tx);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.send(first.clone()).await.unwrap();
+        tx.send(first).await.unwrap();
+        tx.send(second).await.unwrap();
+        let (parsed, buffered) =
+            crate::sniffer::sniff_udp_host_with_limits(&mut rx, Duration::from_millis(100), 2)
+                .await;
+        assert_eq!(parsed, None);
+        assert_eq!(buffered.len(), 2);
+    }
 
     #[test]
     fn test_crypto_buffer_merge_ranges() {

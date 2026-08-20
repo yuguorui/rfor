@@ -473,124 +473,6 @@ async fn udp_socket_bind_to_any_with_flag(
     return Ok(source_socket);
 }
 
-/// Maximum number of packets to buffer while waiting for QUIC SNI aggregation
-const QUIC_SNI_MAX_BUFFERED_PACKETS: usize = 16;
-
-/// Timeout for QUIC SNI aggregation (milliseconds)
-const QUIC_SNI_AGGREGATION_TIMEOUT_MS: u64 = 300;
-
-/// Sniff host from UDP packets, supporting QUIC SNI aggregation across multiple packets.
-///
-/// This function first tries to parse the host from the initial packet using HTTP, TLS, and QUIC parsers.
-/// If QUIC parsing indicates that more packets are needed (fragmented ClientHello), it will
-/// wait for additional packets and aggregate CRYPTO frames to extract the SNI.
-///
-/// Returns:
-/// - The parsed hostname (if found)
-/// - A vector of all buffered packets that should be forwarded
-async fn sniff_host_with_quic_aggregation(
-    packet_rx: &mut mpsc::Receiver<bytes::Bytes>,
-) -> (Option<String>, Vec<bytes::Bytes>) {
-    use crate::sniffer::{QuicParseResult, QuicSniAggregator};
-
-    let mut buffered_packets = Vec::new();
-
-    // Wait for the first packet to determine the destination address (for domain sniffing)
-    let init_packet = match packet_rx.recv().await {
-        Some(packet) => packet,
-        None => {
-            return (None, buffered_packets);
-        }
-    };
-
-    buffered_packets.push(init_packet.clone());
-
-    let mut aggregator = QuicSniAggregator::new();
-    match aggregator.process_packet(&init_packet) {
-        QuicParseResult::Success(host) => {
-            debug!("QUIC SNI parsed from first packet: {}", host);
-            return (Some(host), buffered_packets);
-        }
-        QuicParseResult::NeedMoreData(dest_cid) => {
-            debug!(
-                "QUIC SNI needs more packets, dest_cid: {:x?}, waiting for additional packets",
-                dest_cid
-            );
-            // Continue to aggregate more packets
-        }
-        QuicParseResult::Failed(e) => {
-            debug!("QUIC parsing failed: {}, trying other protocols", e);
-            // Not a valid QUIC Initial packet, or parsing failed.
-            // Fallback to legacy parsers for HTTP/TLS (e.g. DTLS or other UDP protocols)
-            if let Some(host) = crate::sniffer::parse_host(&init_packet) {
-                return (Some(host), buffered_packets);
-            }
-            return (None, buffered_packets);
-        }
-    }
-
-    // Set up timeout for aggregation
-    let timeout = tokio::time::sleep(std::time::Duration::from_millis(
-        QUIC_SNI_AGGREGATION_TIMEOUT_MS,
-    ));
-    tokio::pin!(timeout);
-
-    // Try to receive more packets for aggregation
-    loop {
-        if buffered_packets.len() >= QUIC_SNI_MAX_BUFFERED_PACKETS {
-            debug!(
-                "QUIC SNI aggregation: reached max buffered packets ({}), giving up",
-                QUIC_SNI_MAX_BUFFERED_PACKETS
-            );
-            break;
-        }
-
-        tokio::select! {
-            Some(packet) = packet_rx.recv() => {
-                buffered_packets.push(packet.clone());
-
-                match aggregator.process_packet(&packet) {
-                    QuicParseResult::Success(host) => {
-                        debug!(
-                            "QUIC SNI parsed after {} packets: {}",
-                            buffered_packets.len(),
-                            host
-                        );
-                        return (Some(host), buffered_packets);
-                    }
-                    QuicParseResult::NeedMoreData(_) => {
-                        debug!(
-                            "QUIC SNI still needs more packets after {} packets",
-                            buffered_packets.len()
-                        );
-                        // Continue waiting for more packets
-                    }
-                    QuicParseResult::Failed(e) => {
-                        debug!(
-                            "QUIC parsing failed after {} packets: {}",
-                            buffered_packets.len(),
-                            e
-                        );
-                        // This packet caused parsing to fail permanently
-                        break;
-                    }
-                }
-            }
-            _ = &mut timeout => {
-                debug!(
-                    "QUIC SNI aggregation timeout after {}ms with {} packets",
-                    QUIC_SNI_AGGREGATION_TIMEOUT_MS,
-                    buffered_packets.len()
-                );
-                break;
-            }
-        }
-    }
-
-    // Failed to parse SNI from aggregated packets
-    (None, buffered_packets)
-}
-
 async fn relay_udp_packet(
     mut packet_rx: mpsc::Receiver<bytes::Bytes>,
     source_sockaddr: std::net::SocketAddr,
@@ -608,7 +490,7 @@ async fn relay_udp_packet(
     drop(settings);
 
     // Try to parse host from packets, supporting QUIC SNI aggregation
-    let (host, buffered_packets) = sniff_host_with_quic_aggregation(&mut packet_rx).await;
+    let (host, buffered_packets) = crate::sniffer::sniff_udp_host(&mut packet_rx).await;
 
     // If no packets received, just return
     if buffered_packets.is_empty() {

@@ -5,11 +5,16 @@ mod tls_parse;
 use std::io;
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::{timeout_at, Instant};
+use tracing::debug;
 
 const TCP_SNIFF_MAX_BYTES: usize = 32 * 1024;
+const QUIC_SNIFF_MAX_BUFFERED_PACKETS: usize = 16;
+const QUIC_SNIFF_TIMEOUT: Duration = Duration::from_millis(300);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum HostParseResult {
@@ -22,10 +27,6 @@ pub struct SniffedTcp {
     pub host: Option<String>,
     pub data: Vec<u8>,
 }
-
-// Re-export QUIC aggregator for cross-packet SNI parsing
-#[cfg(target_os = "linux")]
-pub use quic_parser::{QuicParseResult, QuicSniAggregator};
 
 pub fn parse_tcp_host(data: &[u8]) -> HostParseResult {
     let http_result = http_parse::parse_host_result(data);
@@ -45,6 +46,84 @@ pub fn parse_tcp_host(data: &[u8]) -> HostParseResult {
     } else {
         HostParseResult::NotProtocol
     }
+}
+
+pub async fn sniff_udp_host(packet_rx: &mut mpsc::Receiver<Bytes>) -> (Option<String>, Vec<Bytes>) {
+    sniff_udp_host_with_limits(
+        packet_rx,
+        QUIC_SNIFF_TIMEOUT,
+        QUIC_SNIFF_MAX_BUFFERED_PACKETS,
+    )
+    .await
+}
+
+async fn sniff_udp_host_with_limits(
+    packet_rx: &mut mpsc::Receiver<Bytes>,
+    timeout: Duration,
+    max_packets: usize,
+) -> (Option<String>, Vec<Bytes>) {
+    use quic_parser::{QuicParseResult, QuicSniAggregator};
+
+    let mut buffered_packets = Vec::new();
+    let Some(initial_packet) = packet_rx.recv().await else {
+        return (None, buffered_packets);
+    };
+    buffered_packets.push(initial_packet.clone());
+
+    let mut aggregator = QuicSniAggregator::new();
+    match aggregator.process_packet(&initial_packet) {
+        QuicParseResult::Success(host) => return (Some(host), buffered_packets),
+        QuicParseResult::NeedMoreData(dest_cid) => {
+            debug!(
+                "QUIC SNI needs more packets for destination CID {:x?}",
+                dest_cid
+            );
+        }
+        QuicParseResult::Failed(error) => {
+            debug!("QUIC parsing failed: {}, trying other protocols", error);
+            return (parse_host(&initial_packet), buffered_packets);
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if buffered_packets.len() >= max_packets {
+            debug!(
+                "QUIC SNI aggregation reached the {} packet limit",
+                max_packets
+            );
+            break;
+        }
+
+        match timeout_at(deadline, packet_rx.recv()).await {
+            Err(_) => {
+                debug!(
+                    "QUIC SNI aggregation timed out after {}ms with {} packets",
+                    timeout.as_millis(),
+                    buffered_packets.len()
+                );
+                break;
+            }
+            Ok(None) => break,
+            Ok(Some(packet)) => {
+                buffered_packets.push(packet.clone());
+                match aggregator.process_packet(&packet) {
+                    QuicParseResult::Success(host) => return (Some(host), buffered_packets),
+                    QuicParseResult::NeedMoreData(_) => {}
+                    QuicParseResult::Failed(error) => {
+                        debug!(
+                            "QUIC parsing failed after {} packets: {}",
+                            buffered_packets.len(),
+                            error
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    (None, buffered_packets)
 }
 
 pub async fn sniff_tcp(
