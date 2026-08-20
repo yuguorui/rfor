@@ -47,6 +47,22 @@ wait_for_log() {
     fail "timed out waiting for log: ${pattern}"
 }
 
+wait_for_log_after() {
+    local pattern=$1
+    local first_line=$2
+    for _attempt in $(seq 1 100); do
+        if tail -n "+${first_line}" "$RFOR_LOG" 2>/dev/null |
+            grep --fixed-strings --quiet "$pattern"; then
+            return 0
+        fi
+        if ! kill -0 "$RFOR_PID" 2>/dev/null; then
+            fail "rfor exited before logging: ${pattern}"
+        fi
+        sleep 0.05
+    done
+    fail "timed out waiting for new log: ${pattern}"
+}
+
 assert_http_forwarding() {
     local body
     body=$(curl --noproxy '*' --fail --silent --show-error --max-time 5 "$HTTP_URL") ||
@@ -102,6 +118,41 @@ stress_reload() {
 
     [[ $failed == 0 ]] || fail "${mode}: one or more concurrent requests failed"
     wait_for_log "Settings reloaded successfully."
+    assert_http_forwarding
+}
+
+assert_route_reload() {
+    local config_file=$1
+    local backup_file="$WORK_DIR/$(basename "$config_file").route-backup"
+    local first_line
+
+    cp "$config_file" "$backup_file"
+    sed -i 's/^  - DEFAULT,,PROXY$/  - DEFAULT,,DROP/' "$config_file"
+    first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
+    kill -HUP "$RFOR_PID"
+    wait_for_log_after 'Settings reloaded successfully.' "$first_line"
+    if curl --noproxy '*' --fail --silent --max-time 2 "$HTTP_URL" >/dev/null; then
+        fail "route reload did not activate the DROP outbound"
+    fi
+
+    cp "$backup_file" "$config_file"
+    first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
+    kill -HUP "$RFOR_PID"
+    wait_for_log_after 'Settings reloaded successfully.' "$first_line"
+    assert_http_forwarding
+}
+
+assert_immutable_reload_rejected() {
+    local config_file=$1
+    local backup_file="$WORK_DIR/$(basename "$config_file").backup"
+
+    cp "$config_file" "$backup_file"
+    sed -i 's/^disable-ipv6: true$/disable-ipv6: false/' "$config_file"
+    sed -i 's/^  - DEFAULT,,PROXY$/  - DEFAULT,,DROP/' "$config_file"
+    kill -HUP "$RFOR_PID"
+    wait_for_log 'Settings reload rejected; restart required for changes to: disable-ipv6'
+    cp "$backup_file" "$config_file"
+
     assert_http_forwarding
 }
 
@@ -183,6 +234,8 @@ run_tproxy_test() {
     assert_http_forwarding
     assert_server_first_forwarding
     stress_reload TPROXY
+    assert_route_reload /integration/config-tproxy.yaml
+    assert_immutable_reload_rejected /integration/config-tproxy.yaml
     grep --quiet 'TPROXY:' "$RFOR_LOG" || fail 'TPROXY traffic was not observed in the route log'
     assert_not_reconciled TPROXY mangle rfor-it-mark
     stop_rfor TPROXY
@@ -200,6 +253,8 @@ run_redirect_test() {
     assert_http_forwarding
     assert_server_first_forwarding
     stress_reload REDIRECT
+    assert_route_reload /integration/config-redirect.yaml
+    assert_immutable_reload_rejected /integration/config-redirect.yaml
     grep --quiet 'REDIRECT:' "$RFOR_LOG" || fail 'REDIRECT traffic was not observed in the route log'
     assert_not_reconciled REDIRECT nat rfor-it-redirect
     stop_rfor REDIRECT

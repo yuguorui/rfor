@@ -76,10 +76,21 @@ async fn reload_worker(
                 }
             };
 
+            let restart_required = get_settings()
+                .read()
+                .await
+                .restart_required_changes(&new_settings);
+            if !restart_required.is_empty() {
+                tracing::error!(
+                    "Settings reload rejected; restart required for changes to: {}",
+                    restart_required.join(", ")
+                );
+                continue;
+            }
+
             let new_pprof_config = new_settings.pprof.clone();
 
-            *get_settings().write().await = new_settings;
-            tracing::info!("Settings reloaded successfully.");
+            get_settings().write().await.apply_reloadable(new_settings);
 
             // Handle Profiler update
             let mut store = profiler_store
@@ -100,6 +111,8 @@ async fn reload_worker(
                     *store = Some(profiler::start(&path)?);
                 }
             }
+
+            tracing::info!("Settings reloaded successfully.");
         }
     }
     #[cfg(not(unix))]

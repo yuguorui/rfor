@@ -38,7 +38,7 @@ struct Args {
     pprof: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq, Eq)]
 pub enum InterceptMode {
     TPROXY {
         local_traffic: bool,
@@ -105,6 +105,45 @@ impl Settings {
                 direct_mark,
             },
         )
+    }
+
+    pub(crate) fn restart_required_changes(&self, new: &Self) -> Vec<&'static str> {
+        let mut changes = Vec::new();
+
+        if self.disable_ipv6 != new.disable_ipv6 {
+            changes.push("disable-ipv6");
+        }
+        if self.tproxy_listen != new.tproxy_listen {
+            changes.push("tproxy-listen");
+        }
+        if self.socks5_listen != new.socks5_listen {
+            changes.push("socks5-listen");
+        }
+        if self.redirect_listen != new.redirect_listen {
+            changes.push("redirect-listen");
+        }
+        if self.intercept_mode != new.intercept_mode {
+            changes.push("traffic-intercept");
+        }
+        if self.udp_enable != new.udp_enable {
+            changes.push("udp-enabled");
+        }
+        if self.udp_max_sessions != new.udp_max_sessions {
+            changes.push("udp-max-sessions");
+        }
+
+        changes
+    }
+
+    pub(crate) fn apply_reloadable(&mut self, new: Self) {
+        self.debug = new.debug;
+        self.pprof = new.pprof;
+        self.routetable = new.routetable;
+        self.udp_timeout = new.udp_timeout;
+        self.udp_fullcone = new.udp_fullcone;
+        self.udp_fullcone_max_sockets = new.udp_fullcone_max_sockets;
+        self.udp_fullcone_socket_timeout = new.udp_fullcone_socket_timeout;
+        self.udp_fullcone_rate_limit = new.udp_fullcone_rate_limit;
     }
 
     pub fn load() -> Result<Self, ConfigError> {
@@ -704,4 +743,96 @@ fn parse_route_rules(s: &Config, route: &mut RouteTable) -> Result<(), ConfigErr
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_settings() -> Settings {
+        Settings {
+            debug: false,
+            pprof: None,
+            disable_ipv6: true,
+            tproxy_listen: Some("0.0.0.0:50080".to_string()),
+            socks5_listen: None,
+            redirect_listen: None,
+            routetable: Arc::new(RouteTable::new()),
+            intercept_mode: InterceptMode::TPROXY {
+                local_traffic: true,
+                ports: "80,443".to_string(),
+                proxy_mark: DEFAULT_IPTABLES_PROXY_MARK,
+                direct_mark: DEFAULT_IPTABLES_DIRECT_MARK,
+                proxy_chain: DEFAULT_IPTABLES_PROXY_CHAIN_NAME.to_string(),
+                mark_chain: DEFAULT_IPTABLES_MARK_CHAIN_NAME.to_string(),
+                rule_table_index: DEFAULT_IPRULE_TABLE,
+            },
+            udp_enable: true,
+            udp_timeout: 60,
+            udp_fullcone: false,
+            udp_fullcone_max_sockets: 64,
+            udp_fullcone_socket_timeout: 30,
+            udp_fullcone_rate_limit: 10,
+            udp_max_sessions: 1024,
+        }
+    }
+
+    #[test]
+    fn restart_required_changes_reports_immutable_fields() {
+        let current = test_settings();
+        let mut new = test_settings();
+        new.disable_ipv6 = false;
+        new.tproxy_listen = Some("0.0.0.0:50081".to_string());
+        new.socks5_listen = Some("0.0.0.0:1080".to_string());
+        new.redirect_listen = Some("0.0.0.0:50082".to_string());
+        new.udp_enable = false;
+        new.udp_max_sessions = 2048;
+        new.intercept_mode = InterceptMode::MANUAL;
+
+        assert_eq!(
+            current.restart_required_changes(&new),
+            vec![
+                "disable-ipv6",
+                "tproxy-listen",
+                "socks5-listen",
+                "redirect-listen",
+                "traffic-intercept",
+                "udp-enabled",
+                "udp-max-sessions",
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_reloadable_updates_only_whitelisted_fields() {
+        let mut current = test_settings();
+        let mut new = test_settings();
+        new.debug = true;
+        new.pprof = Some("profile.svg".to_string());
+        new.udp_timeout = 120;
+        new.udp_fullcone = true;
+        new.udp_fullcone_max_sockets = 128;
+        new.udp_fullcone_socket_timeout = 45;
+        new.udp_fullcone_rate_limit = 20;
+        let new_routetable = Arc::clone(&new.routetable);
+
+        current.apply_reloadable(new);
+
+        assert!(current.debug);
+        assert_eq!(current.pprof.as_deref(), Some("profile.svg"));
+        assert!(Arc::ptr_eq(&current.routetable, &new_routetable));
+        assert_eq!(current.udp_timeout, 120);
+        assert!(current.udp_fullcone);
+        assert_eq!(current.udp_fullcone_max_sockets, 128);
+        assert_eq!(current.udp_fullcone_socket_timeout, 45);
+        assert_eq!(current.udp_fullcone_rate_limit, 20);
+        assert!(current.disable_ipv6);
+        assert_eq!(current.tproxy_listen.as_deref(), Some("0.0.0.0:50080"));
+        assert!(matches!(
+            current.intercept_mode,
+            InterceptMode::TPROXY { .. }
+        ));
+        assert!(current.udp_enable);
+        assert_eq!(current.udp_max_sessions, 1024);
+    }
 }
