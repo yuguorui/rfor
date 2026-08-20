@@ -26,6 +26,21 @@ use fast_socks5::client as socks_client;
 
 pub const TIMEOUT: u64 = 3000;
 
+#[derive(Debug, thiserror::Error)]
+#[error("Connection dropped")]
+struct ConnectionDropped;
+
+fn connection_dropped_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, ConnectionDropped)
+}
+
+pub(crate) fn is_connection_dropped(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<ConnectionDropped>())
+        .is_some()
+}
+
 async fn run_tcp_stage<T, F>(
     deadline: Instant,
     stage: &'static str,
@@ -401,10 +416,7 @@ impl RouteTable {
             )
         })?;
         match proxy_url.scheme() {
-            "drop" => Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "Connection dropped",
-            )),
+            "drop" => Err(connection_dropped_error()),
             "socks" | "socks5" => {
                 let socks_host = proxy_url.host_str().ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing proxy host")
@@ -580,10 +592,7 @@ impl RouteTable {
             )
         })?;
         match proxy_url.scheme() {
-            "drop" => Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "Connection dropped",
-            )),
+            "drop" => Err(connection_dropped_error()),
             "socks" | "socks5" => {
                 let socks_server = format!(
                     "{}:{}",
@@ -767,6 +776,20 @@ impl ProxyDgram for fast_socks5::client::Socks5Datagram<tokio::net::TcpStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_drop_is_distinguishable_from_permission_errors() {
+        let dropped = connection_dropped_error();
+        assert_eq!(dropped.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(dropped.to_string(), "Connection dropped");
+        assert!(is_connection_dropped(&dropped));
+
+        let permission_error = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "socket permission denied",
+        );
+        assert!(!is_connection_dropped(&permission_error));
+    }
 
     #[tokio::test]
     async fn domain_original_address_matches_outbound_socket_family() {

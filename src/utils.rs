@@ -89,14 +89,8 @@ pub async fn transfer_tcp_with_initial_data(
     let (routetable, route_options) = get_settings().read().await.route_snapshot();
     let mut out_sock = match routetable.get_tcp_sock(&rt_context, route_options).await {
         Ok(sock) => sock,
-        Err(err) => match err.kind() {
-            std::io::ErrorKind::PermissionDenied => {
-                return Ok(());
-            }
-            _ => {
-                return Err(err.into());
-            }
-        },
+        Err(err) if crate::rules::is_connection_dropped(&err) => return Ok(()),
+        Err(err) => return Err(err.into()),
     };
     drop(routetable);
 

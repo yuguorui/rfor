@@ -6,6 +6,8 @@ readonly ORIGIN_IPV4=198.18.0.10
 readonly ORIGIN_IPV6=2001:db8:198:18::10
 readonly UDP_ORIGIN_IPV4=198.18.0.11
 readonly UDP_ORIGIN_IPV6=2001:db8:198:18::11
+readonly UDP_DROP_IPV4=198.18.0.12
+readonly UDP_DROP_IPV6=2001:db8:198:18::12
 readonly EXPECTED_HTTP_BODY=rfor-integration-ok
 readonly EXPECTED_HTTPS_BODY=rfor-tls-integration-ok
 readonly EXPECTED_CORRUPTED_TLS_BODY=corrupted-tls-forwarded-ok
@@ -478,6 +480,30 @@ PY
         fail "expected one reused UDP session for ${host}, observed ${session_count}"
 }
 
+assert_udp_drop_is_not_logged_as_error() {
+    local host=$1
+    local first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
+    local route_target
+
+    python3 - "$host" <<'PY' || fail "UDP drop request failed for ${host}"
+import socket
+import sys
+
+host = sys.argv[1]
+family = socket.AF_INET6 if ":" in host else socket.AF_INET
+with socket.socket(family, socket.SOCK_DGRAM) as sock:
+    sock.sendto(b"udp-policy-drop", (host, 18083))
+PY
+
+    route_target=$(format_route_target "$host" 18083)
+    wait_for_log_after "DGRAM -> ${route_target} -> Outbound(DROP)" "$first_line"
+    sleep 0.1
+    if tail -n "+${first_line}" "$RFOR_LOG" |
+        grep --fixed-strings --quiet -- 'Failed to relay udp packet: Connection dropped'; then
+        fail "UDP policy drop was logged as a relay error for ${host}"
+    fi
+}
+
 stress_reload() {
     local mode=$1
     local request_count=32
@@ -681,6 +707,8 @@ run_tproxy_test() {
     assert_family_forwarding "$ORIGIN_IPV6"
     assert_udp_forwarding "$UDP_ORIGIN_IPV4"
     assert_udp_forwarding "$UDP_ORIGIN_IPV6"
+    assert_udp_drop_is_not_logged_as_error "$UDP_DROP_IPV4"
+    assert_udp_drop_is_not_logged_as_error "$UDP_DROP_IPV6"
     stress_reload TPROXY
     assert_route_reload /integration/config-tproxy.yaml
     assert_immutable_reload_rejected /integration/config-tproxy.yaml

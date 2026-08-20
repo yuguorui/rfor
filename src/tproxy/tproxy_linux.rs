@@ -504,17 +504,23 @@ async fn relay_udp_packet(
         }
     };
 
-    let target_socket = routetable
-        .get_dgram_sock(
-            &crate::rules::RouteContext {
-                src_addr: source_sockaddr,
-                dst_addr: dst_addr.clone(),
-                inbound_proto: Some(crate::rules::InboundProtocol::TPROXY),
-                socket_type: crate::rules::SocketType::DGRAM,
-            },
-            route_options,
-        )
-        .await?;
+    let route_context = crate::rules::RouteContext {
+        src_addr: source_sockaddr,
+        dst_addr: dst_addr.clone(),
+        inbound_proto: Some(crate::rules::InboundProtocol::TPROXY),
+        socket_type: crate::rules::SocketType::DGRAM,
+    };
+    let target_socket = match routetable
+        .get_dgram_sock(&route_context, route_options)
+        .await
+    {
+        Ok(socket) => socket,
+        Err(error) if crate::rules::is_connection_dropped(&error) => {
+            debug!("udp relay: dropped by routing policy: {}", route_context);
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     drop(routetable);
 
     // Prepare the intermediate socket which is connected to the source, which should bind to the target address,
