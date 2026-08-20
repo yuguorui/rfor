@@ -130,11 +130,14 @@ async fn accept_socket_loop(listen_addr: &str) -> Result<()> {
         match listener.accept().await {
             Ok((mut socket, peer_addr)) => {
                 tokio::spawn(async move {
-                    let local_addr = socket
-                        .local_addr()
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|_| "unknown".to_string());
-                    if let Err(e) = handle_tcp(&mut socket).await {
+                    let local_addr = match socket.local_addr() {
+                        Ok(addr) => addr,
+                        Err(err) => {
+                            error!("failed to get TPROXY destination address: {}", err);
+                            return;
+                        }
+                    };
+                    if let Err(e) = handle_tcp(&mut socket, peer_addr, local_addr).await {
                         error!(
                             "TCP connection failed: {} -> {}, error: {:#}",
                             peer_addr, local_addr, e
@@ -927,38 +930,38 @@ pub fn tproxy_bind_src(sock: SockRef, src_sock: std::net::SocketAddr) -> tokio::
     Ok(())
 }
 
-async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
+async fn handle_tcp(
+    inbound: &mut tokio::net::TcpStream,
+    peer_addr: std::net::SocketAddr,
+    local_addr: std::net::SocketAddr,
+) -> Result<()> {
     use crate::rules::{InboundProtocol, RouteContext, TargetAddr};
-    use crate::utils::{is_valid_domain, transfer_tcp};
+    use crate::utils::{is_valid_domain, transfer_tcp_with_initial_data};
 
-    let mut buffer = [0u8; 0x800];
-    inbound.peek(&mut buffer).await?;
-
-    let mut domain = crate::sniffer::parse_host(&buffer).filter(|s| is_valid_domain(s.as_str()));
+    let Some(sniffed) = crate::sniffer::sniff_tcp(inbound).await? else {
+        return Ok(());
+    };
+    let mut domain = sniffed.host.filter(|s| is_valid_domain(s.as_str()));
 
     // DNS-over-TCP: sniff the queried domain so DNS traffic can be routed
     // with the regular domain rules.
     if domain.is_none() && inbound.local_addr()?.port() == 53 {
-        domain = crate::sniffer::dns_parse::parse_host_tcp(&buffer)
+        domain = crate::sniffer::dns_parse::parse_host_tcp(&sniffed.data)
             .filter(|s| is_valid_domain(s.as_str()));
     }
     let target_addr = match domain {
-        Some(domain) => TargetAddr::Domain(
-            domain,
-            inbound.local_addr()?.port(),
-            Some(inbound.local_addr()?),
-        ),
-        None => TargetAddr::Ip(inbound.local_addr()?),
+        Some(domain) => TargetAddr::Domain(domain, local_addr.port(), Some(local_addr)),
+        None => TargetAddr::Ip(local_addr),
     };
 
     let rt_context = RouteContext {
-        src_addr: inbound.peer_addr()?,
+        src_addr: peer_addr,
         dst_addr: target_addr,
         inbound_proto: Some(InboundProtocol::TPROXY),
         socket_type: crate::rules::SocketType::STREAM,
     };
 
-    transfer_tcp(inbound, rt_context.to_owned())
+    transfer_tcp_with_initial_data(inbound, rt_context.to_owned(), sniffed.data)
         .await
         .context(format!("Failed request `{}`", rt_context))?;
 

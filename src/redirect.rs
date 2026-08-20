@@ -57,9 +57,9 @@ mod linux_impl {
     async fn accept_socket_loop(listener: tokio::net::TcpListener) {
         loop {
             match listener.accept().await {
-                Ok((mut _socket, _)) => {
+                Ok((mut socket, peer_addr)) => {
                     tokio::spawn(async move {
-                        match handle_tcp(&mut _socket).await {
+                        match handle_tcp(&mut socket, peer_addr).await {
                             Err(e) => {
                                 error!("{:#}", e);
                             }
@@ -72,19 +72,16 @@ mod linux_impl {
         }
     }
 
-    async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
+    async fn handle_tcp(inbound: &mut tokio::net::TcpStream, peer_addr: SocketAddr) -> Result<()> {
         use crate::rules::{InboundProtocol, RouteContext, TargetAddr};
-        use crate::utils::{is_valid_domain, transfer_tcp};
-        use std::time::Duration;
+        use crate::utils::{is_valid_domain, transfer_tcp_with_initial_data};
 
-        let mut buffer = [0u8; 0x800];
-        // Bound the peek so a silent client cannot pin this fd forever.
-        // On timeout we fall through with an empty buffer and route by IP.
-        let _ = tokio::time::timeout(Duration::from_secs(5), inbound.peek(&mut buffer)).await;
+        let Some(sniffed) = crate::sniffer::sniff_tcp(inbound).await? else {
+            return Ok(());
+        };
+        let mut domain = sniffed.host.filter(|s| is_valid_domain(s.as_str()));
 
-        let mut domain = crate::sniffer::parse_host(&buffer).filter(|s| is_valid_domain(s.as_str()));
-
-        let origin_addr = match inbound.peer_addr()? {
+        let origin_addr = match peer_addr {
             SocketAddr::V4(v4) => SocketAddr::V4(v4),
             SocketAddr::V6(v6) => {
                 if let Some(v4) = v6.ip().to_ipv4_mapped() {
@@ -121,7 +118,7 @@ mod linux_impl {
         // DNS-over-TCP: sniff the queried domain so DNS traffic can be routed
         // with the regular domain rules.
         if domain.is_none() && origin_addr.port() == 53 {
-            domain = crate::sniffer::dns_parse::parse_host_tcp(&buffer)
+            domain = crate::sniffer::dns_parse::parse_host_tcp(&sniffed.data)
                 .filter(|s| is_valid_domain(s.as_str()));
         }
 
@@ -131,13 +128,13 @@ mod linux_impl {
         };
 
         let rt_context = RouteContext {
-            src_addr: inbound.peer_addr()?,
+            src_addr: peer_addr,
             dst_addr: target_addr,
             inbound_proto: Some(InboundProtocol::REDIRECT),
             socket_type: crate::rules::SocketType::STREAM,
         };
 
-        transfer_tcp(inbound, rt_context.to_owned())
+        transfer_tcp_with_initial_data(inbound, rt_context.to_owned(), sniffed.data)
             .await
             .context(format!("Failed request `{}`", rt_context))?;
 

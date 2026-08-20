@@ -13,9 +13,8 @@ use crate::stats::TCP_STATS;
 
 use anyhow::anyhow;
 #[cfg(target_os = "linux")]
-use tokio::io::AsyncWriteExt;
-#[cfg(target_os = "linux")]
 use std::io;
+use tokio::io::AsyncWriteExt;
 use tracing;
 
 use std::convert::TryInto;
@@ -80,6 +79,14 @@ pub fn to_io_err(sock_err: fast_socks5::SocksError) -> std::io::Error {
 }
 
 pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> Result<()> {
+    transfer_tcp_with_initial_data(in_sock, rt_context, Vec::new()).await
+}
+
+pub async fn transfer_tcp_with_initial_data(
+    in_sock: &mut TcpStream,
+    rt_context: RouteContext,
+    initial_data: Vec<u8>,
+) -> Result<()> {
     let mut out_sock = match get_settings()
         .read()
         .await
@@ -101,6 +108,12 @@ pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> 
     setup_tcp_keepalive(in_sock);
     setup_tcp_keepalive(&out_sock);
 
+    let initial_bytes = initial_data.len() as u64;
+    if !initial_data.is_empty() {
+        out_sock.write_all(&initial_data).await?;
+    }
+    drop(initial_data);
+
     // Track session start
     TCP_STATS.session_start();
 
@@ -118,7 +131,7 @@ pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> 
     };
 
     // Track session end with bytes transferred
-    TCP_STATS.session_end(bytes_transferred);
+    TCP_STATS.session_end(initial_bytes + bytes_transferred);
 
     Ok(())
 }

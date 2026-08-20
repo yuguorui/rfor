@@ -3,11 +3,13 @@
 // All credits belong to @Geal
 
 use nom::branch::alt;
-use nom::bytes::complete::{tag, take_while1};
-use nom::character::complete::char;
-use nom::multi::many1;
+use nom::bytes::streaming::{tag, take_while1};
+use nom::character::streaming::char;
+use nom::multi::{many0, many1};
 use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::IResult;
+
+use super::HostParseResult;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub struct Request<'a> {
@@ -109,31 +111,38 @@ fn message_header(input: &[u8]) -> IResult<&[u8], Header<'_>> {
 }
 
 pub fn request(input: &[u8]) -> IResult<&[u8], (Request<'_>, Vec<Header<'_>>)> {
-    terminated(pair(request_line, many1(message_header)), line_ending)(input)
+    terminated(pair(request_line, many0(message_header)), line_ending)(input)
 }
 
 pub fn parse_host(remaining: &[u8]) -> Option<String> {
-    if let Ok((_remaining, (_request, headers))) = request(remaining) {
-        for header in headers {
-            if let Ok(name) = std::str::from_utf8(header.name) {
-                match name.to_lowercase().as_str() {
-                    "host" => {
-                        return String::from_utf8(
-                            header
-                                .value
-                                .into_iter()
-                                .flat_map(ToOwned::to_owned)
-                                .collect(),
-                        )
-                        .map(|d| d.split(':').next().unwrap_or("").to_owned())
-                        .ok();
-                    }
-                    _ => (),
+    match parse_host_result(remaining) {
+        HostParseResult::Found(host) => Some(host),
+        HostParseResult::NeedMore | HostParseResult::NotProtocol => None,
+    }
+}
+
+pub fn parse_host_result(remaining: &[u8]) -> HostParseResult {
+    match request(remaining) {
+        Ok((_remaining, (_request, headers))) => {
+            for header in headers {
+                if header.name.eq_ignore_ascii_case(b"host") {
+                    return String::from_utf8(
+                        header
+                            .value
+                            .into_iter()
+                            .flat_map(ToOwned::to_owned)
+                            .collect(),
+                    )
+                    .map(|value| value.trim().split(':').next().unwrap_or("").to_owned())
+                    .map(HostParseResult::Found)
+                    .unwrap_or(HostParseResult::NotProtocol);
                 }
             }
+            HostParseResult::NotProtocol
         }
+        Err(nom::Err::Incomplete(_)) => HostParseResult::NeedMore,
+        Err(nom::Err::Error(_)) | Err(nom::Err::Failure(_)) => HostParseResult::NotProtocol,
     }
-    None
 }
 
 #[cfg(test)]
@@ -171,6 +180,26 @@ User-Agent: just/testing
                     value: vec![b"just/testing"],
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn reports_incomplete_request_headers() {
+        assert_eq!(
+            parse_host_result(b"GET / HTTP/1.1\r\nHost: exam"),
+            HostParseResult::NeedMore
+        );
+        assert_eq!(
+            parse_host_result(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+            HostParseResult::Found("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_non_http_data() {
+        assert_eq!(
+            parse_host_result(b"\x01\x02\x03\x04"),
+            HostParseResult::NotProtocol
         );
     }
 }
