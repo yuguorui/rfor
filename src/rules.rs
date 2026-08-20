@@ -8,6 +8,7 @@ use tokio::net::UdpSocket;
 use tokio::time::Instant;
 
 use std::fmt::Display;
+use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::time::Duration;
@@ -24,6 +25,34 @@ use crate::utils::{rfor_bind_addr, to_io_err, ToV6Net, ToV6SockAddr};
 use fast_socks5::client as socks_client;
 
 pub const TIMEOUT: u64 = 3000;
+
+async fn run_tcp_stage<T, F>(
+    deadline: Instant,
+    stage: &'static str,
+    future: F,
+) -> tokio::io::Result<T>
+where
+    F: Future<Output = tokio::io::Result<T>>,
+{
+    match tokio::time::timeout_at(deadline, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => {
+            let action = if err.kind() == std::io::ErrorKind::TimedOut {
+                "timed out"
+            } else {
+                "failed"
+            };
+            Err(std::io::Error::new(
+                err.kind(),
+                format!("{} {}: {}", stage, action, err),
+            ))
+        }
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{} timed out ({} ms connection deadline)", stage, TIMEOUT),
+        )),
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct RouteOptions {
@@ -355,9 +384,14 @@ impl RouteTable {
             #[cfg(not(target_os = "linux"))]
             let _ = inbound_proto; // Suppress unused variable warning
 
-            let sock_addr =
-                resolve_target_addr(context.dst_addr.clone(), options.disable_ipv6).await?;
-            return timeout(Duration::from_millis(TIMEOUT), sock.connect(sock_addr)).await?;
+            let deadline = Instant::now() + Duration::from_millis(TIMEOUT);
+            let sock_addr = run_tcp_stage(
+                deadline,
+                "target DNS resolution",
+                resolve_target_addr(context.dst_addr.clone(), options.disable_ipv6),
+            )
+            .await?;
+            return run_tcp_stage(deadline, "target TCP connect", sock.connect(sock_addr)).await;
         }
 
         let proxy_url = outbound.url.as_ref().ok_or_else(|| {
@@ -422,20 +456,30 @@ impl RouteTable {
                 // can set SO_MARK before connect(). Otherwise the SYN to the
                 // proxy server can be caught by our own REDIRECT/TPROXY rules
                 // in the OUTPUT chain and loop back into rfor.
-                let connect_and_handshake = async {
-                    let socks_sock_addr = resolve_target_addr(
+                let deadline = Instant::now() + Duration::from_millis(TIMEOUT);
+                let socks_sock_addr = run_tcp_stage(
+                    deadline,
+                    "SOCKS server DNS resolution",
+                    resolve_target_addr(
                         TargetAddr::Domain(socks_host, socks_port, None),
                         options.disable_ipv6,
-                    )
-                    .await?;
-                    let sock = match options.disable_ipv6 {
-                        false => TcpSocket::new_v6()?,
-                        true => TcpSocket::new_v4()?,
-                    };
-                    #[cfg(target_os = "linux")]
-                    prepare_socket_bypass_mangle(sock.as_raw_fd(), options.direct_mark)?;
-                    let stream = sock.connect(socks_sock_addr).await?;
+                    ),
+                )
+                .await?;
+                let sock = match options.disable_ipv6 {
+                    false => TcpSocket::new_v6()?,
+                    true => TcpSocket::new_v4()?,
+                };
+                #[cfg(target_os = "linux")]
+                prepare_socket_bypass_mangle(sock.as_raw_fd(), options.direct_mark)?;
+                let stream = run_tcp_stage(
+                    deadline,
+                    "SOCKS server TCP connect",
+                    sock.connect(socks_sock_addr),
+                )
+                .await?;
 
+                let handshake = async {
                     let mut socks = socks_client::Socks5Stream::use_stream(
                         stream,
                         auth,
@@ -452,8 +496,7 @@ impl RouteTable {
                         .map_err(to_io_err)?;
                     Ok::<_, std::io::Error>(socks)
                 };
-                let socks =
-                    timeout(Duration::from_millis(TIMEOUT), connect_and_handshake).await??;
+                let socks = run_tcp_stage(deadline, "SOCKS handshake", handshake).await?;
                 Ok(socks.get_socket())
             }
             scheme => Err(std::io::Error::new(
@@ -721,5 +764,59 @@ impl ProxyDgram for fast_socks5::client::Socks5Datagram<tokio::net::TcpStream> {
             TargetAddr::Domain(domain, port, _) => self.send_to(buf, (domain.as_str(), port)).await,
         }
         .map_err(to_io_err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tcp_stage_identifies_expired_deadline() {
+        let future = async {
+            std::future::pending::<()>().await;
+            Ok::<(), std::io::Error>(())
+        };
+        let error = run_tcp_stage(Instant::now(), "SOCKS handshake", future)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.to_string(),
+            "SOCKS handshake timed out (3000 ms connection deadline)"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_stage_preserves_and_labels_io_errors() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let timeout_error = run_tcp_stage(deadline, "target DNS resolution", async {
+            Err::<(), _>(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "resolver deadline",
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(timeout_error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            timeout_error.to_string(),
+            "target DNS resolution timed out: resolver deadline"
+        );
+
+        let connect_error = run_tcp_stage(deadline, "target TCP connect", async {
+            Err::<(), _>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "connection refused",
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(connect_error.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(
+            connect_error.to_string(),
+            "target TCP connect failed: connection refused"
+        );
     }
 }
