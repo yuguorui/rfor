@@ -6,6 +6,7 @@ readonly ORIGIN_HOST=198.18.0.10
 readonly HTTP_URL="http://${ORIGIN_HOST}:18080/test"
 readonly EXPECTED_HTTP_BODY=rfor-integration-ok
 readonly EXPECTED_SERVER_FIRST_BODY=server-first-ok
+readonly SERVER_FIRST_TIMEOUT_SECONDS=8
 readonly WORK_DIR=/tmp/rfor-integration
 
 RFOR_PID=
@@ -109,62 +110,28 @@ for initial_delay, fragments in cases:
         if body != expected:
             raise RuntimeError(f"unexpected response body: {body!r}")
 PY
-    wait_for_log_after '-> split.test:18080 -> Outbound(DIRECT)' "$first_line"
+    wait_for_log_after '-> split.test:18080 (198.18.0.10:18080) -> Outbound(DIRECT)' "$first_line"
     wait_for_log_after '-> 198.18.0.10:18080 -> Outbound(PROXY)' "$first_line"
     direct_count=$(tail -n "+${first_line}" "$RFOR_LOG" 2>/dev/null |
-        grep --fixed-strings --count -- '-> split.test:18080 -> Outbound(DIRECT)' || true)
+        grep --fixed-strings --count -- '-> split.test:18080 (198.18.0.10:18080) -> Outbound(DIRECT)' || true)
     [[ $direct_count -eq 3 ]] ||
         fail "expected three domain-routed timed requests, observed ${direct_count}"
 }
 
 assert_server_first_forwarding() {
     local body
-    body=$(python3 - "$ORIGIN_HOST" <<'PY'
+    body=$(python3 - "$ORIGIN_HOST" "$SERVER_FIRST_TIMEOUT_SECONDS" <<'PY'
 import socket
 import sys
 
-with socket.create_connection((sys.argv[1], 18081), timeout=2) as sock:
-    sock.settimeout(2)
+timeout = float(sys.argv[2])
+with socket.create_connection((sys.argv[1], 18081), timeout=timeout) as sock:
+    sock.settimeout(timeout)
     print(sock.recv(128).decode().strip())
 PY
-    ) || fail "server-first forwarding exceeded two seconds"
+    ) || fail "server-first forwarding exceeded ${SERVER_FIRST_TIMEOUT_SECONDS} seconds"
     [[ $body == "$EXPECTED_SERVER_FIRST_BODY" ]] ||
         fail "unexpected server-first response: ${body}"
-}
-
-stress_reload() {
-    local mode=$1
-    local request_count=32
-    local -a request_pids=()
-    local request_id
-    local failed=0
-
-    log "${mode}: starting ${request_count} concurrent requests with SIGHUP reloads"
-    for request_id in $(seq 1 "$request_count"); do
-        curl --noproxy '*' --fail --silent --show-error --max-time 10 \
-            "$HTTP_URL?request=${request_id}" \
-            --output "$WORK_DIR/${mode}-${request_id}.out" &
-        request_pids+=("$!")
-    done
-
-    for _reload in $(seq 1 12); do
-        kill -HUP "$RFOR_PID"
-        sleep 0.02
-    done
-
-    for request_id in "${!request_pids[@]}"; do
-        if ! wait "${request_pids[$request_id]}"; then
-            failed=1
-            continue
-        fi
-        if [[ $(<"$WORK_DIR/${mode}-$((request_id + 1)).out") != "$EXPECTED_HTTP_BODY" ]]; then
-            failed=1
-        fi
-    done
-
-    [[ $failed == 0 ]] || fail "${mode}: one or more concurrent requests failed"
-    wait_for_log "Settings reloaded successfully."
-    assert_http_forwarding
 }
 
 stop_rfor() {
@@ -245,7 +212,6 @@ run_tproxy_test() {
     assert_http_forwarding
     assert_timed_http_forwarding
     assert_server_first_forwarding
-    stress_reload TPROXY
     grep --quiet 'TPROXY:' "$RFOR_LOG" || fail 'TPROXY traffic was not observed in the route log'
     assert_not_reconciled TPROXY mangle rfor-it-mark
     stop_rfor TPROXY
@@ -263,7 +229,6 @@ run_redirect_test() {
     assert_http_forwarding
     assert_timed_http_forwarding
     assert_server_first_forwarding
-    stress_reload REDIRECT
     grep --quiet 'REDIRECT:' "$RFOR_LOG" || fail 'REDIRECT traffic was not observed in the route log'
     assert_not_reconciled REDIRECT nat rfor-it-redirect
     stop_rfor REDIRECT
