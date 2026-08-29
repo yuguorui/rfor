@@ -484,6 +484,7 @@ const QUIC_SNI_AGGREGATION_TIMEOUT_MS: u64 = 300;
 /// - A vector of all buffered packets that should be forwarded
 async fn sniff_host_with_quic_aggregation(
     packet_rx: &mut mpsc::Receiver<bytes::Bytes>,
+    target_port: u16,
 ) -> (Option<String>, Vec<bytes::Bytes>) {
     use crate::sniffer::{QuicParseResult, QuicSniAggregator};
 
@@ -498,6 +499,15 @@ async fn sniff_host_with_quic_aggregation(
     };
 
     buffered_packets.push(init_packet.clone());
+
+    // DNS queries carry the requested domain in the question section; sniff it
+    // so DNS traffic can be routed with the regular domain rules.
+    if target_port == 53 {
+        if let Some(host) = crate::sniffer::dns_parse::parse_host(&init_packet) {
+            debug!("DNS query domain parsed from first packet: {}", host);
+            return (Some(host), buffered_packets);
+        }
+    }
 
     let mut aggregator = QuicSniAggregator::new();
     match aggregator.process_packet(&init_packet) {
@@ -598,7 +608,7 @@ async fn relay_udp_packet(
     drop(settings);
 
     // Try to parse host from packets, supporting QUIC SNI aggregation
-    let (host, buffered_packets) = sniff_host_with_quic_aggregation(&mut packet_rx).await;
+    let (host, buffered_packets) = sniff_host_with_quic_aggregation(&mut packet_rx, target_sockaddr.port()).await;
 
     // If no packets received, just return
     if buffered_packets.is_empty() {
@@ -887,8 +897,14 @@ async fn handle_tcp(inbound: &mut tokio::net::TcpStream) -> Result<()> {
     let mut buffer = [0u8; 0x800];
     inbound.peek(&mut buffer).await?;
 
-    let domain = crate::sniffer::parse_host(&buffer).filter(|s| is_valid_domain(s.as_str()));
+    let mut domain = crate::sniffer::parse_host(&buffer).filter(|s| is_valid_domain(s.as_str()));
 
+    // DNS-over-TCP: sniff the queried domain so DNS traffic can be routed
+    // with the regular domain rules.
+    if domain.is_none() && inbound.local_addr()?.port() == 53 {
+        domain = crate::sniffer::dns_parse::parse_host_tcp(&buffer)
+            .filter(|s| is_valid_domain(s.as_str()));
+    }
     let target_addr = match domain {
         Some(domain) => TargetAddr::Domain(
             domain,

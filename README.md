@@ -11,6 +11,7 @@ Features
 - Standard SOCKS5 proxy protocols support
 - Fast routing decision ( <= 15us with 70k rules )
     - TLS/QUIC SNI sniffing
+    - DNS query sniffing (route intercepted DNS requests by the queried domain)
     - [GeoIP](https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat)/[GeoSite](https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat)/[MMDB](https://raw.githubusercontent.com/alecthw/mmdb_china_ip_list/release/Country.mmdb) support
 - Auto configuration and cleanup for transparent proxy with iptables and tproxy (No more mess with iptables🥳)
 - Optional source IP preserving when connects directly
@@ -73,6 +74,12 @@ rules:
   - GEOIP,Country.mmdb:JP,DIRECT
   - GEOSITE,geosite.dat:category-ads,DROP
 ```
+
+DNS requests (UDP/TCP port 53) intercepted by tproxy/redirect are sniffed for
+the queried domain, so the domain rules above also apply to DNS traffic itself.
+The query is still forwarded to the original DNS server; only the routing
+decision uses the sniffed domain. To route DNS requests, make sure port 53 is
+included in `traffic-intercept.ports` (and `udp-enabled: true` for UDP DNS).
 
 You can run it with:
 ```shell

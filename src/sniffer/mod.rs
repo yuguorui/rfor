@@ -1,3 +1,4 @@
+pub mod dns_parse;
 mod http_parse;
 mod quic_parser;
 mod tls_parse;

@@ -82,7 +82,7 @@ mod linux_impl {
         // On timeout we fall through with an empty buffer and route by IP.
         let _ = tokio::time::timeout(Duration::from_secs(5), inbound.peek(&mut buffer)).await;
 
-        let domain = crate::sniffer::parse_host(&buffer).filter(|s| is_valid_domain(s.as_str()));
+        let mut domain = crate::sniffer::parse_host(&buffer).filter(|s| is_valid_domain(s.as_str()));
 
         let origin_addr = match inbound.peer_addr()? {
             SocketAddr::V4(v4) => SocketAddr::V4(v4),
@@ -117,6 +117,13 @@ mod linux_impl {
                 )
             }
         };
+
+        // DNS-over-TCP: sniff the queried domain so DNS traffic can be routed
+        // with the regular domain rules.
+        if domain.is_none() && origin_addr.port() == 53 {
+            domain = crate::sniffer::dns_parse::parse_host_tcp(&buffer)
+                .filter(|s| is_valid_domain(s.as_str()));
+        }
 
         let target_addr = match domain {
             Some(domain) => TargetAddr::Domain(domain, origin_addr.port(), Some(origin_addr)),
