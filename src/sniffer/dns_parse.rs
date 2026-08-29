@@ -51,6 +51,49 @@ fn parse_dns_query(msg: &[u8]) -> Option<String> {
     Some(name)
 }
 
+
+/// Build an NXDOMAIN response for a DNS query message (UDP payload).
+///
+/// The response echoes the query's ID and question section, sets QR/RA and
+/// RCODE=3 (NXDOMAIN), and carries no answer/authority/additional records.
+/// Returns None if `query` is not a well-formed standard query.
+pub fn build_nxdomain_response(query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < DNS_HEADER_LEN {
+        return None;
+    }
+
+    let flags = u16::from_be_bytes([query[2], query[3]]);
+    let is_response = flags & 0x8000 != 0;
+    let opcode = (flags >> 11) & 0x0f;
+    if is_response || opcode != 0 {
+        return None;
+    }
+
+    let qdcount = u16::from_be_bytes([query[4], query[5]]) as usize;
+    if qdcount == 0 {
+        return None;
+    }
+
+    // Walk all questions to find the end of the question section.
+    let mut pos = DNS_HEADER_LEN;
+    for _ in 0..qdcount {
+        let (_, next) = parse_name(query, pos, 0)?;
+        pos = next.checked_add(4)?; // QTYPE + QCLASS
+        if pos > query.len() {
+            return None;
+        }
+    }
+
+    let mut resp = Vec::with_capacity(pos);
+    resp.extend_from_slice(&query[..pos]);
+    // Keep RD and CD from the query; set QR=1, RA=1, RCODE=3 (NXDOMAIN).
+    let resp_flags = (flags & 0x0110) | 0x8083;
+    resp[2..4].copy_from_slice(&resp_flags.to_be_bytes());
+    // ANCOUNT = NSCOUNT = ARCOUNT = 0
+    resp[6..12].copy_from_slice(&[0; 6]);
+    Some(resp)
+}
+
 /// Parse a (possibly compressed) domain name starting at `offset`.
 /// Returns the lower-cased domain and the offset right after the name
 /// (following the initial encoding, not the pointer target).
@@ -127,6 +170,38 @@ mod tests {
         msg.push(0); // root label
         msg.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QTYPE A, QCLASS IN
         msg
+    }
+
+
+    #[test]
+    fn nxdomain_response() {
+        let mut query = build_query("ads.example.com");
+        query[0] = 0xab;
+        query[1] = 0xcd; // ID
+        let resp = build_nxdomain_response(&query).unwrap();
+        // ID echoed
+        assert_eq!(&resp[0..2], &[0xab, 0xcd]);
+        let flags = u16::from_be_bytes([resp[2], resp[3]]);
+        assert!(flags & 0x8000 != 0, "QR must be set");
+        assert!(flags & 0x0080 != 0, "RA must be set");
+        assert_eq!(flags & 0x000f, 3, "RCODE must be NXDOMAIN");
+        assert!(flags & 0x0100 != 0, "RD preserved");
+        // no answer/authority/additional records
+        assert_eq!(&resp[6..12], &[0; 6]);
+        // question section echoed verbatim
+        assert_eq!(&resp[12..], &query[12..query.len()]);
+        // a response must not be accepted as a query again
+        assert_eq!(parse_host(&resp), None);
+        assert_eq!(build_nxdomain_response(&resp), None);
+    }
+
+    #[test]
+    fn nxdomain_rejects_non_query() {
+        assert_eq!(build_nxdomain_response(b""), None);
+        assert_eq!(build_nxdomain_response(&[0u8; 5]), None);
+        let mut msg = build_query("www.example.com");
+        msg[5] = 0x00; // QDCOUNT = 0
+        assert_eq!(build_nxdomain_response(&msg), None);
     }
 
     #[test]

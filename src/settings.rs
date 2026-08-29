@@ -80,6 +80,22 @@ pub struct Settings {
     pub udp_fullcone_rate_limit: u32,
     /// Maximum number of concurrent UDP sessions (0 = unlimited)
     pub udp_max_sessions: usize,
+    /// How to answer requests rejected by a DROP outbound, per protocol
+    pub drop_reply: DropReply,
+}
+
+/// Per-protocol reply behavior for requests rejected by a DROP outbound.
+/// Silent by default; extend with more protocols (e.g. tls: alert) as needed.
+#[derive(Serialize, Default)]
+pub struct DropReply {
+    pub dns: DnsDropReply,
+}
+
+#[derive(Serialize, Default, Clone, Copy, PartialEq)]
+pub enum DnsDropReply {
+    #[default]
+    Silent,
+    Nxdomain,
 }
 
 impl Settings {
@@ -170,6 +186,7 @@ impl Settings {
                 as u64,
             udp_fullcone_rate_limit: s.get_int("udp-fullcone-rate-limit").unwrap_or(10) as u32,
             udp_max_sessions: s.get_int("udp-max-sessions").unwrap_or(1024) as usize,
+            drop_reply: parse_drop_reply(&s)?,
         };
 
         // Validate settings
@@ -338,6 +355,35 @@ fn port_range_to_string(ranges: &[[u16; 2]]) -> String {
             }
         })
         .join(",")
+}
+
+fn parse_drop_reply(s: &Config) -> Result<DropReply, ConfigError> {
+    let mut reply = DropReply::default();
+
+    let table = match s.get_table("drop-reply") {
+        Err(_) => return Ok(reply),
+        Ok(t) => t,
+    };
+
+    if let Some(v) = table.get("dns") {
+        let value = v
+            .clone()
+            .into_string()
+            .map(|s| s.to_lowercase())
+            .map_err(|e| ConfigError::Message(format!("Failed to parse drop-reply.dns: {}", e)))?;
+        reply.dns = match value.as_str() {
+            "silent" | "none" => DnsDropReply::Silent,
+            "nxdomain" => DnsDropReply::Nxdomain,
+            _ => {
+                return Err(ConfigError::Message(format!(
+                    "invalid drop-reply.dns '{}', expect silent|nxdomain",
+                    value
+                )))
+            }
+        };
+    }
+
+    Ok(reply)
 }
 
 fn parse_intercept_mode(s: &Config) -> Result<InterceptMode, ConfigError> {

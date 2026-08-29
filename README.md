@@ -45,6 +45,9 @@ socks5-listen: '[::]:50081'
 udp-enabled: true
 # udp-timeout: 60
 
+# drop-reply:                  # how to answer requests rejected by a drop:// outbound
+#   dns: nxdomain              # silent (default) | nxdomain
+
 traffic-intercept:
   mode: auto                # auto(tproxy)/redirect/manual, set to "manual" when you want set iptables by hand.
   local-traffic: true       # set to true to allow intercept local traffic
@@ -80,6 +83,10 @@ the queried domain, so the domain rules above also apply to DNS traffic itself.
 The query is still forwarded to the original DNS server; only the routing
 decision uses the sniffed domain. To route DNS requests, make sure port 53 is
 included in `traffic-intercept.ports` (and `udp-enabled: true` for UDP DNS).
+When a DNS query matches a `drop://` outbound and `drop-reply.dns: nxdomain` is
+set, rfor answers with an NXDOMAIN response (impersonating the original DNS
+server) instead of silently dropping the packet, so clients fail fast without
+waiting for the DNS timeout.
 
 You can run it with:
 ```shell

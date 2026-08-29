@@ -605,6 +605,10 @@ async fn relay_udp_packet(
     let fullcone_socket_timeout = settings.udp_fullcone_socket_timeout;
     let fullcone_rate_limit = settings.udp_fullcone_rate_limit;
     let disable_ipv6 = settings.disable_ipv6;
+    let dns_drop_nxdomain = matches!(
+        settings.drop_reply.dns,
+        crate::settings::DnsDropReply::Nxdomain
+    );
     drop(settings);
 
     // Try to parse host from packets, supporting QUIC SNI aggregation
@@ -638,7 +642,31 @@ async fn relay_udp_packet(
         Err(err) => match err.kind() {
             // Intentional DROP outbound, mirror the TCP path in transfer_tcp
             // and return quietly instead of logging an error.
-            std::io::ErrorKind::PermissionDenied => return Ok(()),
+            std::io::ErrorKind::PermissionDenied => {
+                // Optionally answer DNS queries with NXDOMAIN so clients fail
+                // fast instead of waiting for the DNS timeout.
+                if dns_drop_nxdomain {
+                    if let Some(resp) =
+                        crate::sniffer::dns_parse::build_nxdomain_response(&buffered_packets[0])
+                    {
+                        // Reply from the original DNS server's address, like the
+                        // normal relay path does with source_socket.
+                        match udp_socket_bind_to_any_with_flag(target_sockaddr, disable_ipv6).await
+                        {
+                            Ok(sock) => {
+                                if let Err(e) = sock
+                                    .send_to(&resp, source_sockaddr)
+                                    .await
+                                {
+                                    debug!("failed to send NXDOMAIN response: {}", e);
+                                }
+                            }
+                            Err(e) => debug!("failed to bind NXDOMAIN reply socket: {}", e),
+                        }
+                    }
+                }
+                return Ok(());
+            }
             _ => return Err(err.into()),
         },
     };
