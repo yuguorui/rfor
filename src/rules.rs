@@ -155,7 +155,12 @@ impl Display for TargetAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TargetAddr::Ip(ip) => write!(f, "{}", ip),
-            TargetAddr::Domain(domain, port, _) => write!(f, "{}:{}", domain, port),
+            TargetAddr::Domain(domain, port, osock) => match osock {
+                // Show the original destination in parentheses: the domain is
+                // only used for routing, the traffic goes to this address.
+                Some(sock) => write!(f, "{}:{} ({})", domain, port, sock),
+                None => write!(f, "{}:{}", domain, port),
+            },
         }
     }
 }
