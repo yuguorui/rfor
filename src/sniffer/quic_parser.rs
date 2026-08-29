@@ -14,6 +14,8 @@ const VERSION2: u32 = 0x6b3343cf; // QUIC v2 (RFC 9369)
 // QUIC frame types
 const FRAME_TYPE_PADDING: u8 = 0x00;
 const FRAME_TYPE_PING: u8 = 0x01;
+const FRAME_TYPE_ACK: u8 = 0x02;
+const FRAME_TYPE_ACK_ECN: u8 = 0x03;
 const FRAME_TYPE_CRYPTO: u8 = 0x06;
 const FRAME_TYPE_CONNECTION_CLOSE: u8 = 0x1c;
 const FRAME_TYPE_CONNECTION_CLOSE_APP: u8 = 0x1d;
@@ -334,7 +336,8 @@ fn version_to_rustls(version: u32) -> Option<rustls::quic::Version> {
     match version {
         VERSION_DRAFT23..=VERSION_DRAFT29 => Some(rustls::quic::Version::V1Draft),
         VERSION1 => Some(rustls::quic::Version::V1),
-        VERSION2 => Some(rustls::quic::Version::V1), // QUIC v2 uses same initial secrets as v1
+        // QUIC v2 has its own initial salt and HKDF labels (RFC 9369 Section 3)
+        VERSION2 => Some(rustls::quic::Version::V2),
         _ => None,
     }
 }
@@ -524,6 +527,30 @@ fn parse_initial_packet(remaining: &[u8]) -> Result<ParsedInitialPacket, QuicPar
     })
 }
 
+/// Skip over an ACK frame's fields (RFC 9000 Section 19.3)
+fn skip_ack_frame<B: Buf>(r: &mut B, has_ecn: bool) -> Result<(), QuicParseError> {
+    // Largest Acknowledged, ACK Delay, ACK Range Count, First ACK Range
+    decode_varint(r).ok_or(QuicParseError::InsufficientData)?;
+    decode_varint(r).ok_or(QuicParseError::InsufficientData)?;
+    let range_count = decode_varint(r).ok_or(QuicParseError::InsufficientData)?;
+    decode_varint(r).ok_or(QuicParseError::InsufficientData)?;
+
+    for _ in 0..range_count {
+        // Gap, ACK Range Length
+        decode_varint(r).ok_or(QuicParseError::InsufficientData)?;
+        decode_varint(r).ok_or(QuicParseError::InsufficientData)?;
+    }
+
+    if has_ecn {
+        // ECT0 Count, ECT1 Count, ECN-CE Count
+        decode_varint(r).ok_or(QuicParseError::InsufficientData)?;
+        decode_varint(r).ok_or(QuicParseError::InsufficientData)?;
+        decode_varint(r).ok_or(QuicParseError::InsufficientData)?;
+    }
+
+    Ok(())
+}
+
 /// Extract all CRYPTO frames from a decrypted QUIC payload
 fn extract_crypto_frames(payload: &[u8]) -> Result<Vec<CryptoFrame>, QuicParseError> {
     use byteorder::ReadBytesExt;
@@ -538,11 +565,12 @@ fn extract_crypto_frames(payload: &[u8]) -> Result<Vec<CryptoFrame>, QuicParseEr
             .map_err(|_| QuicParseError::InsufficientData)?;
 
         match frame_type {
-            FRAME_TYPE_PADDING => {
-                continue;
+            FRAME_TYPE_PADDING | FRAME_TYPE_PING => {}
+            FRAME_TYPE_ACK => {
+                skip_ack_frame(&mut cursor, false)?;
             }
-            FRAME_TYPE_PING => {
-                continue;
+            FRAME_TYPE_ACK_ECN => {
+                skip_ack_frame(&mut cursor, true)?;
             }
             FRAME_TYPE_CRYPTO => {
                 let offset = decode_varint(&mut cursor).ok_or(QuicParseError::InsufficientData)?;
@@ -566,13 +594,11 @@ fn extract_crypto_frames(payload: &[u8]) -> Result<Vec<CryptoFrame>, QuicParseEr
                 break;
             }
             _ => {
-                // Try to skip unknown frame
-                if let Some(length) = decode_varint(&mut cursor) {
-                    let skip_len = length.min(cursor.remaining() as u64) as usize;
-                    cursor.set_position(cursor.position() + skip_len as u64);
-                } else {
-                    break;
-                }
+                // QUIC frame types carry no uniform length field, so the
+                // extent of an unknown frame cannot be determined. Anything
+                // after it is undecodable; keep what was collected so far.
+                debug!("Unknown QUIC frame type {:#x}, stop parsing", frame_type);
+                break;
             }
         }
     }
@@ -755,5 +781,157 @@ mod tests {
         assert!(aggregator.connections.contains_key(&cid1));
         assert!(!aggregator.connections.contains_key(&cid2)); // cid2 was evicted
         assert!(aggregator.connections.contains_key(&cid3));
+    }
+
+    #[test]
+    fn test_extract_crypto_frames_skips_ack() {
+        // ACK (largest=1, delay=0, range_count=1, first_range=0, gap=0, len=0),
+        // then an ACK with ECN counts, then a CRYPTO frame.
+        let payload = [
+            0x02, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, // ACK
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, // ACK + ECN
+            0x06, 0x00, 0x03, 0xaa, 0xbb, 0xcc, // CRYPTO offset=0 len=3
+        ];
+        let frames = extract_crypto_frames(&payload).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].offset, 0);
+        assert_eq!(frames[0].data, vec![0xaa, 0xbb, 0xcc]);
+    }
+
+    #[test]
+    fn test_extract_crypto_frames_stops_at_unknown_frame() {
+        // CRYPTO frame followed by a stream frame (0x08): stream frames are
+        // not legal in Initial packets and carry no uniform length field, so
+        // parsing stops but the collected CRYPTO frame is kept.
+        let payload = [
+            0x06, 0x00, 0x03, 0xaa, 0xbb, 0xcc, // CRYPTO offset=0 len=3
+            0x08, 0xff, 0xff, // unknown-in-initial frame + garbage
+        ];
+        let frames = extract_crypto_frames(&payload).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, vec![0xaa, 0xbb, 0xcc]);
+
+        // Unknown frame before any CRYPTO frame yields nothing.
+        let payload = [0x08, 0x00, 0x00, 0x06, 0x00, 0x01, 0xaa];
+        assert!(matches!(
+            extract_crypto_frames(&payload),
+            Err(QuicParseError::NoCryptoFrame)
+        ));
+    }
+
+    fn encode_varint(x: u64) -> Vec<u8> {
+        if x < 64 {
+            vec![x as u8]
+        } else if x < 16384 {
+            ((x as u16) | 0x4000).to_be_bytes().to_vec()
+        } else if x < (1 << 30) {
+            ((x as u32) | 0x8000_0000).to_be_bytes().to_vec()
+        } else {
+            (x | 0xc000_0000_0000_0000).to_be_bytes().to_vec()
+        }
+    }
+
+    /// Build a real QUIC Initial packet carrying a ClientHello for `host`,
+    /// protected with the Initial keys of the given version.
+    fn build_initial_packet(
+        wire_version: u32,
+        rustls_version: rustls::quic::Version,
+        host: &str,
+    ) -> Vec<u8> {
+        use std::sync::Arc;
+
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+        let mut client = rustls::ClientConnection::new(Arc::new(config), server_name).unwrap();
+        let mut record = Vec::new();
+        client.write_tls(&mut record).unwrap();
+        // Strip the 5-byte TLS record header; QUIC carries bare handshake messages.
+        assert_eq!(record[0], 0x16);
+        let record_len = u16::from_be_bytes([record[3], record[4]]) as usize;
+        let hello = &record[5..5 + record_len];
+
+        // CRYPTO frame: type, offset 0, length, data
+        let mut payload = vec![FRAME_TYPE_CRYPTO];
+        payload.extend_from_slice(&encode_varint(0));
+        payload.extend_from_slice(&encode_varint(hello.len() as u64));
+        payload.extend_from_slice(hello);
+
+        let dcid = b"rfor-test-dcid";
+        let scid = b"src";
+        let keys = TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .unwrap()
+            .quic_suite()
+            .unwrap()
+            .keys(dcid, rustls::Side::Client, rustls_version);
+
+        // Long header with a 4-byte packet number: 0xc0 sets the long header,
+        // fixed bit and Initial type, 0x03 encodes pn_len - 1.
+        let first_byte = 0xc3u8;
+        let pn = [0u8; 4];
+        let packet_number = 0u64;
+        let mut header = vec![first_byte];
+        header.extend_from_slice(&wire_version.to_be_bytes());
+        header.push(dcid.len() as u8);
+        header.extend_from_slice(dcid);
+        header.push(scid.len() as u8);
+        header.extend_from_slice(scid);
+        header.extend_from_slice(&encode_varint(0)); // token length
+        // Length covers the packet number and the protected payload (with tag).
+        header.extend_from_slice(&encode_varint((pn.len() + payload.len() + 16) as u64));
+
+        let mut ciphertext = payload.clone();
+        let tag = keys
+            .local
+            .packet
+            .encrypt_in_place(
+                packet_number,
+                &[header.as_slice(), pn.as_slice()].concat(),
+                &mut ciphertext,
+            )
+            .unwrap();
+        ciphertext.extend_from_slice(tag.as_ref());
+
+        let hdr_len = header.len();
+        let mut packet = header;
+        packet.extend_from_slice(&pn);
+        packet.extend_from_slice(&ciphertext);
+
+        // Apply header protection using the ciphertext sample.
+        let sample_start = hdr_len + 4;
+        let sample: Vec<u8> = packet[sample_start..sample_start + 16].to_vec();
+        let mut protected_first = packet[0];
+        let mut protected_pn = packet[hdr_len..hdr_len + 4].to_vec();
+        keys.local
+            .header
+            .encrypt_in_place(&sample, &mut protected_first, &mut protected_pn)
+            .unwrap();
+        packet[0] = protected_first;
+        packet[hdr_len..hdr_len + 4].copy_from_slice(&protected_pn);
+
+        packet
+    }
+
+    fn assert_initial_sni(wire_version: u32, rustls_version: rustls::quic::Version, host: &str) {
+        let packet = build_initial_packet(wire_version, rustls_version, host);
+        let mut aggregator = QuicSniAggregator::new();
+        match aggregator.process_packet(&packet) {
+            QuicParseResult::Success(parsed) => assert_eq!(parsed, host),
+            other => panic!("expected SNI for QUIC version {:#x}, got {:?}", wire_version, other),
+        }
+    }
+
+    #[test]
+    fn test_parse_quic_v1_initial_sni() {
+        assert_initial_sni(VERSION1, rustls::quic::Version::V1, "v1.example.com");
+    }
+
+    #[test]
+    fn test_parse_quic_v2_initial_sni() {
+        // QUIC v2 (RFC 9369) uses a different initial salt and HKDF labels;
+        // deriving keys as v1 must not accidentally succeed here.
+        assert_initial_sni(VERSION2, rustls::quic::Version::V2, "v2.example.com");
     }
 }
