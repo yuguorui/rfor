@@ -622,7 +622,7 @@ async fn relay_udp_packet(
         }
     };
 
-    let target_socket = get_settings()
+    let target_socket = match get_settings()
         .read()
         .await
         .routetable
@@ -632,7 +632,16 @@ async fn relay_udp_packet(
             inbound_proto: Some(crate::rules::InboundProtocol::TPROXY),
             socket_type: crate::rules::SocketType::DGRAM,
         })
-        .await?;
+        .await
+    {
+        Ok(sock) => sock,
+        Err(err) => match err.kind() {
+            // Intentional DROP outbound, mirror the TCP path in transfer_tcp
+            // and return quietly instead of logging an error.
+            std::io::ErrorKind::PermissionDenied => return Ok(()),
+            _ => return Err(err.into()),
+        },
+    };
 
     // Prepare the intermediate socket which is connected to the source, which should bind to the target address,
     // and pretend to be the target.
