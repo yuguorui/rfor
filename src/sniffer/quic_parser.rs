@@ -26,6 +26,11 @@ const MAX_CRYPTO_BUFFER_SIZE: usize = 16384;
 /// Maximum number of connections to track simultaneously
 const MAX_TRACKED_CONNECTIONS: usize = 1024;
 
+/// Minimum UDP payload size for a datagram carrying a client Initial
+/// packet (RFC 9000 Section 14.1). Anything smaller cannot be a
+/// conforming client Initial, so reject it before deriving keys.
+const MIN_CLIENT_INITIAL_DATAGRAM: usize = 1200;
+
 /// Errors that can occur during QUIC parsing
 #[derive(Debug, Clone, Error)]
 pub enum QuicParseError {
@@ -62,7 +67,6 @@ pub enum QuicParseResult {
 }
 
 /// Tracks CRYPTO frame data for a single QUIC connection
-#[derive(Debug)]
 struct CryptoBuffer {
     /// Buffer holding aggregated CRYPTO frame data
     data: Vec<u8>,
@@ -71,6 +75,20 @@ struct CryptoBuffer {
     written_ranges: Vec<(usize, usize)>,
     /// Last access time for LRU eviction
     last_access: Instant,
+    /// Initial keys derived from the destination CID, computed lazily on
+    /// the first packet and reused by later packets of this connection
+    keys: Option<rustls::quic::Keys>,
+}
+
+impl std::fmt::Debug for CryptoBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CryptoBuffer")
+            .field("data", &self.data)
+            .field("written_ranges", &self.written_ranges)
+            .field("last_access", &self.last_access)
+            .field("keys", &self.keys.as_ref().map(|_| "<derived>"))
+            .finish()
+    }
 }
 
 impl CryptoBuffer {
@@ -79,6 +97,7 @@ impl CryptoBuffer {
             data: Vec::new(),
             written_ranges: Vec::new(),
             last_access: Instant::now(),
+            keys: None,
         }
     }
 
@@ -238,11 +257,12 @@ impl QuicSniAggregator {
 
     /// Internal packet processing with detailed error handling
     fn process_packet_internal(&mut self, packet: &[u8]) -> Result<QuicParseResult, QuicParseError> {
-        // Parse the QUIC header and extract crypto frames
-        let parsed = parse_initial_packet(packet)?;
+        // Parse the header first; key derivation is deferred until the
+        // packet has passed every check that needs no cryptography.
+        let header = parse_initial_header(packet)?;
 
         // Get or create the crypto buffer for this connection
-        let dest_cid = parsed.dest_conn_id.clone();
+        let dest_cid = header.dest_conn_id.clone();
 
         // Limit number of tracked connections using strict LRU eviction
         if !self.connections.contains_key(&dest_cid) && self.connections.len() >= MAX_TRACKED_CONNECTIONS
@@ -258,8 +278,18 @@ impl QuicSniAggregator {
         // Update last access time for LRU tracking
         buffer.touch();
 
+        // Initial keys depend only on the destination CID and version;
+        // derive once and reuse for later packets of this connection.
+        if buffer.keys.is_none() {
+            buffer.keys = Some(derive_initial_keys(&dest_cid, header.rustls_version)?);
+        }
+
+        // Decrypt the payload and extract crypto frames
+        let crypto_frames =
+            decrypt_initial_payload(buffer.keys.as_ref().unwrap(), packet, &header)?;
+
         // Add all crypto frame data to the buffer
-        for frame in &parsed.crypto_frames {
+        for frame in &crypto_frames {
             buffer.add_data(frame.offset as usize, &frame.data)?;
         }
 
@@ -317,12 +347,15 @@ impl QuicSniAggregator {
     }
 }
 
-/// Parsed QUIC Initial packet data
-struct ParsedInitialPacket {
+/// Header fields of a QUIC Initial packet, parsed without decryption
+struct InitialHeader {
     dest_conn_id: Vec<u8>,
-    #[allow(dead_code)]
     src_conn_id: Vec<u8>,
-    crypto_frames: Vec<CryptoFrame>,
+    rustls_version: rustls::quic::Version,
+    /// Offset of the packet number field within the packet
+    hdr_len: usize,
+    /// Value of the length field: packet number + payload + tag
+    packet_len: u64,
 }
 
 /// A single CRYPTO frame's data
@@ -379,14 +412,34 @@ fn decode_varint<B: Buf>(r: &mut B) -> Option<u64> {
     Some(x)
 }
 
-/// Parse a QUIC Initial packet and extract CRYPTO frames
-fn parse_initial_packet(remaining: &[u8]) -> Result<ParsedInitialPacket, QuicParseError> {
+/// Derive Initial secrets from the destination CID (RFC 9001 Section 5)
+fn derive_initial_keys(
+    dest_conn_id: &[u8],
+    rustls_version: rustls::quic::Version,
+) -> Result<rustls::quic::Keys, QuicParseError> {
+    Ok(TLS13_AES_128_GCM_SHA256
+        .tls13()
+        .ok_or(QuicParseError::QuicSuiteUnavailable)?
+        .quic_suite()
+        .ok_or(QuicParseError::QuicSuiteUnavailable)?
+        .keys(dest_conn_id, rustls::Side::Client, rustls_version))
+}
+
+/// Parse a QUIC Initial packet header without any cryptography (RFC 9000
+/// Section 17.2). Anything that fails here must not trigger key derivation.
+fn parse_initial_header(remaining: &[u8]) -> Result<InitialHeader, QuicParseError> {
     use byteorder::ReadBytesExt;
     use std::io::Read;
 
+    // A client must pad every datagram carrying an Initial packet to at
+    // least 1200 bytes; smaller datagrams are not worth deriving keys for.
+    if remaining.len() < MIN_CLIENT_INITIAL_DATAGRAM {
+        return Err(QuicParseError::NotInitialPacket);
+    }
+
     let mut buffer = std::io::Cursor::new(remaining);
 
-    // Parse QUIC long header (RFC 9000 Section 17.2)
+    // Parse QUIC long header
     let type_byte = buffer
         .read_u8()
         .map_err(|_| QuicParseError::InsufficientData)?;
@@ -443,41 +496,52 @@ fn parse_initial_packet(remaining: &[u8]) -> Result<ParsedInitialPacket, QuicPar
         .read_exact(&mut token)
         .map_err(|_| QuicParseError::InsufficientData)?;
 
-    // Parse packet length
+    // Parse packet length (packet number + payload + tag)
     let packet_len = decode_varint(&mut buffer).ok_or(QuicParseError::InsufficientData)?;
     let hdr_len = buffer.position() as usize;
 
+    // Header protection needs a 16-byte sample starting 4 bytes after the
+    // packet number field begins.
+    if remaining.len() < hdr_len + 4 + 16 {
+        return Err(QuicParseError::InsufficientData);
+    }
+
+    Ok(InitialHeader {
+        dest_conn_id,
+        src_conn_id,
+        rustls_version,
+        hdr_len,
+        packet_len,
+    })
+}
+
+/// Remove header protection and decrypt the payload of an Initial packet,
+/// returning its CRYPTO frames.
+fn decrypt_initial_payload(
+    keys: &rustls::quic::Keys,
+    remaining: &[u8],
+    header: &InitialHeader,
+) -> Result<Vec<CryptoFrame>, QuicParseError> {
+    use byteorder::ReadBytesExt;
+    use std::io::Read;
+
+    let hdr_len = header.hdr_len;
+
     // Read encrypted packet number (up to 4 bytes)
+    let mut buffer = std::io::Cursor::new(remaining);
+    buffer.set_position(hdr_len as u64);
     let mut orig_pn_bytes = [0u8; 4];
     buffer
         .read_exact(&mut orig_pn_bytes)
         .map_err(|_| QuicParseError::InsufficientData)?;
 
-    // Derive Initial secrets and decrypt header (RFC 9001 Section 5)
-    let key_len = 16; // AES-128-GCM sample length
-    let keys = TLS13_AES_128_GCM_SHA256
-        .tls13()
-        .ok_or(QuicParseError::QuicSuiteUnavailable)?
-        .quic_suite()
-        .ok_or(QuicParseError::QuicSuiteUnavailable)?
-        .keys(&dest_conn_id, rustls::Side::Client, rustls_version);
-
     // Decrypt header to get actual packet number length
     let mut first_byte = remaining[0];
     let mut pn = orig_pn_bytes;
 
-    // Check if we have enough data for header decryption
-    if remaining.len() < hdr_len + 4 + key_len {
-        return Err(QuicParseError::InsufficientData);
-    }
-
     keys.local
         .header
-        .decrypt_in_place(
-            &remaining[hdr_len + 4..hdr_len + 4 + key_len],
-            &mut first_byte,
-            &mut pn,
-        )
+        .decrypt_in_place(&remaining[hdr_len + 4..hdr_len + 4 + 16], &mut first_byte, &mut pn)
         .map_err(|_| QuicParseError::DecryptionFailed)?;
 
     // Extract packet number length (bits 0-1 of first byte)
@@ -498,33 +562,28 @@ fn parse_initial_packet(remaining: &[u8]) -> Result<ParsedInitialPacket, QuicPar
     };
     debug!(
         "dest CID: {:x?}, src CID: {:x?}, packet number: {}",
-        dest_conn_id, src_conn_id, packet_number
+        header.dest_conn_id, header.src_conn_id, packet_number
     );
 
     // Reconstruct header with decrypted first byte and packet number
-    let mut header = remaining[..hdr_len + packet_number_len].to_vec();
-    header[0] = first_byte;
-    header[hdr_len..(hdr_len + packet_number_len)].copy_from_slice(&pn[..packet_number_len]);
+    let mut reconstructed = remaining[..hdr_len + packet_number_len].to_vec();
+    reconstructed[0] = first_byte;
+    reconstructed[hdr_len..(hdr_len + packet_number_len)].copy_from_slice(&pn[..packet_number_len]);
 
-    // Extract and decrypt payload
-    let payload_end = (packet_len as usize + hdr_len).min(remaining.len());
+    // Extract and decrypt payload; coalesced packets are ignored by
+    // bounding the payload with the length field.
+    let payload_end = (header.packet_len as usize + hdr_len).min(remaining.len());
     let mut payload = remaining[hdr_len + packet_number_len..payload_end].to_vec();
 
     keys.local
         .packet
-        .decrypt_in_place(packet_number, &header, &mut payload)
+        .decrypt_in_place(packet_number, &reconstructed, &mut payload)
         .map_err(|_| QuicParseError::DecryptionFailed)?;
 
     debug!("Decrypted QUIC payload length: {}", payload.len());
 
     // Parse frames to extract CRYPTO frames
-    let crypto_frames = extract_crypto_frames(&payload)?;
-
-    Ok(ParsedInitialPacket {
-        dest_conn_id,
-        src_conn_id,
-        crypto_frames,
-    })
+    extract_crypto_frames(&payload)
 }
 
 /// Skip over an ACK frame's fields (RFC 9000 Section 19.3)
@@ -831,13 +890,8 @@ mod tests {
         }
     }
 
-    /// Build a real QUIC Initial packet carrying a ClientHello for `host`,
-    /// protected with the Initial keys of the given version.
-    fn build_initial_packet(
-        wire_version: u32,
-        rustls_version: rustls::quic::Version,
-        host: &str,
-    ) -> Vec<u8> {
+    /// Build a bare TLS ClientHello handshake message for `host`.
+    fn client_hello(host: &str) -> Vec<u8> {
         use std::sync::Arc;
 
         let config = rustls::ClientConfig::builder()
@@ -850,15 +904,27 @@ mod tests {
         // Strip the 5-byte TLS record header; QUIC carries bare handshake messages.
         assert_eq!(record[0], 0x16);
         let record_len = u16::from_be_bytes([record[3], record[4]]) as usize;
-        let hello = &record[5..5 + record_len];
+        record[5..5 + record_len].to_vec()
+    }
 
-        // CRYPTO frame: type, offset 0, length, data
-        let mut payload = vec![FRAME_TYPE_CRYPTO];
-        payload.extend_from_slice(&encode_varint(0));
-        payload.extend_from_slice(&encode_varint(hello.len() as u64));
-        payload.extend_from_slice(hello);
+    /// Build a real QUIC Initial packet carrying the given CRYPTO fragments,
+    /// protected with the Initial keys of the given version. The datagram is
+    /// padded to 1200 bytes like a conforming client (RFC 9000 Section 14.1).
+    fn build_initial_packet(
+        wire_version: u32,
+        rustls_version: rustls::quic::Version,
+        dcid: &[u8],
+        packet_number: u64,
+        crypto_fragments: &[(u64, &[u8])],
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for (offset, data) in crypto_fragments {
+            payload.push(FRAME_TYPE_CRYPTO);
+            payload.extend_from_slice(&encode_varint(*offset));
+            payload.extend_from_slice(&encode_varint(data.len() as u64));
+            payload.extend_from_slice(data);
+        }
 
-        let dcid = b"rfor-test-dcid";
         let scid = b"src";
         let keys = TLS13_AES_128_GCM_SHA256
             .tls13()
@@ -870,8 +936,7 @@ mod tests {
         // Long header with a 4-byte packet number: 0xc0 sets the long header,
         // fixed bit and Initial type, 0x03 encodes pn_len - 1.
         let first_byte = 0xc3u8;
-        let pn = [0u8; 4];
-        let packet_number = 0u64;
+        let pn = (packet_number as u32).to_be_bytes();
         let mut header = vec![first_byte];
         header.extend_from_slice(&wire_version.to_be_bytes());
         header.push(dcid.len() as u8);
@@ -879,10 +944,19 @@ mod tests {
         header.push(scid.len() as u8);
         header.extend_from_slice(scid);
         header.extend_from_slice(&encode_varint(0)); // token length
+        // The length field is a 2-byte varint for our sizes (< 16384).
+        let hdr_len = header.len() + 2;
+
+        // Pad with PADDING frames so the datagram reaches 1200 bytes.
+        let min_payload = MIN_CLIENT_INITIAL_DATAGRAM - hdr_len - pn.len() - 16;
+        if payload.len() < min_payload {
+            payload.resize(min_payload, FRAME_TYPE_PADDING);
+        }
+
         // Length covers the packet number and the protected payload (with tag).
         header.extend_from_slice(&encode_varint((pn.len() + payload.len() + 16) as u64));
 
-        let mut ciphertext = payload.clone();
+        let mut ciphertext = payload;
         let tag = keys
             .local
             .packet
@@ -894,7 +968,6 @@ mod tests {
             .unwrap();
         ciphertext.extend_from_slice(tag.as_ref());
 
-        let hdr_len = header.len();
         let mut packet = header;
         packet.extend_from_slice(&pn);
         packet.extend_from_slice(&ciphertext);
@@ -915,11 +988,21 @@ mod tests {
     }
 
     fn assert_initial_sni(wire_version: u32, rustls_version: rustls::quic::Version, host: &str) {
-        let packet = build_initial_packet(wire_version, rustls_version, host);
+        let hello = client_hello(host);
+        let packet = build_initial_packet(
+            wire_version,
+            rustls_version,
+            b"rfor-test-dcid",
+            0,
+            &[(0, hello.as_slice())],
+        );
         let mut aggregator = QuicSniAggregator::new();
         match aggregator.process_packet(&packet) {
             QuicParseResult::Success(parsed) => assert_eq!(parsed, host),
-            other => panic!("expected SNI for QUIC version {:#x}, got {:?}", wire_version, other),
+            other => panic!(
+                "expected SNI for QUIC version {:#x}, got {:?}",
+                wire_version, other
+            ),
         }
     }
 
@@ -933,5 +1016,51 @@ mod tests {
         // QUIC v2 (RFC 9369) uses a different initial salt and HKDF labels;
         // deriving keys as v1 must not accidentally succeed here.
         assert_initial_sni(VERSION2, rustls::quic::Version::V2, "v2.example.com");
+    }
+
+    #[test]
+    fn test_parse_client_hello_fragmented_across_initials() {
+        let host = "fragmented.example.com";
+        let hello = client_hello(host);
+        let split_at = hello.len() / 2;
+        let dcid = b"fragmented-dcid";
+
+        let mut aggregator = QuicSniAggregator::new();
+        let first = build_initial_packet(
+            VERSION1,
+            rustls::quic::Version::V1,
+            dcid,
+            0,
+            &[(0, &hello[..split_at])],
+        );
+        assert!(matches!(
+            aggregator.process_packet(&first),
+            QuicParseResult::NeedMoreData(_)
+        ));
+
+        // The second packet of the same connection reuses the keys derived
+        // for the first one.
+        let second = build_initial_packet(
+            VERSION1,
+            rustls::quic::Version::V1,
+            dcid,
+            1,
+            &[(split_at as u64, &hello[split_at..])],
+        );
+        match aggregator.process_packet(&second) {
+            QuicParseResult::Success(parsed) => assert_eq!(parsed, host),
+            other => panic!("expected SNI from fragmented ClientHello, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_rejects_undersized_initial_before_key_derivation() {
+        // A conforming client pads Initial datagrams to 1200 bytes; anything
+        // smaller is rejected before touching HKDF/AES.
+        let tiny = [0xc3u8; 100];
+        assert!(matches!(
+            parse_initial_header(&tiny),
+            Err(QuicParseError::NotInitialPacket)
+        ));
     }
 }
