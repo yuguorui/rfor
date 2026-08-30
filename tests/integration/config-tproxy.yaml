@@ -1,12 +1,12 @@
 debug: false
 disable-ipv6: true
 tproxy-listen: 0.0.0.0:15080
-udp-enabled: false
+udp-enabled: true
 
 traffic-intercept:
   mode: tproxy
   local-traffic: true
-  ports: ["18080-18081"]
+  ports: ["18080-18081", "443"]
   tproxy-proxy-chain: rfor-it-proxy
   tproxy-mark-chain: rfor-it-mark
   rule-table: 66
@@ -17,4 +17,5 @@ outbounds:
 
 rules:
   - DOMAIN,split.test,DIRECT
+  - DOMAIN,quic.test,DIRECT
   - DEFAULT,,PROXY

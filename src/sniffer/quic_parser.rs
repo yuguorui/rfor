@@ -1063,4 +1063,46 @@ mod tests {
             Err(QuicParseError::NotInitialPacket)
         ));
     }
+    /// Captured from the independent python-cryptography crafter in
+    /// tests/integration/quic_sni.py (SNI quic-python-vector.test).
+    const PYTHON_CRAFTED_INITIAL: &str = concat!(
+        "c8000000010d72666f722d6532652d64636964036532650044962cc24db3f1d2142af6988bb83f4778c4bbb42287041856aaebea4a17af2c68b399e0",
+        "d163476151b0a846937081b85a8d6d80939c4ae9328291ccb2d0972b024158460db72b6b0ab93ac34906db5b20968f2d0adb8ca4e1b4d8fb530171d2",
+        "5a02e039fb11a2f94214aebb7da6b0c1dfedbaa2e63e37dfb23fdd53cea121797427b2ddd7d230fc1ff2b13b1e0048f1ef166e780ff73a26ac92a326",
+        "1e5b362cc5ce5e9654ebdd0af7465cf0f6868a91c201010d2a102518d434841657bbbaf521d9a69d839881422b85676b42d7d09e520d0867392cbbd6",
+        "6d430d1f8098d295e1da181fffe6a3356a99b4c7aa7b21bd40b0000d93bc1c563cfae4c47f540e737fb56137ed36ade957d43df6c360d366010340d5",
+        "5da4a07f7b018d355801f98e0f25dee39fa9f5d744f5a13cd26032d711b17fb529f3e4419c4cc2ec0420343e99164e2b6c53d5375a19e9257b7de98f",
+        "becf4edb50a095e6255dbbffd5aa405cc630235568ed7e1bf25da614fd3ae9d95ed057313d2290acf250446547396d523102902a65118819bac208cc",
+        "daf1ae0cf30767aba3bb29e89cb5bf193eb25bb4056cd80cea559accf9dda4f19da801b021c9376f75869bba16d75b2403ef715fc6ea95dc0b820778",
+        "337ebfd65951493663464a274d71e69825a8e19c97caffd7b49f8ece92c4f4ecae081383917128d35245d5da15522629d8a2c531c33636b45339baa5",
+        "001a8ff0d16678f39263a475fde4cf6ca1b7a68a80e45991197d4e93bc86708266b59b2c407b37d24567a62a282370d6440553f3354b86d9dcf4d9ff",
+        "234e768c3faf6cd5cb8a0a3ccd860dd15c76848e9d7556bb66cc91302209198e4f07181b393d9f85975ed28b09c69f9a28ddef9b634b868fbfc64f08",
+        "cfad284e06a47a6a062c1b213597d9cef29a97a65ad23ae55561eeb05811b933cdab1b1313d6ba0ced818c16102eb2dd94112e933b6f0c00aff20473",
+        "5d9d4361d3201f38aa0265904041ac06bd485781a394b658cc353ebdfab72564bfd2b2a740eedb6ec6aef847dd3e79688d65715f3c5302f611177d92",
+        "0304cf484800b49fff5e8d580590a4d39587927a4aa2319138e8f25731834d4c67f55deddee597229e42e5905064e1a63d05191a8fa9d370bc42ad18",
+        "93a05c8c2ee31cd8f374f62c050ac853ad7d0a47dd59847defbb33a87d35bea74e23070ff2a157bf379ca26c7847eada4b851cb7dd4565f0a817628e",
+        "965598841b8ed96f9bfba2a7a8176b064135d0de080e8a123ff454b6f2b8ad42f43bc17b2df36fd7bd411bf74065b26ad5060466c4070ac6cdbda869",
+        "5bcce8bb18fa47c7beaae4bad086b9ca6b89f958fb11f81cb42a075de2a4278c864fa85e3b31bfd415d422eea351cb7270192ec5ab5ba97e557b822e",
+        "4e4aebb09fba46df295279b0355f6b5400176e039bf65786368f0bb10e27a7b6ec1376f3a81c1f02080f245c46d32780b0cdd957863906d9ebb7bf6f",
+        "4c6865bf3fb4675534841e5a4116e3bdb9b2db2a03d343337e0ef89d1d3f59970f426e0fc8af0d2bb60f32d6b630c63969d5ba7deff5e7f928bceb0e",
+        "d03a0190b80405ef53dd30c26b1079383aae702c92f5ab94314b7de2186ac5ca5d2fe141b9f963e1e3a08c4e2b234d200379ffcd1f7200d3d3c48fa8",
+    );
+
+    #[test]
+    fn test_parse_python_crafted_initial() {
+        // Cross-implementation vector: the packet was produced by the
+        // independent RFC 9001 crafter in tests/integration/quic_sni.py,
+        // so a salt, label or header protection mistake on either side
+        // fails here.
+        let packet: Vec<u8> = (0..PYTHON_CRAFTED_INITIAL.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&PYTHON_CRAFTED_INITIAL[i..i + 2], 16).unwrap())
+            .collect();
+        let mut aggregator = QuicSniAggregator::new();
+        match aggregator.process_packet(&packet) {
+            QuicParseResult::Success(host) => assert_eq!(host, "quic-python-vector.test"),
+            other => panic!("expected SNI from python-crafted Initial, got {:?}", other),
+        }
+    }
 }
+

@@ -134,6 +134,12 @@ PY
         fail "unexpected server-first response: ${body}"
 }
 
+assert_quic_sni_routing() {
+    python3 /integration/quic_sni.py "$ORIGIN_HOST" 443 quic.test ||
+        fail "failed to send crafted QUIC Initial"
+    wait_for_log '-> quic.test:443 ([::ffff:198.18.0.10]:443) -> Outbound(DIRECT)'
+}
+
 stop_rfor() {
     local mode=$1
     kill -TERM "$RFOR_PID"
@@ -212,6 +218,7 @@ run_tproxy_test() {
     assert_http_forwarding
     assert_timed_http_forwarding
     assert_server_first_forwarding
+    assert_quic_sni_routing
     grep --quiet 'TPROXY:' "$RFOR_LOG" || fail 'TPROXY traffic was not observed in the route log'
     assert_not_reconciled TPROXY mangle rfor-it-mark
     stop_rfor TPROXY

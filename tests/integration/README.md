@@ -14,7 +14,10 @@ network with three containers:
 - a privileged test container that installs real iptables and policy routes.
 
 Both TPROXY and REDIRECT modes are exercised. Each phase verifies transparent
-HTTP forwarding, server-first forwarding, concurrent connections during
-SIGHUP reloads, absence of periodic rule reconstruction, and complete rule
-cleanup after SIGTERM. Runtime traffic stays inside the Docker network.
+HTTP forwarding, fragmented and server-first TCP forwarding, absence of
+periodic rule reconstruction, and complete rule cleanup after SIGTERM. The
+TPROXY phase additionally routes a QUIC Initial packet crafted by an
+independent RFC 9001 implementation (quic_sni.py, python-cryptography) and
+checks that its SNI drives the domain rule. Runtime traffic stays inside the
+Docker network.
 

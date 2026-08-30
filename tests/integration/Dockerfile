@@ -24,7 +24,8 @@ RUN apt-get update && \
         iproute2 \
         iptables \
         netcat-openbsd \
-        python3 && \
+        python3 \
+        python3-cryptography && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /tmp/rfor /usr/local/bin/rfor
