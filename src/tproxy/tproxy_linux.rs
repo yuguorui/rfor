@@ -483,13 +483,13 @@ const QUIC_SNI_AGGREGATION_TIMEOUT_MS: u64 = 300;
 /// wait for additional packets and aggregate CRYPTO frames to extract the SNI.
 ///
 /// Returns:
-/// - The parsed hostname (if found)
+/// - The sniffed host and protocol (if found)
 /// - A vector of all buffered packets that should be forwarded
 async fn sniff_host_with_quic_aggregation(
     packet_rx: &mut mpsc::Receiver<bytes::Bytes>,
     target_port: u16,
-) -> (Option<String>, Vec<bytes::Bytes>) {
-    use crate::sniffer::{QuicParseResult, QuicSniAggregator};
+) -> (Option<crate::sniffer::SniffedHost>, Vec<bytes::Bytes>) {
+    use crate::sniffer::{QuicParseResult, QuicSniAggregator, SniffedHost, SniffedProtocol};
 
     let mut buffered_packets = Vec::new();
 
@@ -508,14 +508,20 @@ async fn sniff_host_with_quic_aggregation(
     if target_port == 53 {
         if let Some(host) = crate::sniffer::dns_parse::parse_host(&init_packet) {
             debug!("DNS query domain parsed from first packet: {}", host);
-            return (Some(host), buffered_packets);
+            return (
+                Some(SniffedHost {
+                    host,
+                    protocol: Some(SniffedProtocol::Dns),
+                }),
+                buffered_packets,
+            );
         }
     }
 
     let mut aggregator = QuicSniAggregator::new();
     match aggregator.process_packet(&init_packet) {
         QuicParseResult::Success(host) => {
-            debug!("QUIC SNI parsed from first packet: {}", host);
+            debug!("QUIC SNI parsed from first packet: {}", host.host);
             return (Some(host), buffered_packets);
         }
         QuicParseResult::NeedMoreData(dest_cid) => {
@@ -530,7 +536,13 @@ async fn sniff_host_with_quic_aggregation(
             // Not a valid QUIC Initial packet, or parsing failed.
             // Fallback to legacy parsers for HTTP/TLS (e.g. DTLS or other UDP protocols)
             if let Some(host) = crate::sniffer::parse_host(&init_packet) {
-                return (Some(host), buffered_packets);
+                return (
+                    Some(SniffedHost {
+                        host,
+                        protocol: None,
+                    }),
+                    buffered_packets,
+                );
             }
             return (None, buffered_packets);
         }
@@ -559,7 +571,7 @@ async fn sniff_host_with_quic_aggregation(
                         debug!(
                             "QUIC SNI parsed after {} packets: {}",
                             buffered_packets.len(),
-                            host
+                            host.host
                         );
                         return (Some(host), buffered_packets);
                     }
@@ -622,10 +634,11 @@ async fn relay_udp_packet(
         return Ok(());
     }
 
+    let sniffed_proto = host.as_ref().and_then(|h| h.protocol);
     let dst_addr = match host {
         None => crate::rules::TargetAddr::Ip(target_sockaddr),
         Some(host) => {
-            crate::rules::TargetAddr::Domain(host, target_sockaddr.port(), Some(target_sockaddr))
+            crate::rules::TargetAddr::Domain(host.host, target_sockaddr.port(), Some(target_sockaddr))
         }
     };
 
@@ -638,6 +651,7 @@ async fn relay_udp_packet(
             dst_addr: dst_addr.clone(),
             inbound_proto: Some(crate::rules::InboundProtocol::TPROXY),
             socket_type: crate::rules::SocketType::DGRAM,
+            sniffed_proto,
         })
         .await
     {
@@ -941,16 +955,22 @@ async fn handle_tcp(
     let Some(sniffed) = crate::sniffer::sniff_tcp(inbound).await? else {
         return Ok(());
     };
-    let mut domain = sniffed.host.filter(|s| is_valid_domain(s.as_str()));
+    let mut domain = sniffed.host.filter(|s| is_valid_domain(s.host.as_str()));
 
     // DNS-over-TCP: sniff the queried domain so DNS traffic can be routed
     // with the regular domain rules.
     if domain.is_none() && inbound.local_addr()?.port() == 53 {
         domain = crate::sniffer::dns_parse::parse_host_tcp(&sniffed.data)
-            .filter(|s| is_valid_domain(s.as_str()));
+            .filter(|s| is_valid_domain(s.as_str()))
+            .map(|host| crate::sniffer::SniffedHost {
+                host,
+                protocol: Some(crate::sniffer::SniffedProtocol::Dns),
+            });
     }
+
+    let sniffed_proto = domain.as_ref().and_then(|d| d.protocol);
     let target_addr = match domain {
-        Some(domain) => TargetAddr::Domain(domain, local_addr.port(), Some(local_addr)),
+        Some(domain) => TargetAddr::Domain(domain.host, local_addr.port(), Some(local_addr)),
         None => TargetAddr::Ip(local_addr),
     };
 
@@ -959,6 +979,7 @@ async fn handle_tcp(
         dst_addr: target_addr,
         inbound_proto: Some(InboundProtocol::TPROXY),
         socket_type: crate::rules::SocketType::STREAM,
+        sniffed_proto,
     };
 
     transfer_tcp_with_initial_data(inbound, rt_context.to_owned(), sniffed.data)

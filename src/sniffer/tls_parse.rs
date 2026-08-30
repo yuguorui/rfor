@@ -10,7 +10,7 @@ const TLS_CLIENT_HELLO_TYPE: u8 = 1;
 
 pub fn parse_host(remaining: &[u8]) -> Option<String> {
     match parse_host_result(remaining) {
-        HostParseResult::Found(host) => Some(host),
+        HostParseResult::Found(host) => Some(host.host),
         HostParseResult::NeedMore | HostParseResult::NotProtocol => None,
     }
 }
@@ -56,7 +56,12 @@ pub fn parse_host_result(remaining: &[u8]) -> HostParseResult {
             if handshake.len() >= message_len {
                 return match parse_tls_message_handshake(&handshake[..message_len]) {
                     Ok((_remaining, msg)) => parse_tls_msg(&msg)
-                        .map(HostParseResult::Found)
+                        .map(|host| {
+                            HostParseResult::Found(super::SniffedHost {
+                                host,
+                                protocol: Some(super::SniffedProtocol::Tls),
+                            })
+                        })
                         .unwrap_or(HostParseResult::NotProtocol),
                     Err(_) => HostParseResult::NotProtocol,
                 };
@@ -134,7 +139,10 @@ mod tests {
         );
         assert_eq!(
             parse_host_result(&hello),
-            HostParseResult::Found("fragmented.example".to_string())
+            HostParseResult::Found(crate::sniffer::SniffedHost {
+                host: "fragmented.example".to_string(),
+                protocol: Some(crate::sniffer::SniffedProtocol::Tls),
+            })
         );
     }
 
@@ -143,7 +151,10 @@ mod tests {
         let hello = client_hello("records.example");
         assert_eq!(
             parse_host_result(&split_record(&hello)),
-            HostParseResult::Found("records.example".to_string())
+            HostParseResult::Found(crate::sniffer::SniffedHost {
+                host: "records.example".to_string(),
+                protocol: Some(crate::sniffer::SniffedProtocol::Tls),
+            })
         );
     }
 }

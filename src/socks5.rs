@@ -57,6 +57,7 @@ async fn socks5_instance(socket: TcpStream) -> Result<()> {
                     dst_addr: crate::rules::TargetAddr::Ip(sock_addr.to_owned()),
                     inbound_proto: Some(InboundProtocol::SOCKS5),
                     socket_type: crate::rules::SocketType::STREAM,
+                    sniffed_proto: None,
                 },
                 fast_socks5::util::target_addr::TargetAddr::Domain(domain, port) => RouteContext {
                     src_addr: src_addr,
@@ -67,6 +68,7 @@ async fn socks5_instance(socket: TcpStream) -> Result<()> {
                     ),
                     inbound_proto: Some(InboundProtocol::SOCKS5),
                     socket_type: crate::rules::SocketType::STREAM,
+                    sniffed_proto: None,
                 },
             };
 
@@ -154,6 +156,7 @@ async fn transfer_udp<T: AsyncRead + AsyncWrite + Unpin + Send>(
             dst_addr: crate::rules::TargetAddr::Ip(sock_addr.to_owned()),
             inbound_proto: Some(InboundProtocol::SOCKS5),
             socket_type: crate::rules::SocketType::DGRAM,
+            sniffed_proto: None,
         },
         fast_socks5::util::target_addr::TargetAddr::Domain(domain, port) => RouteContext {
             src_addr: client_addr,
@@ -164,6 +167,7 @@ async fn transfer_udp<T: AsyncRead + AsyncWrite + Unpin + Send>(
             ),
             inbound_proto: Some(InboundProtocol::SOCKS5),
             socket_type: crate::rules::SocketType::DGRAM,
+            sniffed_proto: None,
         },
     };
 

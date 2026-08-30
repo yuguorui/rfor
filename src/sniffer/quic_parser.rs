@@ -57,8 +57,8 @@ pub enum QuicParseError {
 /// Result of parsing a QUIC packet for SNI
 #[derive(Debug, Clone)]
 pub enum QuicParseResult {
-    /// Successfully extracted SNI hostname
-    Success(String),
+    /// Successfully extracted SNI hostname and protocol version
+    Success(super::SniffedHost),
     /// Need more packets to complete the TLS handshake
     /// Contains the destination CID for correlation
     NeedMoreData(Vec<u8>),
@@ -242,7 +242,7 @@ impl QuicSniAggregator {
     /// Process a QUIC packet and attempt to extract SNI
     ///
     /// Returns:
-    /// - `QuicParseResult::Success(hostname)` if SNI was successfully extracted
+    /// - `QuicParseResult::Success(host)` if SNI was successfully extracted
     /// - `QuicParseResult::NeedMoreData(dest_cid)` if more packets are needed
     /// - `QuicParseResult::Failed(error)` if parsing failed permanently
     pub fn process_packet(&mut self, packet: &[u8]) -> QuicParseResult {
@@ -304,7 +304,10 @@ impl QuicSniAggregator {
                 Ok(hostname) => {
                     // Success! Remove this connection from tracking
                     self.connections.remove(&dest_cid);
-                    return Ok(QuicParseResult::Success(hostname));
+                    return Ok(QuicParseResult::Success(super::SniffedHost {
+                        host: hostname,
+                        protocol: Some(header.protocol),
+                    }));
                 }
                 Err(QuicParseError::InsufficientData) | Err(QuicParseError::TlsParseError) => {
                     // Need more data - check if we're missing data from the start
@@ -352,6 +355,7 @@ struct InitialHeader {
     dest_conn_id: Vec<u8>,
     src_conn_id: Vec<u8>,
     rustls_version: rustls::quic::Version,
+    protocol: super::SniffedProtocol,
     /// Offset of the packet number field within the packet
     hdr_len: usize,
     /// Value of the length field: packet number + payload + tag
@@ -364,13 +368,17 @@ struct CryptoFrame {
     data: Vec<u8>,
 }
 
-/// Map QUIC wire version to rustls version
-fn version_to_rustls(version: u32) -> Option<rustls::quic::Version> {
+/// Map QUIC wire version to the rustls version and the protocol tag used
+/// in route logs
+fn classify_version(version: u32) -> Option<(rustls::quic::Version, super::SniffedProtocol)> {
     match version {
-        VERSION_DRAFT23..=VERSION_DRAFT29 => Some(rustls::quic::Version::V1Draft),
-        VERSION1 => Some(rustls::quic::Version::V1),
+        VERSION_DRAFT23..=VERSION_DRAFT29 => Some((
+            rustls::quic::Version::V1Draft,
+            super::SniffedProtocol::QuicDraft,
+        )),
+        VERSION1 => Some((rustls::quic::Version::V1, super::SniffedProtocol::QuicV1)),
         // QUIC v2 has its own initial salt and HKDF labels (RFC 9369 Section 3)
-        VERSION2 => Some(rustls::quic::Version::V2),
+        VERSION2 => Some((rustls::quic::Version::V2, super::SniffedProtocol::QuicV2)),
         _ => None,
     }
 }
@@ -461,7 +469,7 @@ fn parse_initial_header(remaining: &[u8]) -> Result<InitialHeader, QuicParseErro
     let version_number = u32::from_be_bytes(version_bytes);
 
     // Validate version is supported
-    let rustls_version = version_to_rustls(version_number)
+    let (rustls_version, protocol) = classify_version(version_number)
         .ok_or(QuicParseError::UnsupportedVersion(version_number))?;
 
     debug!("QUIC version: {:#x}", version_number);
@@ -510,6 +518,7 @@ fn parse_initial_header(remaining: &[u8]) -> Result<InitialHeader, QuicParseErro
         dest_conn_id,
         src_conn_id,
         rustls_version,
+        protocol,
         hdr_len,
         packet_len,
     })
@@ -522,7 +531,6 @@ fn decrypt_initial_payload(
     remaining: &[u8],
     header: &InitialHeader,
 ) -> Result<Vec<CryptoFrame>, QuicParseError> {
-    use byteorder::ReadBytesExt;
     use std::io::Read;
 
     let hdr_len = header.hdr_len;
@@ -721,7 +729,7 @@ fn try_parse_sni(crypto_data: &[u8]) -> Result<String, QuicParseError> {
 pub fn parse_host(remaining: &[u8]) -> Option<String> {
     let mut aggregator = QuicSniAggregator::new();
     match aggregator.process_packet(remaining) {
-        QuicParseResult::Success(host) => Some(host),
+        QuicParseResult::Success(host) => Some(host.host),
         QuicParseResult::NeedMoreData(_) => {
             debug!("QUIC SNI parsing needs more packets (single-packet API)");
             None
@@ -987,7 +995,12 @@ mod tests {
         packet
     }
 
-    fn assert_initial_sni(wire_version: u32, rustls_version: rustls::quic::Version, host: &str) {
+    fn assert_initial_sni(
+        wire_version: u32,
+        rustls_version: rustls::quic::Version,
+        protocol: crate::sniffer::SniffedProtocol,
+        host: &str,
+    ) {
         let hello = client_hello(host);
         let packet = build_initial_packet(
             wire_version,
@@ -998,7 +1011,10 @@ mod tests {
         );
         let mut aggregator = QuicSniAggregator::new();
         match aggregator.process_packet(&packet) {
-            QuicParseResult::Success(parsed) => assert_eq!(parsed, host),
+            QuicParseResult::Success(parsed) => {
+                assert_eq!(parsed.host, host);
+                assert_eq!(parsed.protocol, Some(protocol));
+            }
             other => panic!(
                 "expected SNI for QUIC version {:#x}, got {:?}",
                 wire_version, other
@@ -1008,14 +1024,24 @@ mod tests {
 
     #[test]
     fn test_parse_quic_v1_initial_sni() {
-        assert_initial_sni(VERSION1, rustls::quic::Version::V1, "v1.example.com");
+        assert_initial_sni(
+            VERSION1,
+            rustls::quic::Version::V1,
+            crate::sniffer::SniffedProtocol::QuicV1,
+            "v1.example.com",
+        );
     }
 
     #[test]
     fn test_parse_quic_v2_initial_sni() {
         // QUIC v2 (RFC 9369) uses a different initial salt and HKDF labels;
         // deriving keys as v1 must not accidentally succeed here.
-        assert_initial_sni(VERSION2, rustls::quic::Version::V2, "v2.example.com");
+        assert_initial_sni(
+            VERSION2,
+            rustls::quic::Version::V2,
+            crate::sniffer::SniffedProtocol::QuicV2,
+            "v2.example.com",
+        );
     }
 
     #[test]
@@ -1048,7 +1074,10 @@ mod tests {
             &[(split_at as u64, &hello[split_at..])],
         );
         match aggregator.process_packet(&second) {
-            QuicParseResult::Success(parsed) => assert_eq!(parsed, host),
+            QuicParseResult::Success(parsed) => {
+                assert_eq!(parsed.host, host);
+                assert_eq!(parsed.protocol, Some(crate::sniffer::SniffedProtocol::QuicV1));
+            }
             other => panic!("expected SNI from fragmented ClientHello, got {:?}", other),
         }
     }
@@ -1100,7 +1129,10 @@ mod tests {
             .collect();
         let mut aggregator = QuicSniAggregator::new();
         match aggregator.process_packet(&packet) {
-            QuicParseResult::Success(host) => assert_eq!(host, "quic-python-vector.test"),
+            QuicParseResult::Success(host) => {
+                assert_eq!(host.host, "quic-python-vector.test");
+                assert_eq!(host.protocol, Some(crate::sniffer::SniffedProtocol::QuicV1));
+            }
             other => panic!("expected SNI from python-crafted Initial, got {:?}", other),
         }
     }

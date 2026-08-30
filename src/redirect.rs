@@ -79,7 +79,7 @@ mod linux_impl {
         let Some(sniffed) = crate::sniffer::sniff_tcp(inbound).await? else {
             return Ok(());
         };
-        let mut domain = sniffed.host.filter(|s| is_valid_domain(s.as_str()));
+        let mut domain = sniffed.host.filter(|s| is_valid_domain(s.host.as_str()));
 
         let origin_addr = match peer_addr {
             SocketAddr::V4(v4) => SocketAddr::V4(v4),
@@ -119,11 +119,16 @@ mod linux_impl {
         // with the regular domain rules.
         if domain.is_none() && origin_addr.port() == 53 {
             domain = crate::sniffer::dns_parse::parse_host_tcp(&sniffed.data)
-                .filter(|s| is_valid_domain(s.as_str()));
+                .filter(|s| is_valid_domain(s.as_str()))
+                .map(|host| crate::sniffer::SniffedHost {
+                    host,
+                    protocol: Some(crate::sniffer::SniffedProtocol::Dns),
+                });
         }
 
+        let sniffed_proto = domain.as_ref().and_then(|d| d.protocol);
         let target_addr = match domain {
-            Some(domain) => TargetAddr::Domain(domain, origin_addr.port(), Some(origin_addr)),
+            Some(domain) => TargetAddr::Domain(domain.host, origin_addr.port(), Some(origin_addr)),
             None => TargetAddr::Ip(origin_addr),
         };
 
@@ -132,6 +137,7 @@ mod linux_impl {
             dst_addr: target_addr,
             inbound_proto: Some(InboundProtocol::REDIRECT),
             socket_type: crate::rules::SocketType::STREAM,
+            sniffed_proto,
         };
 
         transfer_tcp_with_initial_data(inbound, rt_context.to_owned(), sniffed.data)

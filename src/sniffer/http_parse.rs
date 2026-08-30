@@ -116,7 +116,7 @@ pub fn request(input: &[u8]) -> IResult<&[u8], (Request<'_>, Vec<Header<'_>>)> {
 
 pub fn parse_host(remaining: &[u8]) -> Option<String> {
     match parse_host_result(remaining) {
-        HostParseResult::Found(host) => Some(host),
+        HostParseResult::Found(host) => Some(host.host),
         HostParseResult::NeedMore | HostParseResult::NotProtocol => None,
     }
 }
@@ -134,7 +134,12 @@ pub fn parse_host_result(remaining: &[u8]) -> HostParseResult {
                             .collect(),
                     )
                     .map(|value| value.trim().split(':').next().unwrap_or("").to_owned())
-                    .map(HostParseResult::Found)
+                    .map(|host| {
+                        HostParseResult::Found(super::SniffedHost {
+                            host,
+                            protocol: Some(super::SniffedProtocol::Http),
+                        })
+                    })
                     .unwrap_or(HostParseResult::NotProtocol);
                 }
             }
@@ -191,7 +196,10 @@ User-Agent: just/testing
         );
         assert_eq!(
             parse_host_result(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
-            HostParseResult::Found("example.com".to_string())
+            HostParseResult::Found(crate::sniffer::SniffedHost {
+                host: "example.com".to_string(),
+                protocol: Some(crate::sniffer::SniffedProtocol::Http),
+            })
         );
     }
 

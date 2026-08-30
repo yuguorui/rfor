@@ -110,10 +110,10 @@ for initial_delay, fragments in cases:
         if body != expected:
             raise RuntimeError(f"unexpected response body: {body!r}")
 PY
-    wait_for_log_after '-> split.test:18080 (198.18.0.10:18080) -> Outbound(DIRECT)' "$first_line"
+    wait_for_log_after '-> split.test:18080 (198.18.0.10:18080) [http] -> Outbound(DIRECT)' "$first_line"
     wait_for_log_after '-> 198.18.0.10:18080 -> Outbound(PROXY)' "$first_line"
     direct_count=$(tail -n "+${first_line}" "$RFOR_LOG" 2>/dev/null |
-        grep --fixed-strings --count -- '-> split.test:18080 (198.18.0.10:18080) -> Outbound(DIRECT)' || true)
+        grep --fixed-strings --count -- '-> split.test:18080 (198.18.0.10:18080) [http] -> Outbound(DIRECT)' || true)
     [[ $direct_count -eq 3 ]] ||
         fail "expected three domain-routed timed requests, observed ${direct_count}"
 }
@@ -137,7 +137,7 @@ PY
 assert_quic_sni_routing() {
     python3 /integration/quic_sni.py "$ORIGIN_HOST" 443 quic.test ||
         fail "failed to send crafted QUIC Initial"
-    wait_for_log '-> quic.test:443 ([::ffff:198.18.0.10]:443) -> Outbound(DIRECT)'
+    wait_for_log '-> quic.test:443 ([::ffff:198.18.0.10]:443) [quic-v1] -> Outbound(DIRECT)'
 }
 
 stop_rfor() {

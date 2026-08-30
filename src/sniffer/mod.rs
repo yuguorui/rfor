@@ -13,15 +13,47 @@ use tokio::time::{timeout_at, Instant};
 const TCP_SNIFF_TIMEOUT: Duration = Duration::from_millis(500);
 const TCP_SNIFF_MAX_BYTES: usize = 32 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SniffedProtocol {
+    Dns,
+    Http,
+    Tls,
+    QuicV1,
+    QuicV2,
+    QuicDraft,
+}
+
+impl std::fmt::Display for SniffedProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            SniffedProtocol::Dns => "dns",
+            SniffedProtocol::Http => "http",
+            SniffedProtocol::Tls => "tls",
+            SniffedProtocol::QuicV1 => "quic-v1",
+            SniffedProtocol::QuicV2 => "quic-v2",
+            SniffedProtocol::QuicDraft => "quic-draft",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Host and protocol identified by sniffing. The protocol is None when the
+/// legacy parsers matched and cannot attribute it reliably.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SniffedHost {
+    pub host: String,
+    pub protocol: Option<SniffedProtocol>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum HostParseResult {
-    Found(String),
+    Found(SniffedHost),
     NeedMore,
     NotProtocol,
 }
 
 pub struct SniffedTcp {
-    pub host: Option<String>,
+    pub host: Option<SniffedHost>,
     pub data: Vec<u8>,
 }
 
@@ -149,7 +181,9 @@ mod tests {
             .unwrap();
         writer.await.unwrap();
 
-        assert_eq!(sniffed.host.as_deref(), Some("split.example"));
+        let host = sniffed.host.unwrap();
+        assert_eq!(host.host, "split.example");
+        assert_eq!(host.protocol, Some(SniffedProtocol::Http));
         assert_eq!(sniffed.data, [first.as_slice(), second.as_slice()].concat());
     }
 
@@ -167,7 +201,9 @@ mod tests {
             .unwrap();
         writer.await.unwrap();
 
-        assert_eq!(sniffed.host.as_deref(), Some("delayed.example"));
+        let host = sniffed.host.unwrap();
+        assert_eq!(host.host, "delayed.example");
+        assert_eq!(host.protocol, Some(SniffedProtocol::Http));
         assert_eq!(sniffed.data, request);
     }
 

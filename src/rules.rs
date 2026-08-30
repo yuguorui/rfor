@@ -186,6 +186,8 @@ pub struct RouteContext {
     pub dst_addr: TargetAddr,
     pub inbound_proto: Option<InboundProtocol>,
     pub socket_type: SocketType,
+    /// Application protocol identified by payload sniffing, shown in logs
+    pub sniffed_proto: Option<crate::sniffer::SniffedProtocol>,
 }
 
 impl Display for RouteContext {
@@ -199,7 +201,11 @@ impl Display for RouteContext {
             self.src_addr,
             self.socket_type,
             self.dst_addr
-        )
+        )?;
+        if let Some(proto) = self.sniffed_proto {
+            write!(f, " [{}]", proto)?;
+        }
+        Ok(())
     }
 }
 
