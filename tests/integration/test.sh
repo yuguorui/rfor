@@ -136,8 +136,11 @@ PY
 
 assert_quic_sni_routing() {
     python3 /integration/quic_sni.py "$ORIGIN_HOST" 443 quic.test ||
-        fail "failed to send crafted QUIC Initial"
+        fail "failed to send crafted QUIC v1 Initial"
     wait_for_log '-> quic.test:443 ([::ffff:198.18.0.10]:443) [quic-v1] -> Outbound(DIRECT)'
+    python3 /integration/quic_sni.py "$ORIGIN_HOST" 443 quic-v2.test v2 ||
+        fail "failed to send crafted QUIC v2 Initial"
+    wait_for_log '-> quic-v2.test:443 ([::ffff:198.18.0.10]:443) [quic-v2] -> Outbound(DIRECT)'
 }
 
 stop_rfor() {

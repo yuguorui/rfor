@@ -5,9 +5,11 @@ sniffing end to end.
 This is intentionally independent of rfor's rustls-based parser: the
 Initial secrets, AEAD and header protection are derived here with
 python-cryptography, following RFC 9001 Section 5 and RFC 9001
-Appendix A.1 (AES header protection sample).
+Appendix A.1 (AES header protection sample). QUIC v2 support follows
+RFC 9369 / draft-ietf-quic-v2 Section 3 (own initial salt and HKDF
+labels).
 
-Usage: quic_sni.py <target-ip> <target-port> <sni-host>
+Usage: quic_sni.py <target-ip> <target-port> <sni-host> [v1|v2]
 """
 
 import socket
@@ -18,8 +20,17 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 
-INITIAL_SALT_V1 = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
-QUIC_V1 = 1
+# RFC 9001 Section 5.2 / RFC 9369 Section 3 (draft-ietf-quic-v2).
+INITIAL_SALT = {
+    1: bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a"),
+    2: bytes.fromhex("0dede3def700a6db819381be6e269dcbf9bd2ed9"),
+}
+WIRE_VERSION = {1: 0x00000001, 2: 0x6B3343CF}
+# rustls and RFC 9369 both still wrap these labels with the "tls13 "
+# prefix inside hkdf_expand_label.
+KEY_LABELS = {1: b"quic key", 2: b"quicv2 key"}
+IV_LABELS = {1: b"quic iv", 2: b"quicv2 iv"}
+HP_LABELS = {1: b"quic hp", 2: b"quicv2 hp"}
 AES_GCM_TAG_LEN = 16
 MIN_INITIAL_DATAGRAM = 1200
 
@@ -36,20 +47,20 @@ def hkdf_expand_label(secret, label, context, length):
     return HKDFExpand(algorithm=hashes.SHA256(), length=length, info=hkdf_label).derive(secret)
 
 
-def initial_keys(dcid):
+def initial_keys(dcid, version):
     # HKDF-Extract only (RFC 5869 Section 2.2): PRK = HMAC-Hash(salt, IKM).
     # cryptography's HKDF would also apply the expand step, which RFC 9001
     # does not want here.
-    extract = hmac.HMAC(INITIAL_SALT_V1, hashes.SHA256())
+    extract = hmac.HMAC(INITIAL_SALT[version], hashes.SHA256())
     extract.update(dcid)
     initial_secret = extract.finalize()
     client_secret = hkdf_expand_label(
         initial_secret, b"client in", b"", hashes.SHA256.digest_size
     )
     return (
-        hkdf_expand_label(client_secret, b"quic key", b"", 16),
-        hkdf_expand_label(client_secret, b"quic iv", b"", 12),
-        hkdf_expand_label(client_secret, b"quic hp", b"", 16),
+        hkdf_expand_label(client_secret, KEY_LABELS[version], b"", 16),
+        hkdf_expand_label(client_secret, IV_LABELS[version], b"", 12),
+        hkdf_expand_label(client_secret, HP_LABELS[version], b"", 16),
     )
 
 
@@ -87,8 +98,8 @@ def client_hello(host):
     return bytes([1]) + len(body).to_bytes(3, "big") + body
 
 
-def build_initial(dcid, scid, hello):
-    key, iv, hp = initial_keys(dcid)
+def build_initial(dcid, scid, hello, version=1):
+    key, iv, hp = initial_keys(dcid, version)
 
     # CRYPTO frame: type 0x06, offset 0, length, data.
     payload = bytes([0x06]) + varint(0) + varint(len(hello)) + hello
@@ -97,7 +108,7 @@ def build_initial(dcid, scid, hello):
     pn = packet_number.to_bytes(4, "big")
     header = (
         bytes([0xC3])  # long header, fixed bit, Initial type, pn_len - 1 = 3
-        + QUIC_V1.to_bytes(4, "big")
+        + WIRE_VERSION[version].to_bytes(4, "big")
         + bytes([len(dcid)])
         + dcid
         + bytes([len(scid)])
@@ -128,11 +139,12 @@ def build_initial(dcid, scid, hello):
 
 def main():
     target, port, host = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-    packet = build_initial(b"rfor-e2e-dcid", b"e2e", client_hello(host))
+    version = int(sys.argv[4][1]) if len(sys.argv) > 4 else 1
+    packet = build_initial(b"rfor-e2e-dcid", b"e2e", client_hello(host), version)
     assert len(packet) >= MIN_INITIAL_DATAGRAM
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.sendto(packet, (target, port))
-    print(f"sent QUIC Initial for {host} to {target}:{port} ({len(packet)} bytes)")
+    print(f"sent QUIC v{version} Initial for {host} to {target}:{port} ({len(packet)} bytes)")
 
 
 if __name__ == "__main__":

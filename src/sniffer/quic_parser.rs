@@ -1136,5 +1136,54 @@ mod tests {
             other => panic!("expected SNI from python-crafted Initial, got {:?}", other),
         }
     }
+
+    /// Same provenance as PYTHON_CRAFTED_INITIAL, but a QUIC v2 packet
+    /// (SNI quic-v2-python-vector.test).
+    const PYTHON_CRAFTED_INITIAL_V2: &str = concat!(
+        "cf6b3343cf0d72666f722d6532652d646369640365326500449691999c0d0bd810e28fba23f75d40717e715b1c60462a",
+        "b34e4863b3996704fda61888dc66c8a0e936d713787df48dc2cd8bb625f0a46544d34b1469a5fd51f4a0e7a322d15cc3",
+        "b51af8fd74b3fb18fc47c994c09b3188f991d323a87a3c433760304c4b795d0336c17045a4919383db5f84927f41bbba",
+        "cf431c95ebe054b7ed6de18945df0659fbf1029915e91aa7777265792c146783856573dfb70c46865ac2b1c4670f7a12",
+        "1aac9361cf4532d29206f5b052bb884b47edc62ba3fa15defab29a9b9ec22d2757091194611eecd9877bdd9fd26be3c1",
+        "d289440f9c2e75dfe45eb800c41de33881f133faf6440574bd93655249f915020e32d0e26d01b8e763c9f8520f88c148",
+        "85355eb588f06ba0cdaffa6199a28d979404605e06ddd1b82db450b83bfcedf7a94408b09dec30827e83e7a90495ce6c",
+        "06a71f27f578b60bf6ec2730ec062af7d701fe7c3b34c02e89fe9c66ed9889bc04fbd401edc6f4f09129f010afc1396d",
+        "02294b3d6f8194ffbceecd2cf80a62f0c437ca59e76f64aff1463a8f570694015b0998f0b4b11838e40b5e6a0df97cd9",
+        "fee5224ea3193f3bef0fd24d2d454a533290bd09b30afdd037b436f82a832156d747d7f62590af451509f0572c813ab1",
+        "099f88325fab99ba0fc702d1005f1007d2c6a9cbe78ff17e0b45f86b40dba4d2c127468d8a1b815490cf00b2fa55ba3d",
+        "3505641d240399ebf0400b0fffb61c40d193b858390c300ce79bda0c9254886be161729bbb0b7f94874a895a8c52bf9c",
+        "e8d2089cbe9d4a0b4aa036503b03c6749e62afa116313ecef74647379b69143264ea4a48e02d684f213ba35f6664f842",
+        "2b190d1ce93c677728267ba7ed14940b08ab69a29debe533a6ed2802c2f055bb3a571c7b85a429203f327dab555d58af",
+        "8a5241443ed88a1b68b16042d767dcaafcc66d5f084c93c1dedfd766a35c66f18c9f11a60598f1cd8c3a4144bbd67468",
+        "2a7d70158592084c6749a7fe6dad82a1961424521adcb5352af95225a9e122b5184cd26ea8599b21f8f83c9679f8adf2",
+        "08212ded597b89700d561c262d738f135792cd6f2c037ffbe234e279d32f45b9c308873430a2a0a363932deffb45d332",
+        "d53842332153c54b789cc1db50bcf9f752d746250e402d61b80ab9f302bccbdc2f04cb366b6aac3ed2928986849166f0",
+        "418462aa92b6f6e39d2651c31339072b93c02f977568e8374f5a7e095470e2c12c8626b02a62af62a7e9454c65bfcb2e",
+        "1f7ed803eed9a4d3d00e179be47a99f7015a1ee39e68dea2bc763de72b33bd684a17262ccf0b8c34a9b7df0c0ef40522",
+        "9bab55371fc1344d7a3b9de19bc6fb03ca087d4e3674edede69d6671a25341a2465408d946fd115e04bfeaf75397c211",
+        "9eb1d232b534fba76e14c620e8f2f76515c813ec56067fbc46510fa5fdde3ff6ffb7fc51cb87ce681c226b464ad52110",
+        "018ccd6d4d3e38993e05d312b057cbe7a5186aa1c4294e124b1c9f6d0c458dda96fa4f9d20e8a2efd1b331d300c0c1c7",
+        "3f850890a4babe5faa294c40d00e1164d8bab676f0d6824dc8a5fb6224d908f7a2e8c7007cbd8bb4b2a87910ecff0596",
+        "5f0b97183d23b777f0f4b85571de5a173a6644b6aed9c7fd4963fd043f5f5b3535fd3b8b0e410f0cbf6f253f9430dab9",
+    );
+
+    #[test]
+    fn test_parse_python_crafted_initial_v2() {
+        // QUIC v2 cross-implementation vector: the python crafter derives
+        // keys with the RFC 9369 initial salt and "quicv2 *" HKDF labels,
+        // independently of the rustls code under test.
+        let packet: Vec<u8> = (0..PYTHON_CRAFTED_INITIAL_V2.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&PYTHON_CRAFTED_INITIAL_V2[i..i + 2], 16).unwrap())
+            .collect();
+        let mut aggregator = QuicSniAggregator::new();
+        match aggregator.process_packet(&packet) {
+            QuicParseResult::Success(host) => {
+                assert_eq!(host.host, "quic-v2-python-vector.test");
+                assert_eq!(host.protocol, Some(crate::sniffer::SniffedProtocol::QuicV2));
+            }
+            other => panic!("expected SNI from python-crafted v2 Initial, got {:?}", other),
+        }
+    }
 }
 

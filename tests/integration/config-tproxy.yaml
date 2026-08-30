@@ -18,4 +18,5 @@ outbounds:
 rules:
   - DOMAIN,split.test,DIRECT
   - DOMAIN,quic.test,DIRECT
+  - DOMAIN,quic-v2.test,DIRECT
   - DEFAULT,,PROXY
