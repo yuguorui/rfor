@@ -971,17 +971,97 @@ async fn relay_udp_packet(
     Ok(())
 }
 
+/// Compare IPv4 and IPv6 addresses using rfor's canonical IPv6 form.
+fn canonical_ipv6(ip: std::net::IpAddr) -> std::net::Ipv6Addr {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+        std::net::IpAddr::V6(ip) => ip,
+    }
+}
+
+fn is_local_ip(ip: std::net::IpAddr) -> std::io::Result<bool> {
+    use nix::sys::socket::{AddressFamily, SockaddrLike};
+
+    let interfaces = nix::ifaddrs::getifaddrs().map_err(|err| {
+        std::io::Error::other(format!(
+            "failed to enumerate interface addresses: {}",
+            err
+        ))
+    })?;
+    let wanted_ip = canonical_ipv6(ip);
+
+    Ok(interfaces
+        .filter_map(|interface| interface.address)
+        .any(|address| {
+            let interface_ip = match address.family() {
+                Some(AddressFamily::Inet) => address
+                    .as_sockaddr_in()
+                    .map(|address| std::net::IpAddr::V4(address.ip())),
+                Some(AddressFamily::Inet6) => address
+                    .as_sockaddr_in6()
+                    .map(|address| std::net::IpAddr::V6(address.ip())),
+                _ => None,
+            };
+
+            interface_ip.is_some_and(|interface_ip| canonical_ipv6(interface_ip) == wanted_ip)
+        }))
+}
+
 pub fn tproxy_bind_src(sock: SockRef, src_sock: std::net::SocketAddr) -> tokio::io::Result<()> {
+    // Preserving the original source endpoint is only useful for remote TPROXY
+    // clients. If the source is already assigned to this host (for example, a
+    // local unbound query), binding the outbound socket to that endpoint can
+    // make our transparent reply socket send packets back to our own outbound
+    // socket, creating a UDP reflection loop.
+    if is_local_ip(src_sock.ip())? {
+        return Ok(());
+    }
+
     setup_iptransparent_opts(&sock)?;
     match sock.bind(&SockAddr::from(src_sock)) {
         Ok(_) => {}
         Err(err) => match err.kind() {
-            // In this branch, we are processing the local traffic.
+            // Another socket may temporarily own this source endpoint while a
+            // local application is being proxied. Let the kernel choose an
+            // ephemeral source endpoint instead.
             std::io::ErrorKind::AddrInUse => {}
             _ => return Err(err),
         },
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonical_ipv6, is_local_ip};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn addresses_use_canonical_ipv6_form() {
+        let mapped_loopback = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+
+        assert_eq!(
+            canonical_ipv6(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            mapped_loopback
+        );
+        assert_eq!(
+            canonical_ipv6(IpAddr::V6(mapped_loopback)),
+            mapped_loopback
+        );
+        assert_eq!(
+            canonical_ipv6(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            Ipv6Addr::LOCALHOST
+        );
+    }
+
+    #[test]
+    fn interface_addresses_include_loopback() {
+        let mapped_loopback = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+
+        assert!(is_local_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap());
+        assert!(is_local_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)).unwrap());
+        assert!(is_local_ip(IpAddr::V6(mapped_loopback)).unwrap());
+    }
 }
 
 async fn handle_tcp(
