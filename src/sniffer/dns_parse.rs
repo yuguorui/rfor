@@ -1,8 +1,8 @@
 //! DNS query sniffer.
 //!
 //! Extracts the queried domain (QNAME of the first question) from DNS
-//! messages so that intercepted DNS traffic (UDP/TCP port 53) can be
-//! routed with the regular domain rules (DOMAIN/DOMAIN-SUFFIX/GEOSITE).
+//! messages so that intercepted DNS traffic can be routed with the regular
+//! domain rules (DOMAIN/DOMAIN-SUFFIX/GEOSITE).
 //!
 //! Only standard queries (QR=0, OPCODE=0) are accepted; responses and
 //! other message types are ignored to avoid false positives.

@@ -519,7 +519,6 @@ const QUIC_SNI_AGGREGATION_TIMEOUT_MS: u64 = 300;
 /// - A vector of all buffered packets that should be forwarded
 async fn sniff_host_with_quic_aggregation(
     packet_rx: &mut mpsc::Receiver<bytes::Bytes>,
-    target_port: u16,
 ) -> (Option<crate::sniffer::SniffedHost>, Vec<bytes::Bytes>) {
     use crate::sniffer::{QuicParseResult, QuicSniAggregator, SniffedHost, SniffedProtocol};
 
@@ -535,19 +534,17 @@ async fn sniff_host_with_quic_aggregation(
 
     buffered_packets.push(init_packet.clone());
 
-    // DNS queries carry the requested domain in the question section; sniff it
-    // so DNS traffic can be routed with the regular domain rules.
-    if target_port == 53 {
-        if let Some(host) = crate::sniffer::dns_parse::parse_host(&init_packet) {
-            debug!("DNS query domain parsed from first packet: {}", host);
-            return (
-                Some(SniffedHost {
-                    host,
-                    protocol: Some(SniffedProtocol::Dns),
-                }),
-                buffered_packets,
-            );
-        }
+    // DNS queries carry the requested domain in the question section. Sniff
+    // the payload itself so DNS is identified even on non-standard ports.
+    if let Some(host) = crate::sniffer::dns_parse::parse_host(&init_packet) {
+        debug!("DNS query domain parsed from first packet: {}", host);
+        return (
+            Some(SniffedHost {
+                host,
+                protocol: Some(SniffedProtocol::Dns),
+            }),
+            buffered_packets,
+        );
     }
 
     let mut aggregator = QuicSniAggregator::new();
@@ -659,7 +656,8 @@ async fn relay_udp_packet(
     drop(settings);
 
     // Try to parse host from packets, supporting QUIC SNI aggregation
-    let (host, buffered_packets) = sniff_host_with_quic_aggregation(&mut packet_rx, target_sockaddr.port()).await;
+    let (host, buffered_packets) =
+        sniff_host_with_quic_aggregation(&mut packet_rx).await;
 
     // If no packets received, just return
     if buffered_packets.is_empty() {
