@@ -24,6 +24,10 @@ struct UdpSessionEntry {
 /// Channel buffer size for forwarding packets to existing sessions
 const UDP_SESSION_CHANNEL_SIZE: usize = 32;
 
+/// DNS exchanges are request/response flows. Avoid retaining each Unbound
+/// query session for the generic UDP idle timeout.
+const DNS_UDP_TIMEOUT_SECS: u64 = 10;
+
 /// Global map to track active UDP sessions with packet forwarding channels
 static UDP_SESSIONS: Lazy<DashMap<UdpSessionKey, UdpSessionEntry>> =
     Lazy::new(|| DashMap::new());
@@ -781,7 +785,13 @@ async fn relay_udp_packet(
     let mut socket_sets = hash_map::HashMap::<std::net::SocketAddr, FullconeSocketEntry>::new();
     let mut rate_limiter = RateLimiter::new(fullcone_rate_limit);
 
-    let timeout = std::time::Duration::from_secs(udp_timeout);
+    // Apply the shorter DNS timeout only after the payload has been identified
+    // as DNS; do not infer the protocol from the destination port.
+    let timeout = if sniffed_proto == Some(crate::sniffer::SniffedProtocol::Dns) {
+        std::time::Duration::from_secs(DNS_UDP_TIMEOUT_SECS)
+    } else {
+        std::time::Duration::from_secs(udp_timeout)
+    };
     let socket_idle_timeout = std::time::Duration::from_secs(fullcone_socket_timeout);
     let sleep = tokio::time::sleep(timeout);
     tokio::pin!(sleep);
