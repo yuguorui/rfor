@@ -298,7 +298,38 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
 
                 let prefilled_data = bytes::Bytes::copy_from_slice(&buffer[..size]);
 
-                // Check max sessions limit before attempting entry (avoid calling len() inside entry())
+                // Existing sessions must remain usable after the global new-session
+                // limit has been reached. Do the lookup before enforcing the limit,
+                // and avoid calling UDP_SESSIONS.len() while holding an entry lock.
+                if let Some(session) = UDP_SESSIONS.get(&session_key) {
+                    match session.packet_tx.try_send(prefilled_data) {
+                        Ok(_) => {
+                            debug!(
+                                "udp relay: forwarded packet to existing session {:?} <-> {:?}, {} bytes",
+                                source_sockaddr, target_sockaddr, size
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!(
+                                "udp relay: channel full for session {:?} <-> {:?}, packet dropped",
+                                source_sockaddr, target_sockaddr
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            // Session is closing, remove the stale entry and let the
+                            // next packet create a replacement session.
+                            drop(session);
+                            UDP_SESSIONS.remove(&session_key);
+                            debug!(
+                                "udp relay: removed stale session {:?} <-> {:?}",
+                                source_sockaddr, target_sockaddr
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                // The limit only applies to packets that would create a new session.
                 if max_sessions > 0 && UDP_SESSIONS.len() >= max_sessions {
                     warn!(
                         "udp relay: max sessions limit ({}) reached, dropping new session {:?} <-> {:?}",
@@ -307,7 +338,8 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
                     continue;
                 }
 
-                // Use DashMap entry API to atomically check and insert
+                // Use DashMap entry API to atomically check and insert. A session may
+                // have been created after the fast-path lookup above.
                 match UDP_SESSIONS.entry(session_key) {
                     Entry::Occupied(entry) => {
                         // Session already exists, forward packet through channel
