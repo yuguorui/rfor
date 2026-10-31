@@ -41,6 +41,10 @@ pub async fn socks5_worker() -> Result<()> {
 }
 
 async fn socks5_instance(socket: TcpStream) -> Result<()> {
+    // The UDP relay must be bound in the same address family the client used
+    // to reach us: OpenBSD IPv6 sockets are v6-only by default, so a single
+    // [::]:0 listener silently drops datagrams from IPv4 SOCKS clients.
+    let local_addr = socket.local_addr()?;
     let (proto, cmd, target_addr) = Socks5ServerProtocol::accept_no_auth(socket).await?
         .read_command().await?;
 
@@ -81,13 +85,25 @@ async fn socks5_instance(socket: TcpStream) -> Result<()> {
             return Err(ReplyError::CommandNotSupported.into());
         }
         fast_socks5::Socks5Command::UDPAssociate => {
-            // Listen with UDP6 socket, so the client can connect to it with either
-            // IPv4 or IPv6.
-            let peer_sock = UdpSocket::bind("[::]:0").await?;
+            // Bind the relay in the client's address family. A dual-stack
+            // [::]:0 socket only works where bindv6only=0; OpenBSD defaults
+            // to v6-only, which would make IPv4 UDP associates time out.
+            let (bind_addr, relay_ip) = if local_addr.is_ipv4() {
+                (
+                    "0.0.0.0:0",
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                )
+            } else {
+                (
+                    "[::]:0",
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                )
+            };
+            let peer_sock = UdpSocket::bind(bind_addr).await?;
 
             let udp_port = peer_sock.local_addr()?.port();
             let mut inner = proto
-                .reply_success(std::net::SocketAddr::new(empty_ip, udp_port))
+                .reply_success(std::net::SocketAddr::new(relay_ip, udp_port))
                 .await?;
 
             transfer_udp(&mut inner, peer_sock).await?;

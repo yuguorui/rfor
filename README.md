@@ -175,6 +175,14 @@ the same reason, `udp-fullcone` together with `bind_range` is not supported
 on OpenBSD: the connected socket only accepts replies from the resolved
 target.
 
+SOCKS5 UDP upstreams bind their relay socket in the address family of the
+SOCKS server: `0.0.0.0:0` for an IPv4 server such as `127.0.0.1:7905`, and
+`[::]:0` for an IPv6 server. OpenBSD's IPv6 sockets are IPv6-only by
+default, so reusing `[::]:0` for an IPv4 relay would make UDP upstream
+traffic time out. The SOCKS5 server applies the same rule to UDP ASSOCIATE:
+an IPv4 control connection gets a `0.0.0.0:0` relay and an IPv6 connection
+gets `[::]:0`.
+
 The rules rely on `divert-to` preserving the original destination without a
 privileged DIOCNATLOOK. TCP recovers it with `getsockname(2)`; UDP uses
 `IP_RECVDSTADDR`/`IP_RECVDSTPORT` or `IPV6_PKTINFO`/`IPV6_RECVDSTPORT`.

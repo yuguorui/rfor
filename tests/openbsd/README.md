@@ -93,11 +93,17 @@ With `bind_range` set to the client's IPv4 and IPv6 addresses:
 4. IPv6 UDP: echo returned; origin saw peer `2408:...:85b1`.
 5. SOCKS5 TCP: HTTP and HTTPS through a SOCKS5 upstream succeeded; rfor
    logged `Outbound(PROXY)`.
-6. Graceful SIGTERM flushed the anchor and traffic bypassed the proxy;
+6. SOCKS5 UDP: a DNS query to `8.8.8.8:53` returned a response through both
+   the `7905` (US) and `7904` (JP) upstreams; rfor logged the DGRAM flow as
+   `Outbound(PROXY)`.
+7. Graceful SIGTERM flushed the anchor and traffic bypassed the proxy;
    SIGKILL left the anchor loaded and the same HTTP request failed closed
    until the next restart.
+8. SOCKS5 UDP associate: a stock SOCKS5 client sent a DNS query through
+   rfor's `socks5-listen` and received the response; the relay was bound to
+   `0.0.0.0:<port>` for the IPv4 control connection.
 
-Two fixes were required for UDP source preservation:
+Four OpenBSD UDP fixes were required:
 
 - Unmap the internal IPv4-mapped IPv6 source before binding an AF_INET
   socket; otherwise `bind(2)` returns `EAFNOSUPPORT`.
@@ -106,6 +112,12 @@ Two fixes were required for UDP source preservation:
   source address, let the kernel choose a fresh source port to avoid the
   divert-to 5-tuple collision, and fall back to `send(2)` when `sendto(2)`
   returns `EISCONN`.
+- Bind the SOCKS5 datagram relay socket in the SOCKS server's address
+  family. OpenBSD IPv6 sockets are IPv6-only by default, so `[::]:0` could
+  not send to an IPv4 relay such as `127.0.0.1:7905`.
+- Bind the SOCKS5 server's UDP associate relay in the client's address
+  family. An IPv4 control connection must get a `0.0.0.0:0` relay; a
+  `[::]:0` relay is IPv6-only on OpenBSD and silently drops IPv4 datagrams.
 
 Not validated:
 
@@ -115,6 +127,38 @@ Not validated:
 - A target whose return path bypasses the OpenBSD gateway (for example a
   target on the client's L2 segment); source preservation requires the
   gateway to see the reply.
+
+## Resolver upstream through rfor SOCKS5
+
+`traffic-intercept.local-traffic: false` means PF `divert-to` never sees
+traffic originated by the router itself. unbound's own upstream queries
+therefore bypass the transparent path and cannot use the rfor rule table or
+its default outbound directly. proxychains is not a fix: it hooks TCP
+`connect(2)` only, while unbound's default forwarder transport is UDP; on
+OpenBSD unbound is also chrooted and pledged, so LD_PRELOAD injection is not
+dependable.
+
+The tested layout inserts a local UDP-to-SOCKS5 adapter:
+
+    unbound -> 127.0.0.1:5353 (v2ray dokodemo-door, tcp,udp)
+            -> 127.0.0.1:1080 (rfor socks5-listen)
+            -> rfor rules / DEFAULT -> PROXY
+
+unbound needs `do-not-query-localhost: no` and:
+
+    forward-zone:
+      name: "."
+      forward-addr: 127.0.0.1@5353
+      forward-first: no
+
+Live results on OpenBSD 8.0:
+
+1. UDP and TCP DNS through the adapter returned answers; `tcpdump -i lo0
+   'tcp port 1080'` showed the SOCKS5 control connection for each query.
+2. `cloudflare.com A +dnssec` returned `flags: qr rd ra ad`, so unbound
+   still validates DNSSEC through the forwarder.
+3. `home.ygo-note.com` and `openbsd-router.lan` returned the split-horizon
+   `192.168.51.1` records.
 
 ## Explicit negative checks
 

@@ -20,7 +20,9 @@ use url::Url;
 use tracing::info;
 
 use crate::get_settings;
-use crate::utils::{rfor_bind_addr, to_io_err, ToV6Net, ToV6SockAddr};
+#[cfg(not(target_os = "openbsd"))]
+use crate::utils::rfor_bind_addr;
+use crate::utils::{to_io_err, ToV6Net, ToV6SockAddr};
 
 use fast_socks5::client as socks_client;
 
@@ -599,7 +601,7 @@ impl RouteTable {
                 );
 
                 #[cfg(target_os = "openbsd")]
-                let backing_socket = {
+                let (backing_socket, socks_udp_bind) = {
                     let socks_addr = resolve_target_addr(TargetAddr::Domain(
                         proxy_url
                             .host_str()
@@ -617,25 +619,35 @@ impl RouteTable {
                         None,
                     ))
                     .await?;
+                    let socks_udp_bind = if socks_addr.is_ipv4() {
+                        "0.0.0.0:0".to_owned()
+                    } else {
+                        "[::]:0".to_owned()
+                    };
                     let sock = if socks_addr.is_ipv4() {
                         TcpSocket::new_v4()?
                     } else {
                         TcpSocket::new_v6()?
                     };
                     prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
-                    timeout(Duration::from_millis(TIMEOUT), sock.connect(socks_addr)).await??
+                    let backing =
+                        timeout(Duration::from_millis(TIMEOUT), sock.connect(socks_addr)).await??;
+                    (backing, socks_udp_bind)
                 };
                 #[cfg(not(target_os = "openbsd"))]
-                let backing_socket = timeout(
-                    Duration::from_millis(TIMEOUT),
-                    TcpStream::connect(&socks_server),
-                )
-                .await??;
+                let (backing_socket, socks_udp_bind) = (
+                    timeout(
+                        Duration::from_millis(TIMEOUT),
+                        TcpStream::connect(&socks_server),
+                    )
+                    .await??,
+                    rfor_bind_addr().await,
+                );
 
                 let sock = if proxy_url.username().is_empty() {
                     let fut = socks_client::Socks5Datagram::bind(
                         backing_socket,
-                        rfor_bind_addr().await,
+                        socks_udp_bind,
                     );
                     timeout(Duration::from_millis(TIMEOUT), fut)
                         .await?
@@ -643,7 +655,7 @@ impl RouteTable {
                 } else {
                     let fut = socks_client::Socks5Datagram::bind_with_password(
                         backing_socket,
-                        rfor_bind_addr().await,
+                        socks_udp_bind,
                         proxy_url.username(),
                         proxy_url.password().unwrap_or(""),
                     );
