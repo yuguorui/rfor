@@ -130,7 +130,8 @@ The first version intentionally supports forwarded traffic only:
 `local-traffic: true` is rejected at startup because the loopback route-to/TOS
 marker path has not been live-tested and is not safe to ship as an implicit
 feature yet.
-Forwarded TCP/UDP over IPv4 and IPv6 has been live-tested on OpenBSD 7.9.
+Forwarded TCP/UDP over IPv4 and IPv6 has been live-tested on OpenBSD 7.9
+and 8.0 (8.0 after syspatch 001-005).
 Source preservation through `bind_range` is live-tested for IPv4 and IPv6
 TCP/UDP when the return path is routed back through the OpenBSD gateway.
 

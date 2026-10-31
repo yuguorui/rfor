@@ -1,9 +1,18 @@
 # OpenBSD forwarded-traffic live test
 
 Status: **executed on 2026-10-31** against OpenBSD 7.9/amd64, first under
-QEMU TCG, then under PVE/KVM with routed client and target namespaces. This
-test covers forwarded traffic only; `local-traffic: true` is intentionally
-rejected by rfor.
+QEMU TCG, then under PVE/KVM with routed client and target namespaces. The
+same PVE/KVM VM was later upgraded to 8.0. This test covers forwarded
+traffic only; `local-traffic: true` is intentionally rejected by rfor.
+
+## OpenBSD 8.0 upgrade
+
+The PVE/KVM VM was upgraded from 7.9 to 8.0 with `sysupgrade -R 8.0`
+(release sets from cdn.openbsd.org) and syspatch 001-005. rfor was rebuilt
+with an 8.0 sysroot; v2ray and gost were rebuilt for openbsd/amd64. PF
+anchor installation, forwarded IPv4 TCP, forwarded UDP DNS, and the proxy
+paths were re-verified on 8.0. The full ULA/GUA source-preservation matrix
+was re-run on 8.0; see below.
 
 ## Tested topology
 
@@ -127,6 +136,31 @@ Not validated:
 - A target whose return path bypasses the OpenBSD gateway (for example a
   target on the client's L2 segment); source preservation requires the
   gateway to see the reply.
+
+### OpenBSD 8.0 re-run
+
+The matrix was repeated on the same VM after the 8.0 upgrade, with `vio1`
+moved to an isolated bridge so the production WAN L2 was not touched:
+
+- proxy: `vio0` `192.168.51.254/24` plus the test ULA `fd00:99::1/64`;
+  `vio1` `203.0.113.1/24` and `2001:db8:99::1/64`.
+- client namespace: `192.168.51.240/24` and `fd00:99::240/64`, IPv4 and
+  IPv6 defaults via the proxy.
+- target namespace: `203.0.113.2/24` and `2001:db8:99::2/64`, HTTP on port
+  80 and UDP echo on port 443.
+- rfor: `bind_range` `::ffff:192.168.51.240/128` and
+  `fd00:99::240/128`, `DEFAULT,,DIRECT`.
+
+All four flows passed:
+
+1. IPv4 TCP: origin saw peer `192.168.51.240`.
+2. IPv4 UDP: echo returned; origin saw peer `192.168.51.240`.
+3. IPv6 TCP: origin saw peer `fd00:99::240`.
+4. IPv6 UDP: echo returned; origin saw peer `fd00:99::240`.
+
+rfor logged `Outbound(DIRECT)` for all four flows. The test anchor was
+`rfor/15080_rfortest`; forwarding and the test addresses were removed
+afterwards.
 
 ## Resolver upstream through rfor SOCKS5
 
