@@ -7,10 +7,15 @@ use tracing::{error, info, warn, debug};
 
 use crate::{rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr, get_settings};
 use crate::stats::UDP_STATS;
-use std::{collections::hash_map, mem::MaybeUninit, os::fd::BorrowedFd, sync::Arc, time::Instant};
+use std::{collections::hash_map, mem::MaybeUninit, sync::Arc, time::Instant};
+#[cfg(target_os = "linux")]
+use std::os::fd::BorrowedFd;
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
+
+#[cfg(target_os = "freebsd")]
+use super::ipfw_freebsd;
 
 /// Key for UDP session mapping: (source_addr, target_addr)
 type UdpSessionKey = (std::net::SocketAddr, std::net::SocketAddr);
@@ -32,10 +37,11 @@ const DNS_UDP_TIMEOUT_SECS: u64 = 10;
 static UDP_SESSIONS: Lazy<DashMap<UdpSessionKey, UdpSessionEntry>> =
     Lazy::new(|| DashMap::new());
 
+#[cfg(target_os = "linux")]
 fn setup_iptransparent_opts(sock: &SockRef) -> std::io::Result<()> {
     use nix::sys::socket::sockopt::IpTransparent;
     use nix::sys::socket::{self};
-    use std::os::unix::io::AsRawFd;
+    use std::os::fd::AsRawFd;
 
     // SockRef implements AsRawFd but not AsFd, so we need to wrap with BorrowedFd
     // SAFETY: The fd is valid for the lifetime of sock
@@ -44,11 +50,44 @@ fn setup_iptransparent_opts(sock: &SockRef) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "freebsd")]
+fn setup_sockopt_int(fd: i32, level: i32, option: i32, value: i32) -> std::io::Result<()> {
+    let ret = unsafe {
+        nix::libc::setsockopt(
+            fd,
+            level,
+            option,
+            &value as *const _ as *const nix::libc::c_void,
+            std::mem::size_of_val(&value) as nix::libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+fn setup_iptransparent_opts(sock: &SockRef) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let local_addr = sock.local_addr()?.as_socket().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Unsupported, "socket has no IP address")
+    })?;
+    let (level, option) = match local_addr.ip() {
+        std::net::IpAddr::V4(_) => (nix::libc::IPPROTO_IP, nix::libc::IP_BINDANY),
+        std::net::IpAddr::V6(_) => (nix::libc::IPPROTO_IPV6, nix::libc::IPV6_BINDANY),
+    };
+    setup_sockopt_int(sock.as_raw_fd(), level, option, 1)
+}
+
 fn setup_udpsock_opts(sock: &tokio::net::UdpSocket) -> Result<()> {
     use std::os::unix::io::AsRawFd;
 
     setup_iptransparent_opts(&SockRef::from(sock))?;
 
+    #[cfg(target_os = "linux")]
     let optret = match sock.local_addr()?.ip() {
         std::net::IpAddr::V4(_) => unsafe {
             nix::libc::setsockopt(
@@ -83,6 +122,30 @@ fn setup_udpsock_opts(sock: &tokio::net::UdpSocket) -> Result<()> {
         },
     };
 
+    #[cfg(target_os = "freebsd")]
+    let optret = {
+        let fd = sock.as_raw_fd();
+        match sock.local_addr()?.ip() {
+            std::net::IpAddr::V4(_) => {
+                setup_sockopt_int(fd, nix::libc::IPPROTO_IP, nix::libc::IP_ORIGDSTADDR, 1)?;
+                0
+            }
+            std::net::IpAddr::V6(_) => {
+                // A dual-stack listener receives IPv4-mapped datagrams as well.
+                // Enable both options; the kernel ignores the one that does not
+                // apply to the packet's address family.
+                setup_sockopt_int(
+                    fd,
+                    nix::libc::IPPROTO_IPV6,
+                    nix::libc::IPV6_ORIGDSTADDR,
+                    1,
+                )?;
+                let _ = setup_sockopt_int(fd, nix::libc::IPPROTO_IP, nix::libc::IP_ORIGDSTADDR, 1);
+                0
+            }
+        }
+    };
+
     if optret < 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -91,6 +154,86 @@ fn setup_udpsock_opts(sock: &tokio::net::UdpSocket) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn bind_tcp_listener(listen_addr: &str) -> Result<TcpListener> {
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .context("failed to bind tcp listener")?;
+    setup_iptransparent_opts(&SockRef::from(&listener)).context("failed to set IP_TRANSPARENT")?;
+    Ok(listener)
+}
+
+#[cfg(target_os = "freebsd")]
+async fn bind_tcp_listener(listen_addr: &str) -> Result<TcpListener> {
+    use std::net::SocketAddr;
+    use std::os::unix::io::AsRawFd;
+    use tokio::net::TcpSocket;
+
+    let addr: SocketAddr = listen_addr.parse().context("invalid tproxy-listen address")?;
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        let socket = TcpSocket::new_v6()?;
+        setup_sockopt_int(
+            socket.as_raw_fd(),
+            nix::libc::IPPROTO_IPV6,
+            nix::libc::IPV6_V6ONLY,
+            1,
+        )?;
+        socket
+    };
+    setup_iptransparent_opts(&SockRef::from(&socket)).context("failed to set IP_BINDANY")?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    Ok(socket.listen(1024)?)
+}
+
+#[cfg(target_os = "linux")]
+async fn bind_udp_listener(listen_addr: &str) -> Result<UdpSocket> {
+    Ok(UdpSocket::bind(listen_addr).await?)
+}
+
+#[cfg(target_os = "freebsd")]
+async fn bind_udp_listener(listen_addr: &str) -> Result<UdpSocket> {
+    use socket2::{Domain, Type};
+    use std::net::SocketAddr;
+
+    let addr: SocketAddr = listen_addr.parse().context("invalid tproxy-listen address")?;
+    let socket = if addr.is_ipv4() {
+        socket2::Socket::new(Domain::IPV4, Type::DGRAM, None)?
+    } else {
+        let socket = socket2::Socket::new(Domain::IPV6, Type::DGRAM, None)?;
+        socket.set_only_v6(true)?;
+        socket
+    };
+    socket.set_nonblocking(true)?;
+    setup_iptransparent_opts(&SockRef::from(&socket))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&SockAddr::from(addr))?;
+    let socket: std::net::UdpSocket = socket.into();
+    Ok(UdpSocket::from_std(socket)?)
+}
+
+fn listener_addrs(listen_addr: &str) -> Result<Vec<String>> {
+    let address: std::net::SocketAddr = listen_addr
+        .parse()
+        .context("invalid tproxy-listen address")?;
+
+    #[cfg(target_os = "freebsd")]
+    if address.is_ipv6() && address.ip().is_unspecified() {
+        let port = address.port();
+        return Ok(vec![
+            format!("0.0.0.0:{port}"),
+            format!("[::]:{port}"),
+        ]);
+    }
+
+    #[cfg(not(target_os = "freebsd"))]
+    let _ = address;
+
+    Ok(vec![listen_addr.to_owned()])
 }
 
 pub async fn tproxy_worker() -> Result<()> {
@@ -103,32 +246,47 @@ pub async fn tproxy_worker() -> Result<()> {
         return Err(err);
     }
 
-    let Some(listen_addr) = get_settings().read().await.tproxy_listen.clone() else {
-        return Ok(());
+    let (listen_addr, udp_enable) = {
+        let settings = get_settings().read().await;
+        let Some(listen_addr) = settings.tproxy_listen.clone() else {
+            return Ok(());
+        };
+        (listen_addr, settings.udp_enable)
     };
     info!("tproxy listen: {}", listen_addr);
 
-    tokio::select! {
-        Err(err) = accept_socket_loop(&listen_addr) => {
-            clean_environment().await?;
-            return Err(err);
-        },
-        Err(err) = udp_socket_loop(&listen_addr) => {
-            clean_environment().await?;
-            return Err(err);
-        },
-        Err(err) = crate::utils::receive_signal() => {
-            clean_environment().await?;
-            return Err(err);
-        },
+    let mut tasks = tokio::task::JoinSet::new();
+    for address in listener_addrs(&listen_addr)? {
+        let tcp_addr = address.clone();
+        tasks.spawn(async move { accept_socket_loop(&tcp_addr).await });
+        if udp_enable {
+            let udp_addr = address;
+            tasks.spawn(async move { udp_socket_loop(&udp_addr).await });
+        }
+    }
+
+    let result = tokio::select! {
+        result = async {
+            loop {
+                match tasks.join_next().await {
+                    Some(Ok(Ok(()))) => continue,
+                    Some(Ok(Err(err))) => break Err(err),
+                    Some(Err(err)) => {
+                        break Err(anyhow!("tproxy task failed: {}", err))
+                    }
+                    None => break Ok(()),
+                }
+            }
+        } => result,
+        err = crate::utils::receive_signal() => err,
     };
+
+    clean_environment().await?;
+    result
 }
 
 async fn accept_socket_loop(listen_addr: &str) -> Result<()> {
-    let listener = TcpListener::bind(listen_addr)
-        .await
-        .context("failed to bind tcp listener")?;
-    setup_iptransparent_opts(&SockRef::from(&listener)).context("failed to set IP_TRANSPARENT")?;
+    let listener = bind_tcp_listener(listen_addr).await?;
 
     loop {
         match listener.accept().await {
@@ -173,6 +331,8 @@ fn parse_sockaddr_storage(
 }
 
 fn parse_cmsg_orig_dst_addr(msghdr: &nix::libc::msghdr) -> std::io::Result<std::net::SocketAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
     let cmsgptr = unsafe { nix::libc::CMSG_FIRSTHDR(msghdr) };
     if cmsgptr.is_null() {
         return Err(std::io::Error::new(
@@ -181,44 +341,41 @@ fn parse_cmsg_orig_dst_addr(msghdr: &nix::libc::msghdr) -> std::io::Result<std::
         ));
     }
 
-    let mut target_sockaddr_option = None;
     loop {
-        let cmsg_level = unsafe { *cmsgptr }.cmsg_level;
-        let cmsg_type = unsafe { *cmsgptr }.cmsg_type;
+        let header = unsafe { &*cmsgptr };
+        let cmsg_len = header.cmsg_len as usize;
         let cmsg_data = unsafe { nix::libc::CMSG_DATA(cmsgptr) } as *const nix::libc::c_uchar;
 
-        if cmsg_level == nix::libc::SOL_IP && cmsg_type == nix::libc::IP_ORIGDSTADDR {
-            let sockaddr_storage = cmsg_data as *const nix::libc::sockaddr_storage;
-            target_sockaddr_option = Some(
-                unsafe {
-                    socket2::SockAddr::new(
-                        *sockaddr_storage,
-                        std::mem::size_of::<nix::libc::sockaddr_in>() as _,
-                    )
+        if header.cmsg_level == nix::libc::IPPROTO_IP
+            && header.cmsg_type == nix::libc::IP_ORIGDSTADDR
+            && cmsg_len
+                >= unsafe {
+                    nix::libc::CMSG_LEN(std::mem::size_of::<nix::libc::sockaddr_in>() as u32)
+                        as usize
                 }
-                .as_socket()
-                .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "failed to parse sockaddr_in.")
-                })?,
-            );
-            break;
+        {
+            // SAFETY: cmsg_data points to a sufficiently large sockaddr_in in the
+            // control buffer, as checked above. read_unaligned avoids assuming
+            // CMSG_DATA's alignment.
+            let addr = unsafe { std::ptr::read_unaligned(cmsg_data as *const nix::libc::sockaddr_in) };
+            let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+            let port = u16::from_be(addr.sin_port);
+            return Ok(SocketAddr::new(IpAddr::V4(ip), port).to_ipv6_sockaddr());
         }
 
-        if cmsg_level == nix::libc::SOL_IPV6 && cmsg_type == nix::libc::IPV6_ORIGDSTADDR {
-            let sockaddr_storage = cmsg_data as *const nix::libc::sockaddr_storage;
-            target_sockaddr_option = Some(
-                unsafe {
-                    socket2::SockAddr::new(
-                        *sockaddr_storage,
-                        std::mem::size_of::<nix::libc::sockaddr_in6>() as _,
-                    )
+        if header.cmsg_level == nix::libc::IPPROTO_IPV6
+            && header.cmsg_type == nix::libc::IPV6_ORIGDSTADDR
+            && cmsg_len
+                >= unsafe {
+                    nix::libc::CMSG_LEN(std::mem::size_of::<nix::libc::sockaddr_in6>() as u32)
+                        as usize
                 }
-                .as_socket()
-                .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "failed to parse sockaddr_in6.")
-                })?,
-            );
-            break;
+        {
+            // SAFETY: same as above, for sockaddr_in6.
+            let addr = unsafe { std::ptr::read_unaligned(cmsg_data as *const nix::libc::sockaddr_in6) };
+            let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
+            let port = u16::from_be(addr.sin6_port);
+            return Ok(SocketAddr::new(IpAddr::V6(ip), port).to_ipv6_sockaddr());
         }
 
         let cmsgptr = unsafe { nix::libc::CMSG_NXTHDR(msghdr, cmsgptr) };
@@ -227,9 +384,10 @@ fn parse_cmsg_orig_dst_addr(msghdr: &nix::libc::msghdr) -> std::io::Result<std::
         }
     }
 
-    target_sockaddr_option.ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "no target sockaddr received.")
-    })
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "no target sockaddr received.",
+    ))
 }
 
 /// recvmsg wrapper for tproxy, which returns the source and target sockaddr of the packet.
@@ -277,7 +435,7 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
     let max_sessions = settings.udp_max_sessions;
     drop(settings);
 
-    let udp_socket = tokio::net::UdpSocket::bind(listen_addr).await?;
+    let udp_socket = bind_udp_listener(listen_addr).await?;
     setup_udpsock_opts(&udp_socket)?;
 
     let r = Arc::new(udp_socket);
@@ -425,6 +583,19 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
     }
 }
 
+/// FreeBSD binds transparent reply sockets in the target's native family.
+/// Internal rfor addresses use IPv4-mapped IPv6, so unmap them before bind or
+/// connect on an AF_INET socket.
+fn native_sockaddr(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    #[cfg(target_os = "freebsd")]
+    if let std::net::SocketAddr::V6(v6) = addr {
+        if let Some(v4) = v6.ip().to_ipv4_mapped() {
+            return std::net::SocketAddr::V4(std::net::SocketAddrV4::new(v4, v6.port()));
+        }
+    }
+    addr
+}
+
 async fn udp_socket_bind_to_any_with_flag(
     bind_sockaddr: std::net::SocketAddr,
     disable_ipv6: bool,
@@ -435,15 +606,37 @@ async fn udp_socket_bind_to_any_with_flag(
     use std::os::fd::OwnedFd;
     use tokio::net::UdpSocket;
 
+    #[cfg(target_os = "freebsd")]
+    let bind_sockaddr = native_sockaddr(bind_sockaddr);
+
+    // Linux historically uses an IPv6 socket even for IPv4 targets so that the
+    // reply socket can carry both address families. On FreeBSD, keeping the
+    // target's native family avoids IPv4-mapped-address edge cases in IP_BINDANY.
+    #[cfg(target_os = "linux")]
     let bind_sockaddr = if disable_ipv6 {
         bind_sockaddr
     } else {
         bind_sockaddr.to_ipv6_sockaddr()
     };
 
+    let domain = if cfg!(target_os = "freebsd") {
+        if bind_sockaddr.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        }
+    } else if disable_ipv6 {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+
     let owned_fd = unsafe {
-        let fd = libc::socket(if disable_ipv6 {libc::AF_INET} else {libc::AF_INET6},
-            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0);
+        let fd = libc::socket(
+            domain,
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK,
+            0,
+        );
         if fd < 0 {
             return Err(anyhow!(
                 "failed to create socket: {}",
@@ -454,22 +647,11 @@ async fn udp_socket_bind_to_any_with_flag(
         OwnedFd::from_raw_fd(fd)
     };
 
+    setup_iptransparent_opts(&SockRef::from(&owned_fd))
+        .map_err(|err| anyhow!("failed to set transparent bind option: {}", err))?;
+
     unsafe {
         let raw_fd = owned_fd.as_raw_fd();
-
-        let ret = libc::setsockopt(
-            raw_fd,
-            libc::IPPROTO_IP,
-            libc::IP_TRANSPARENT,
-            &1 as *const _ as *const libc::c_void,
-            std::mem::size_of::<i32>() as u32,
-        );
-        if ret < 0 {
-            return Err(anyhow!(
-                "failed to set IP_TRANSPARENT: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
 
         let ret = libc::setsockopt(
             raw_fd,
@@ -486,11 +668,12 @@ async fn udp_socket_bind_to_any_with_flag(
         }
 
         let addr = socket2::SockAddr::from(bind_sockaddr);
+        let addr_len = addr.len();
         let addr_stor = addr.as_storage();
         let ret = libc::bind(
             raw_fd,
             &addr_stor as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_storage>() as u32,
+            addr_len as libc::socklen_t,
         );
         if ret < 0 {
             return Err(anyhow!(
@@ -659,6 +842,9 @@ async fn relay_udp_packet(
     );
     drop(settings);
 
+    // AF_INET sockets cannot send to an IPv4-mapped IPv6 SocketAddr on FreeBSD.
+    let wire_target = native_sockaddr(target_sockaddr);
+
     // Try to parse host from packets, supporting QUIC SNI aggregation
     let (host, buffered_packets) =
         sniff_host_with_quic_aggregation(&mut packet_rx).await;
@@ -670,7 +856,7 @@ async fn relay_udp_packet(
 
     let sniffed_proto = host.as_ref().and_then(|h| h.protocol);
     let dst_addr = match host {
-        None => crate::rules::TargetAddr::Ip(target_sockaddr),
+        None => crate::rules::TargetAddr::Ip(wire_target),
         Some(host) => {
             crate::rules::TargetAddr::Domain(host.host, target_sockaddr.port(), Some(target_sockaddr))
         }
@@ -706,7 +892,7 @@ async fn relay_udp_packet(
                         {
                             Ok(sock) => {
                                 if let Err(e) = sock
-                                    .send_to(&resp, source_sockaddr)
+                                    .send_to(&resp, native_sockaddr(source_sockaddr))
                                     .await
                                 {
                                     debug!("failed to send NXDOMAIN response: {}", e);
@@ -725,12 +911,12 @@ async fn relay_udp_packet(
     // Prepare the intermediate socket which is connected to the source, which should bind to the target address,
     // and pretend to be the target.
     let source_socket = udp_socket_bind_to_any_with_flag(target_sockaddr, disable_ipv6).await?;
-    source_socket.connect(source_sockaddr).await?;
+    source_socket.connect(native_sockaddr(source_sockaddr)).await?;
 
     // Send all buffered packets (including the initial packet)
     for packet in &buffered_packets {
         target_socket
-            .send_to(packet, crate::rules::TargetAddr::Ip(target_sockaddr))
+            .send_to(packet, crate::rules::TargetAddr::Ip(wire_target))
             .await?;
 
         // Track packet bytes
@@ -808,7 +994,7 @@ async fn relay_udp_packet(
             // Handle packets forwarded from other tasks via channel
             Some(packet) = packet_rx.recv() => {
                 sleep.as_mut().set(tokio::time::sleep(timeout));
-                match target_socket.send_to(&packet, crate::rules::TargetAddr::Ip(target_sockaddr)).await {
+                match target_socket.send_to(&packet, crate::rules::TargetAddr::Ip(wire_target)).await {
                     Ok(_) => {
                         UDP_STATS.add_bytes(packet.len() as u64);
                         debug!("udp relay (forwarded): {:?} -> {} with bytes {}",
@@ -823,7 +1009,7 @@ async fn relay_udp_packet(
                 match data {
                     Ok(size) => {
                         sleep.as_mut().set(tokio::time::sleep(timeout));
-                        match target_socket.send_to(&src_buffer[..size], crate::rules::TargetAddr::Ip(target_sockaddr)).await {
+                        match target_socket.send_to(&src_buffer[..size], crate::rules::TargetAddr::Ip(wire_target)).await {
                             Ok(_) => {
                                 UDP_STATS.add_bytes(size as u64);
                                 debug!("udp relay: {:?} -> {} with bytes {}", source_sockaddr, &dst_addr, size);
@@ -905,7 +1091,7 @@ async fn relay_udp_packet(
                                                 // Create new socket with graceful error handling
                                                 match udp_socket_bind_to_any_with_flag(resp_ip, disable_ipv6).await {
                                                     Ok(sock) => {
-                                                        match sock.connect(source_sockaddr).await {
+                                                        match sock.connect(native_sockaddr(source_sockaddr)).await {
                                                             Ok(_) => {
                                                                 let ret = sock.send(&dst_buffer[..size]).await;
                                                                 socket_sets.insert(resp_ip, FullconeSocketEntry {
@@ -1017,6 +1203,8 @@ pub fn tproxy_bind_src(sock: SockRef, src_sock: std::net::SocketAddr) -> tokio::
         return Ok(());
     }
 
+    #[cfg(target_os = "freebsd")]
+    let src_sock = native_sockaddr(src_sock);
     setup_iptransparent_opts(&sock)?;
     match sock.bind(&SockAddr::from(src_sock)) {
         Ok(_) => {}
@@ -1109,6 +1297,7 @@ async fn handle_tcp(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn cleanup_iptables(proxy_chain: &str, mark_chain: &str) -> Result<(), Box<dyn std::error::Error>> {
     let ipts = [
         iptables::new(false).map_err(|e| format!("command iptables not found: {}", e))?,
@@ -1146,6 +1335,7 @@ fn cleanup_iptables(proxy_chain: &str, mark_chain: &str) -> Result<(), Box<dyn s
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn __setup_iptables(
     ipt: &iptables::IPTables,
     proxy_chain: &str,
@@ -1262,6 +1452,7 @@ fn __setup_iptables(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 async fn set_iptables(
     proxy_chain: &str,
     mark_chain: &str,
@@ -1335,6 +1526,7 @@ async fn set_iptables(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 async fn __cleanup_ip_rule(
     handle: &rtnetlink::Handle,
     ip_version: rtnetlink::IpVersion,
@@ -1369,6 +1561,7 @@ async fn __cleanup_ip_rule(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 async fn cleanup_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
     use rtnetlink::new_connection;
 
@@ -1386,6 +1579,7 @@ async fn cleanup_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 async fn get_link_by_name(
     handle: &rtnetlink::Handle,
     name: String,
@@ -1400,6 +1594,7 @@ async fn get_link_by_name(
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use netlink_packet_route::rule::RuleAttribute;
@@ -1468,6 +1663,7 @@ async fn set_ip_rule(route_table_index: u8, fwmark: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 async fn environment_setup() -> Result<()> {
     use std::net::SocketAddr;
 
@@ -1522,9 +1718,13 @@ async fn environment_setup() -> Result<()> {
             return Ok(());
         }
         crate::settings::InterceptMode::REDIRECT { .. } => return Ok(()),
+        crate::settings::InterceptMode::IPFW { .. } => {
+            return Err(anyhow!("ipfw mode is only supported on FreeBSD"))
+        }
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn clean_environment() -> Result<()> {
     let settings = get_settings().read().await;
     match &settings.intercept_mode {
@@ -1550,5 +1750,82 @@ async fn clean_environment() -> Result<()> {
             Ok(())
         }
         crate::settings::InterceptMode::REDIRECT { .. } => return Ok(()),
+        crate::settings::InterceptMode::IPFW { .. } => {
+            return Err(anyhow!("ipfw mode is only supported on FreeBSD"))
+        }
     }
+}
+
+#[cfg(target_os = "freebsd")]
+async fn environment_setup() -> Result<()> {
+    let settings = get_settings().read().await;
+    let (local_traffic, ports, rule_base, proxy_chain, udp_enable, disable_ipv6, port) =
+        match &settings.intercept_mode {
+            crate::settings::InterceptMode::MANUAL => return Ok(()),
+            crate::settings::InterceptMode::IPFW {
+                local_traffic,
+                ports,
+                rule_base,
+                proxy_chain,
+            } => (
+                *local_traffic,
+                ports.clone(),
+                *rule_base,
+                proxy_chain.clone(),
+                settings.udp_enable,
+                settings.disable_ipv6,
+                settings
+                    .tproxy_listen
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("tproxy-listen is not configured"))?
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|e| anyhow!("invalid tproxy-listen address: {}", e))?
+                    .port(),
+            ),
+            _ => {
+                return Err(anyhow!(
+                    "FreeBSD transparent interception requires auto/tproxy/ipfw mode"
+                ))
+            }
+        };
+    let enable_ipv6 = !disable_ipv6
+        && settings
+            .tproxy_listen
+            .as_ref()
+            .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
+            .is_some_and(|addr| addr.is_ipv6());
+    drop(settings);
+
+    ipfw_freebsd::setup(
+        port,
+        &ports,
+        local_traffic,
+        rule_base,
+        &proxy_chain,
+        enable_ipv6,
+        udp_enable,
+    )
+    .await
+}
+
+#[cfg(target_os = "freebsd")]
+async fn clean_environment() -> Result<()> {
+    let settings = get_settings().read().await;
+    let (proxy_chain, port) = match &settings.intercept_mode {
+        crate::settings::InterceptMode::MANUAL => return Ok(()),
+        crate::settings::InterceptMode::IPFW { proxy_chain, .. } => (
+            proxy_chain.clone(),
+            settings
+                .tproxy_listen
+                .as_ref()
+                .ok_or_else(|| anyhow!("tproxy-listen is not configured"))?
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| anyhow!("invalid tproxy-listen address: {}", e))?
+                .port(),
+        ),
+        _ => return Ok(()),
+    };
+    drop(settings);
+
+    ipfw_freebsd::cleanup(&proxy_chain, port).await
 }

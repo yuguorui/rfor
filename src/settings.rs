@@ -20,6 +20,7 @@ const DEFAULT_IPTABLES_DIRECT_MARK: u32 = 0xff43;
 const DEFAULT_IPTABLES_PROXY_CHAIN_NAME: &str = "rfor-proxy";
 const DEFAULT_IPTABLES_MARK_CHAIN_NAME: &str = "rfor-mark";
 const DEFAULT_IPRULE_TABLE: u8 = 0x42;
+const DEFAULT_IPFW_RULE_BASE: u16 = 64000;
 
 /// A simple but fast traffic forwarder with routing.
 #[derive(Parser, Debug)]
@@ -53,6 +54,12 @@ pub enum InterceptMode {
         local_traffic: bool,
         ports: String,
         direct_mark: u32,
+        proxy_chain: String,
+    },
+    IPFW {
+        local_traffic: bool,
+        ports: String,
+        rule_base: u16,
         proxy_chain: String,
     },
     MANUAL,
@@ -138,7 +145,9 @@ impl Settings {
 
         /* 6. Parse the UDP enabling */
         let udp_enable = match &intercept_mode {
-            InterceptMode::TPROXY { .. } | InterceptMode::MANUAL => {
+            InterceptMode::TPROXY { .. }
+            | InterceptMode::IPFW { .. }
+            | InterceptMode::MANUAL => {
                 // The canonical key is `udp-enabled`; keep `udp-enable` as a
                 // deprecated alias so existing configs keep working.
                 match (s.get_bool("udp-enabled"), s.get_bool("udp-enable")) {
@@ -402,7 +411,7 @@ fn parse_intercept_mode(s: &Config) -> Result<InterceptMode, ConfigError> {
 
     match mode.as_str() {
         "manual" => return Ok(InterceptMode::MANUAL),
-        "auto" | "tproxy" | "redirect" => {
+        "auto" | "tproxy" | "ipfw" | "redirect" => {
             let capture_local_traffic = table
                 .get("local-traffic")
                 .and_then(|v| v.clone().into_bool().ok())
@@ -440,27 +449,53 @@ fn parse_intercept_mode(s: &Config) -> Result<InterceptMode, ConfigError> {
             let rule_table_index =
                 parse_optional_int_field_u8(table.clone(), "rule-table", DEFAULT_IPRULE_TABLE);
 
-            if mode.as_str() != "redirect" {
-                Ok(InterceptMode::TPROXY {
-                    local_traffic: capture_local_traffic,
-                    ports: ports.unwrap_or_default(),
-                    proxy_mark,
-                    direct_mark,
-                    proxy_chain,
-                    rule_table_index,
-                    mark_chain,
-                })
-            } else {
-                Ok(InterceptMode::REDIRECT {
+            if mode == "redirect" {
+                if cfg!(target_os = "freebsd") {
+                    return Err(ConfigError::Message(
+                        "redirect mode is not supported on FreeBSD; use auto/tproxy (ipfw) or manual"
+                            .to_string(),
+                    ));
+                }
+                return Ok(InterceptMode::REDIRECT {
                     local_traffic: capture_local_traffic,
                     ports: ports.unwrap_or_default(),
                     direct_mark,
                     proxy_chain,
-                })
+                });
             }
+
+            if mode == "ipfw" || cfg!(target_os = "freebsd") {
+                if !cfg!(target_os = "freebsd") {
+                    return Err(ConfigError::Message(
+                        "ipfw mode is only supported on FreeBSD; use auto/tproxy"
+                            .to_string(),
+                    ));
+                }
+                let rule_base = parse_optional_int_field_u16(
+                    table.clone(),
+                    "ipfw-rule-base",
+                    DEFAULT_IPFW_RULE_BASE,
+                );
+                return Ok(InterceptMode::IPFW {
+                    local_traffic: capture_local_traffic,
+                    ports: ports.unwrap_or_default(),
+                    rule_base,
+                    proxy_chain,
+                });
+            }
+
+            Ok(InterceptMode::TPROXY {
+                local_traffic: capture_local_traffic,
+                ports: ports.unwrap_or_default(),
+                proxy_mark,
+                direct_mark,
+                proxy_chain,
+                rule_table_index,
+                mark_chain,
+            })
         }
         _ => Err(ConfigError::Message(
-            "either `auto/tproxy`, `redirect` or `manual` is expected.".to_owned(),
+            "either `auto/tproxy`, `ipfw`, `redirect` or `manual` is expected.".to_owned(),
         )),
     }
 }
@@ -486,6 +521,18 @@ fn parse_optional_int_field_u8(
         .and_then(|v| v.clone().into_int().ok())
         .unwrap_or(default as i64)
         .min(u8::MAX as i64) as u8
+}
+
+fn parse_optional_int_field_u16(
+    table: std::collections::HashMap<String, config::Value>,
+    field: &str,
+    default: u16,
+) -> u16 {
+    table
+        .get(field)
+        .and_then(|v| v.clone().into_int().ok())
+        .unwrap_or(default as i64)
+        .clamp(0, u16::MAX as i64) as u16
 }
 
 fn parse_optional_string_field(

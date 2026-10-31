@@ -1,13 +1,14 @@
+#[cfg(target_os = "freebsd")]
+mod ipfw_freebsd;
 
-#[cfg(target_os = "linux")]
-mod tproxy_linux;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+mod tproxy_unix;
 
-#[cfg(target_os = "linux")]
-pub use tproxy_linux::*;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub use tproxy_unix::*;
 
-
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 mod tproxy_others;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 pub use tproxy_others::*;

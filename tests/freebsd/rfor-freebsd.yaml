@@ -1,0 +1,21 @@
+debug: true
+tproxy-listen: '[::]:15080'
+socks5-listen: 198.18.0.1:1080
+udp-enabled: true
+
+traffic-intercept:
+  mode: auto
+  local-traffic: true
+  ports: ["18080", "19000", "13"]
+  ipfw-rule-base: 62000
+  tproxy-proxy-chain: rfor-it
+
+outbounds:
+  - name: PROXY
+    url: socks5://198.18.1.2:11080
+  - name: DIRECT
+
+rules:
+  - DOMAIN,proxy.test,PROXY
+  - IP-CIDR,198.18.1.10/32,DIRECT
+  - DEFAULT,,DIRECT

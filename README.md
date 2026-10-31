@@ -13,7 +13,7 @@ Features
     - TLS/QUIC SNI sniffing
     - DNS query sniffing (route intercepted DNS requests by the queried domain)
     - [GeoIP](https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat)/[GeoSite](https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat)/[MMDB](https://raw.githubusercontent.com/alecthw/mmdb_china_ip_list/release/Country.mmdb) support
-- Auto configuration and cleanup for transparent proxy with iptables and tproxy (No more mess with iptables🥳)
+- Auto configuration and cleanup for transparent proxy with Linux TPROXY/iptables and FreeBSD ipfw (No more manual firewall state🥳)
 - Optional source IP preserving when connects directly
 - Native IPv6 support
 - UDP transparent proxy
@@ -33,6 +33,17 @@ $ cargo build --release
 # rustup target add x86_64-unknown-linux-musl
 # RUSTFLAGS='-C target-feature=+crt-static' cargo build --target x86_64-unknown-linux-musl
 ```
+
+On FreeBSD, install a system protobuf compiler and Rust, then build natively:
+
+```bash
+pkg install rust protobuf
+cargo build --release
+```
+
+`pprof`/flamegraph is not available on FreeBSD because the current `pprof`
+crate does not compile for that target. All other features, including the
+SOCKS5 server and transparent proxy, are available.
 
 Usage
 -----
@@ -78,6 +89,38 @@ rules:
   - GEOSITE,geosite.dat:category-ads,DROP
 ```
 
+### FreeBSD transparent proxy
+
+On FreeBSD, `traffic-intercept.mode: auto` (and the alias `tproxy`) selects the
+ipfw backend. `mode: redirect` is intentionally rejected; use `auto`/`tproxy`
+or manage the rules yourself with `mode: manual`. The `ipfw` kernel module must
+already be loaded, for example with `firewall_enable="YES"` in `/etc/rc.conf`
+or `kldload ipfw`.
+
+```yaml
+traffic-intercept:
+  mode: auto
+  local-traffic: false
+  ports: [80, 443]
+  ipfw-rule-base: 64000
+  tproxy-proxy-chain: rfor-proxy
+```
+
+The backend installs commented ipfw rules tagged `// rfor:<tproxy-proxy-chain>`
+and removes them on shutdown. `ipfw-rule-base` must cover eight consecutive rule
+numbers for IPv4/IPv6 TCP/UDP and the optional local-output rules. Keep this
+range reserved. rfor does not change the ipfw default policy; make sure the
+generated rules are reached before any terminal `allow`/`deny` rule.
+
+A FreeBSD listener configured as `[::]:<port>` creates separate IPv4 and IPv6
+sockets, because `ipfw fwd` delivers to the native listener address. An IPv4-only
+listener (`0.0.0.0:<port>`) does not install IPv6 rules.
+
+`local-traffic: true` marks rfor's own sockets with `SO_USER_COOKIE` and uses
+`not sockarg` in the output rules, preventing upstream connections from looping
+back into the proxy. IPv4-mapped IPv6 destinations are normalized to the native
+socket family before transparent binds, TCP connects, and UDP sends.
+
 DNS requests (UDP/TCP port 53) intercepted by tproxy/redirect are sniffed for
 the queried domain, so the domain rules above also apply to DNS traffic itself.
 The query is still forwarded to the original DNS server; only the routing
@@ -105,6 +148,9 @@ OPTIONS:
 ```
 
 # Known Issues
+- On FreeBSD, the ipfw backend requires the `ipfw` module to be loaded and root
+  privileges. It does not add a default `allow` rule; that remains the
+  administrator's policy.
 - `br_netfilter` has some known issues [link](http://patchwork.ozlabs.org/project/netfilter-devel/patch/1518715545-2188-1-git-send-email-gregory.vanderschueren@tessares.net/) with tproxy, which may lead to network timeout in Docker.
    You can mitigate this problem with:
 
