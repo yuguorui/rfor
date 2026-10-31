@@ -1,10 +1,14 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::fs::File;
 
 pub struct Profiler {
-    #[cfg(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64"
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
     ))]
     guard: pprof::ProfilerGuard<'static>,
     pub path: String,
@@ -13,10 +17,13 @@ pub struct Profiler {
 pub fn start(path: &str) -> anyhow::Result<Profiler> {
     tracing::info!("Pprof enabled, output path: {}", path);
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64"
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
     ))]
     {
         let builder = pprof::ProfilerGuardBuilder::default().frequency(1000);
@@ -34,13 +41,16 @@ pub fn start(path: &str) -> anyhow::Result<Profiler> {
         })
     }
 
-    #[cfg(not(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64"
+    #[cfg(not(all(
+        any(target_os = "linux", target_os = "macos"),
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
     )))]
     {
-        tracing::warn!("Pprof is not supported on this architecture.");
+        tracing::warn!("Pprof is not supported on this platform.");
         Ok(Profiler {
             path: path.to_string(),
         })
@@ -49,10 +59,13 @@ pub fn start(path: &str) -> anyhow::Result<Profiler> {
 
 impl Drop for Profiler {
     fn drop(&mut self) {
-        #[cfg(any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64"
+        #[cfg(all(
+            any(target_os = "linux", target_os = "macos"),
+            any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64"
+            )
         ))]
         {
             tracing::info!("Stopping profiler and generating report...");
