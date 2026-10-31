@@ -17,6 +17,9 @@ use once_cell::sync::Lazy;
 #[cfg(target_os = "freebsd")]
 use super::ipfw_freebsd;
 
+#[cfg(target_os = "openbsd")]
+use super::pf_openbsd;
+
 /// Key for UDP session mapping: (source_addr, target_addr)
 type UdpSessionKey = (std::net::SocketAddr, std::net::SocketAddr);
 
@@ -32,6 +35,13 @@ const UDP_SESSION_CHANNEL_SIZE: usize = 32;
 /// DNS exchanges are request/response flows. Avoid retaining each Unbound
 /// query session for the generic UDP idle timeout.
 const DNS_UDP_TIMEOUT_SECS: u64 = 10;
+
+// OpenBSD exposes these as ancillary-data options but the libc crate does not
+// currently define them.
+#[cfg(target_os = "openbsd")]
+const IP_RECVDSTPORT: i32 = 33;
+#[cfg(target_os = "openbsd")]
+const IPV6_RECVDSTPORT: i32 = 64;
 
 /// Global map to track active UDP sessions with packet forwarding channels
 static UDP_SESSIONS: Lazy<DashMap<UdpSessionKey, UdpSessionEntry>> =
@@ -50,7 +60,7 @@ fn setup_iptransparent_opts(sock: &SockRef) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
 fn setup_sockopt_int(fd: i32, level: i32, option: i32, value: i32) -> std::io::Result<()> {
     let ret = unsafe {
         nix::libc::setsockopt(
@@ -66,6 +76,13 @@ fn setup_sockopt_int(fd: i32, level: i32, option: i32, value: i32) -> std::io::R
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+#[cfg(target_os = "openbsd")]
+fn setup_iptransparent_opts(sock: &SockRef) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    setup_sockopt_int(sock.as_raw_fd(), nix::libc::SOL_SOCKET, nix::libc::SO_BINDANY, 1)
 }
 
 #[cfg(target_os = "freebsd")]
@@ -86,6 +103,28 @@ fn setup_udpsock_opts(sock: &tokio::net::UdpSocket) -> Result<()> {
     use std::os::unix::io::AsRawFd;
 
     setup_iptransparent_opts(&SockRef::from(sock))?;
+
+    #[cfg(target_os = "openbsd")]
+    let optret = {
+        let fd = sock.as_raw_fd();
+        match sock.local_addr()?.ip() {
+            std::net::IpAddr::V4(_) => {
+                setup_sockopt_int(fd, nix::libc::IPPROTO_IP, nix::libc::IP_RECVDSTADDR, 1)?;
+                setup_sockopt_int(fd, nix::libc::IPPROTO_IP, IP_RECVDSTPORT, 1)?;
+                0
+            }
+            std::net::IpAddr::V6(_) => {
+                setup_sockopt_int(
+                    fd,
+                    nix::libc::IPPROTO_IPV6,
+                    nix::libc::IPV6_RECVPKTINFO,
+                    1,
+                )?;
+                setup_sockopt_int(fd, nix::libc::IPPROTO_IPV6, IPV6_RECVDSTPORT, 1)?;
+                0
+            }
+        }
+    };
 
     #[cfg(target_os = "linux")]
     let optret = match sock.local_addr()?.ip() {
@@ -190,6 +229,30 @@ async fn bind_tcp_listener(listen_addr: &str) -> Result<TcpListener> {
     Ok(socket.listen(1024)?)
 }
 
+#[cfg(target_os = "openbsd")]
+async fn bind_tcp_listener(listen_addr: &str) -> Result<TcpListener> {
+    use socket2::{Domain, Type};
+    use std::net::SocketAddr;
+
+    let addr: SocketAddr = listen_addr.parse().context("invalid tproxy-listen address")?;
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+    socket.set_reuse_address(true)?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    setup_iptransparent_opts(&SockRef::from(&socket)).context("failed to set SO_BINDANY")?;
+    socket.bind(&SockAddr::from(addr))?;
+    socket.listen(1024)?;
+    let listener: std::net::TcpListener = socket.into();
+    Ok(TcpListener::from_std(listener)?)
+}
+
 #[cfg(target_os = "linux")]
 async fn bind_udp_listener(listen_addr: &str) -> Result<UdpSocket> {
     Ok(UdpSocket::bind(listen_addr).await?)
@@ -216,24 +279,64 @@ async fn bind_udp_listener(listen_addr: &str) -> Result<UdpSocket> {
     Ok(UdpSocket::from_std(socket)?)
 }
 
-fn listener_addrs(listen_addr: &str) -> Result<Vec<String>> {
+#[cfg(target_os = "openbsd")]
+async fn bind_udp_listener(listen_addr: &str) -> Result<UdpSocket> {
+    use socket2::{Domain, Type};
+    use std::net::SocketAddr;
+
+    let addr: SocketAddr = listen_addr.parse().context("invalid tproxy-listen address")?;
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, Type::DGRAM, None)?;
+    socket.set_nonblocking(true)?;
+    socket.set_reuse_address(true)?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.bind(&SockAddr::from(addr))?;
+    let socket: std::net::UdpSocket = socket.into();
+    Ok(UdpSocket::from_std(socket)?)
+}
+
+fn listener_addrs(listen_addr: &str, disable_ipv6: bool) -> Result<Vec<String>> {
     let address: std::net::SocketAddr = listen_addr
         .parse()
         .context("invalid tproxy-listen address")?;
 
-    #[cfg(target_os = "freebsd")]
-    if address.is_ipv6() && address.ip().is_unspecified() {
+    #[cfg(not(target_os = "openbsd"))]
+    let _ = disable_ipv6;
+
+    #[cfg(target_os = "openbsd")]
+    {
+        // PF divert-to addresses the loopback socket explicitly. The
+        // configured address is therefore only used for its port.
         let port = address.port();
-        return Ok(vec![
-            format!("0.0.0.0:{port}"),
-            format!("[::]:{port}"),
-        ]);
+        let mut addrs = vec![format!("127.0.0.1:{port}")];
+        if !disable_ipv6 {
+            addrs.push(format!("[::1]:{port}"));
+        }
+        return Ok(addrs);
     }
 
-    #[cfg(not(target_os = "freebsd"))]
-    let _ = address;
+    #[cfg(not(target_os = "openbsd"))]
+    {
+        #[cfg(target_os = "freebsd")]
+        if address.is_ipv6() && address.ip().is_unspecified() {
+            let port = address.port();
+            return Ok(vec![
+                format!("0.0.0.0:{port}"),
+                format!("[::]:{port}"),
+            ]);
+        }
 
-    Ok(vec![listen_addr.to_owned()])
+        #[cfg(not(target_os = "freebsd"))]
+        let _ = address;
+
+        Ok(vec![listen_addr.to_owned()])
+    }
 }
 
 pub async fn tproxy_worker() -> Result<()> {
@@ -246,17 +349,17 @@ pub async fn tproxy_worker() -> Result<()> {
         return Err(err);
     }
 
-    let (listen_addr, udp_enable) = {
+    let (listen_addr, udp_enable, disable_ipv6) = {
         let settings = get_settings().read().await;
         let Some(listen_addr) = settings.tproxy_listen.clone() else {
             return Ok(());
         };
-        (listen_addr, settings.udp_enable)
+        (listen_addr, settings.udp_enable, settings.disable_ipv6)
     };
     info!("tproxy listen: {}", listen_addr);
 
     let mut tasks = tokio::task::JoinSet::new();
-    for address in listener_addrs(&listen_addr)? {
+    for address in listener_addrs(&listen_addr, disable_ipv6)? {
         let tcp_addr = address.clone();
         tasks.spawn(async move { accept_socket_loop(&tcp_addr).await });
         if udp_enable {
@@ -330,6 +433,7 @@ fn parse_sockaddr_storage(
     })
 }
 
+#[cfg(not(target_os = "openbsd"))]
 fn parse_cmsg_orig_dst_addr(msghdr: &nix::libc::msghdr) -> std::io::Result<std::net::SocketAddr> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -390,6 +494,71 @@ fn parse_cmsg_orig_dst_addr(msghdr: &nix::libc::msghdr) -> std::io::Result<std::
     ))
 }
 
+#[cfg(target_os = "openbsd")]
+fn parse_openbsd_orig_dst_addr(
+    msghdr: &nix::libc::msghdr,
+) -> std::io::Result<std::net::SocketAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let mut ipv4 = None;
+    let mut ipv4_port = None;
+    let mut ipv6 = None;
+    let mut ipv6_port = None;
+
+    let mut cmsgptr = unsafe { nix::libc::CMSG_FIRSTHDR(msghdr) };
+    while !cmsgptr.is_null() {
+        let header = unsafe { &*cmsgptr };
+        let cmsg_len = header.cmsg_len as usize;
+        let data = unsafe { nix::libc::CMSG_DATA(cmsgptr) } as *const nix::libc::c_uchar;
+
+        if header.cmsg_level == nix::libc::IPPROTO_IP
+            && header.cmsg_type == nix::libc::IP_RECVDSTADDR
+            && cmsg_len
+                >= unsafe {
+                    nix::libc::CMSG_LEN(std::mem::size_of::<nix::libc::in_addr>() as u32) as usize
+                }
+        {
+            let addr = unsafe { std::ptr::read_unaligned(data as *const nix::libc::in_addr) };
+            ipv4 = Some(Ipv4Addr::from(u32::from_be(addr.s_addr)));
+        } else if header.cmsg_level == nix::libc::IPPROTO_IP
+            && header.cmsg_type == IP_RECVDSTPORT
+            && cmsg_len >= unsafe { nix::libc::CMSG_LEN(2) as usize }
+        {
+            let port = unsafe { std::ptr::read_unaligned(data as *const u16) };
+            ipv4_port = Some(u16::from_be(port));
+        } else if header.cmsg_level == nix::libc::IPPROTO_IPV6
+            && header.cmsg_type == nix::libc::IPV6_PKTINFO
+            && cmsg_len
+                >= unsafe {
+                    nix::libc::CMSG_LEN(std::mem::size_of::<nix::libc::in6_pktinfo>() as u32) as usize
+                }
+        {
+            let info = unsafe { std::ptr::read_unaligned(data as *const nix::libc::in6_pktinfo) };
+            ipv6 = Some(Ipv6Addr::from(info.ipi6_addr.s6_addr));
+        } else if header.cmsg_level == nix::libc::IPPROTO_IPV6
+            && header.cmsg_type == IPV6_RECVDSTPORT
+            && cmsg_len >= unsafe { nix::libc::CMSG_LEN(2) as usize }
+        {
+            let port = unsafe { std::ptr::read_unaligned(data as *const u16) };
+            ipv6_port = Some(u16::from_be(port));
+        }
+
+        cmsgptr = unsafe { nix::libc::CMSG_NXTHDR(msghdr, cmsgptr) };
+    }
+
+    if let (Some(addr), Some(port)) = (ipv4, ipv4_port) {
+        return Ok(SocketAddr::new(IpAddr::V4(addr), port));
+    }
+    if let (Some(addr), Some(port)) = (ipv6, ipv6_port) {
+        return Ok(SocketAddr::new(IpAddr::V6(addr), port));
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "no OpenBSD original destination address/port received.",
+    ))
+}
+
 /// recvmsg wrapper for tproxy, which returns the source and target sockaddr of the packet.
 fn recvmsg_wrapper(
     fd: i32,
@@ -415,6 +584,9 @@ fn recvmsg_wrapper(
     if ret > 0 {
         let source_sockaddr =
             parse_sockaddr_storage(&unsafe { source_storage.assume_init() })?.to_ipv6_sockaddr();
+        #[cfg(target_os = "openbsd")]
+        let target_sockaddr = parse_openbsd_orig_dst_addr(&msghdr)?.to_ipv6_sockaddr();
+        #[cfg(not(target_os = "openbsd"))]
         let target_sockaddr = parse_cmsg_orig_dst_addr(&msghdr)?.to_ipv6_sockaddr();
 
         return Ok((ret as usize, source_sockaddr, target_sockaddr));
@@ -583,11 +755,11 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
     }
 }
 
-/// FreeBSD binds transparent reply sockets in the target's native family.
-/// Internal rfor addresses use IPv4-mapped IPv6, so unmap them before bind or
-/// connect on an AF_INET socket.
-fn native_sockaddr(addr: std::net::SocketAddr) -> std::net::SocketAddr {
-    #[cfg(target_os = "freebsd")]
+/// FreeBSD and OpenBSD bind transparent reply sockets in the target's native
+/// family. Internal rfor addresses use IPv4-mapped IPv6, so unmap them before
+/// bind or connect on an AF_INET socket.
+pub(crate) fn native_sockaddr(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
     if let std::net::SocketAddr::V6(v6) = addr {
         if let Some(v4) = v6.ip().to_ipv4_mapped() {
             return std::net::SocketAddr::V4(std::net::SocketAddrV4::new(v4, v6.port()));
@@ -606,12 +778,13 @@ async fn udp_socket_bind_to_any_with_flag(
     use std::os::fd::OwnedFd;
     use tokio::net::UdpSocket;
 
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
     let bind_sockaddr = native_sockaddr(bind_sockaddr);
 
     // Linux historically uses an IPv6 socket even for IPv4 targets so that the
-    // reply socket can carry both address families. On FreeBSD, keeping the
-    // target's native family avoids IPv4-mapped-address edge cases in IP_BINDANY.
+    // reply socket can carry both address families. On the BSDs, keeping the
+    // target's native family avoids IPv4-mapped-address edge cases in the
+    // transparent bind options.
     #[cfg(target_os = "linux")]
     let bind_sockaddr = if disable_ipv6 {
         bind_sockaddr
@@ -619,7 +792,7 @@ async fn udp_socket_bind_to_any_with_flag(
         bind_sockaddr.to_ipv6_sockaddr()
     };
 
-    let domain = if cfg!(target_os = "freebsd") {
+    let domain = if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
         if bind_sockaddr.is_ipv4() {
             libc::AF_INET
         } else {
@@ -1203,7 +1376,7 @@ pub fn tproxy_bind_src(sock: SockRef, src_sock: std::net::SocketAddr) -> tokio::
         return Ok(());
     }
 
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
     let src_sock = native_sockaddr(src_sock);
     setup_iptransparent_opts(&sock)?;
     match sock.bind(&SockAddr::from(src_sock)) {
@@ -1240,6 +1413,23 @@ mod tests {
             canonical_ipv6(IpAddr::V6(Ipv6Addr::LOCALHOST)),
             Ipv6Addr::LOCALHOST
         );
+    }
+
+    #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
+    #[test]
+    fn native_sockaddr_unmaps_ipv4_mapped_sources() {
+        use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
+
+        let v4 = Ipv4Addr::new(192, 0, 2, 7);
+        let mapped = std::net::SocketAddr::V6(SocketAddrV6::new(v4.to_ipv6_mapped(), 1234, 0, 0));
+        assert_eq!(
+            super::native_sockaddr(mapped),
+            std::net::SocketAddr::V4(SocketAddrV4::new(v4, 1234))
+        );
+
+        let native =
+            std::net::SocketAddr::V6(SocketAddrV6::new("2001:db8::7".parse().unwrap(), 443, 0, 0));
+        assert_eq!(super::native_sockaddr(native), native);
     }
 
     #[test]
@@ -1721,6 +1911,9 @@ async fn environment_setup() -> Result<()> {
         crate::settings::InterceptMode::IPFW { .. } => {
             return Err(anyhow!("ipfw mode is only supported on FreeBSD"))
         }
+        crate::settings::InterceptMode::PF { .. } => {
+            return Err(anyhow!("pf mode is only supported on OpenBSD"))
+        }
     }
 }
 
@@ -1752,6 +1945,9 @@ async fn clean_environment() -> Result<()> {
         crate::settings::InterceptMode::REDIRECT { .. } => return Ok(()),
         crate::settings::InterceptMode::IPFW { .. } => {
             return Err(anyhow!("ipfw mode is only supported on FreeBSD"))
+        }
+        crate::settings::InterceptMode::PF { .. } => {
+            return Err(anyhow!("pf mode is only supported on OpenBSD"))
         }
     }
 }
@@ -1828,4 +2024,78 @@ async fn clean_environment() -> Result<()> {
     drop(settings);
 
     ipfw_freebsd::cleanup(&proxy_chain, port).await
+}
+
+
+#[cfg(target_os = "openbsd")]
+async fn environment_setup() -> Result<()> {
+    let settings = get_settings().read().await;
+    let (local_traffic, ports, proxy_chain, udp_enable, disable_ipv6, port) =
+        match &settings.intercept_mode {
+            crate::settings::InterceptMode::MANUAL => return Ok(()),
+            crate::settings::InterceptMode::PF {
+                local_traffic,
+                ports,
+                proxy_chain,
+            } => (
+                *local_traffic,
+                ports.clone(),
+                proxy_chain.clone(),
+                settings.udp_enable,
+                settings.disable_ipv6,
+                settings
+                    .tproxy_listen
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("tproxy-listen is not configured"))?
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|e| anyhow!("invalid tproxy-listen address: {}", e))?
+                    .port(),
+            ),
+            _ => {
+                return Err(anyhow!(
+                    "OpenBSD transparent interception requires auto/tproxy/pf mode"
+                ))
+            }
+        };
+    let bind_ranges: Vec<ipnet::Ipv6Net> = settings
+        .routetable
+        .outbounds
+        .iter()
+        .filter_map(|outbound| outbound.bind_range.as_ref())
+        .flat_map(|range| range.iter())
+        .collect();
+    drop(settings);
+
+    pf_openbsd::setup(
+        port,
+        &ports,
+        local_traffic,
+        &proxy_chain,
+        disable_ipv6,
+        udp_enable,
+        &bind_ranges,
+    )
+    .await
+}
+
+#[cfg(target_os = "openbsd")]
+async fn clean_environment() -> Result<()> {
+    let settings = get_settings().read().await;
+    let (proxy_chain, port) = match &settings.intercept_mode {
+        crate::settings::InterceptMode::MANUAL => return Ok(()),
+        crate::settings::InterceptMode::PF { proxy_chain, .. } => (
+            proxy_chain.clone(),
+            settings
+                .tproxy_listen
+                .as_ref()
+                .ok_or_else(|| anyhow!("tproxy-listen is not configured"))?
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| anyhow!("invalid tproxy-listen address: {}", e))?
+                .port(),
+        ),
+        _ => return Ok(()),
+    };
+    drop(settings);
+
+    pf_openbsd::cleanup(&proxy_chain, port).await
 }

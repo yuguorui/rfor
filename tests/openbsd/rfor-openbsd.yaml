@@ -1,0 +1,21 @@
+tproxy-listen: '127.0.0.1:15080'
+socks5-listen: '127.0.0.1:1080'
+
+udp-enabled: true
+udp-timeout: 30
+
+traffic-intercept:
+  mode: auto
+  local-traffic: false
+  ports: [80, 443, 8000]
+  tproxy-proxy-chain: rfor-proxy
+
+outbounds:
+  - name: DIRECT
+    # To test source preservation, use a range that contains the client
+    # address, for example:
+    # bind_range:
+    #   - ::ffff:10.55.0.0/120
+
+rules:
+  - DEFAULT,,DIRECT

@@ -58,7 +58,7 @@ pub struct SniffedTcp {
 }
 
 // Re-export QUIC aggregator for cross-packet SNI parsing
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
 pub use quic_parser::{QuicParseResult, QuicSniAggregator};
 
 pub fn parse_tcp_host(data: &[u8]) -> HostParseResult {

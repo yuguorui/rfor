@@ -62,6 +62,11 @@ pub enum InterceptMode {
         rule_base: u16,
         proxy_chain: String,
     },
+    PF {
+        local_traffic: bool,
+        ports: String,
+        proxy_chain: String,
+    },
     MANUAL,
 }
 
@@ -147,6 +152,7 @@ impl Settings {
         let udp_enable = match &intercept_mode {
             InterceptMode::TPROXY { .. }
             | InterceptMode::IPFW { .. }
+            | InterceptMode::PF { .. }
             | InterceptMode::MANUAL => {
                 // The canonical key is `udp-enabled`; keep `udp-enable` as a
                 // deprecated alias so existing configs keep working.
@@ -411,7 +417,7 @@ fn parse_intercept_mode(s: &Config) -> Result<InterceptMode, ConfigError> {
 
     match mode.as_str() {
         "manual" => return Ok(InterceptMode::MANUAL),
-        "auto" | "tproxy" | "ipfw" | "redirect" => {
+        "auto" | "tproxy" | "ipfw" | "pf" | "redirect" => {
             let capture_local_traffic = table
                 .get("local-traffic")
                 .and_then(|v| v.clone().into_bool().ok())
@@ -450,9 +456,9 @@ fn parse_intercept_mode(s: &Config) -> Result<InterceptMode, ConfigError> {
                 parse_optional_int_field_u8(table.clone(), "rule-table", DEFAULT_IPRULE_TABLE);
 
             if mode == "redirect" {
-                if cfg!(target_os = "freebsd") {
+                if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
                     return Err(ConfigError::Message(
-                        "redirect mode is not supported on FreeBSD; use auto/tproxy (ipfw) or manual"
+                        "redirect mode is not supported on this BSD; use auto/tproxy (ipfw or pf) or manual"
                             .to_string(),
                     ));
                 }
@@ -462,6 +468,12 @@ fn parse_intercept_mode(s: &Config) -> Result<InterceptMode, ConfigError> {
                     direct_mark,
                     proxy_chain,
                 });
+            }
+
+            if mode == "pf" && !cfg!(target_os = "openbsd") {
+                return Err(ConfigError::Message(
+                    "pf mode is only supported on OpenBSD; use auto/tproxy".to_string(),
+                ));
             }
 
             if mode == "ipfw" || cfg!(target_os = "freebsd") {
@@ -480,6 +492,19 @@ fn parse_intercept_mode(s: &Config) -> Result<InterceptMode, ConfigError> {
                     local_traffic: capture_local_traffic,
                     ports: ports.unwrap_or_default(),
                     rule_base,
+                    proxy_chain,
+                });
+            }
+
+            if mode == "pf" || cfg!(target_os = "openbsd") {
+                if !cfg!(target_os = "openbsd") {
+                    return Err(ConfigError::Message(
+                        "pf mode is only supported on OpenBSD; use auto/tproxy".to_string(),
+                    ));
+                }
+                return Ok(InterceptMode::PF {
+                    local_traffic: capture_local_traffic,
+                    ports: ports.unwrap_or_default(),
                     proxy_chain,
                 });
             }

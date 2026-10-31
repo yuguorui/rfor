@@ -298,8 +298,9 @@ fn setup_tcp_keepalive(sock: &TcpStream) {
     use socket2::SockRef;
     let sock_ref = SockRef::from(sock);
     let keepalive = socket2::TcpKeepalive::new()
-        .with_time(std::time::Duration::from_secs(60))
-        .with_interval(std::time::Duration::from_secs(10));
+        .with_time(std::time::Duration::from_secs(60));
+    #[cfg(not(target_os = "openbsd"))]
+    let keepalive = keepalive.with_interval(std::time::Duration::from_secs(10));
     if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
         tracing::warn!("Failed to set TCP keepalive: {}", e);
     }

@@ -2,7 +2,7 @@ use fqdn::FQDN;
 use fqdn_trie::FqdnTrieMap;
 use ipnet::Ipv6Net;
 use iprange::IpRange;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
 use socket2::SockRef;
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
@@ -25,6 +25,7 @@ use crate::utils::{rfor_bind_addr, to_io_err, ToV6Net, ToV6SockAddr};
 use fast_socks5::client as socks_client;
 
 pub const TIMEOUT: u64 = 3000;
+#[cfg(target_os = "freebsd")]
 const RFOR_SOCKET_COOKIE: u32 = 0x5246_4f52;
 
 #[derive(Debug, Clone)]
@@ -169,7 +170,7 @@ impl Display for TargetAddr {
 #[derive(Debug, Clone)]
 pub enum InboundProtocol {
     SOCKS5,
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
     TPROXY,
     REDIRECT,
     UNKNOWN,
@@ -321,7 +322,7 @@ impl RouteTable {
 
         if outbound.url.is_none() {
             let sock_addr = resolve_target_addr(context.dst_addr.clone()).await?;
-            let use_ipv4 = if cfg!(target_os = "freebsd") {
+            let use_ipv4 = if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
                 sock_addr.is_ipv4()
             } else {
                 get_settings().read().await.disable_ipv6
@@ -336,7 +337,7 @@ impl RouteTable {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "inbound_proto is None")
             })?;
 
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
             if matches!(
                 inbound_proto,
                 InboundProtocol::TPROXY | InboundProtocol::REDIRECT
@@ -358,7 +359,7 @@ impl RouteTable {
                 prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
             }
 
-            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+            #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd")))]
             let _ = inbound_proto; // Suppress unused variable warning
 
             return timeout(Duration::from_millis(TIMEOUT), sock.connect(sock_addr)).await?;
@@ -435,7 +436,7 @@ impl RouteTable {
                         None,
                     ))
                     .await?;
-                    let use_ipv4 = if cfg!(target_os = "freebsd") {
+                    let use_ipv4 = if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
                         socks_sock_addr.is_ipv4()
                     } else {
                         get_settings().read().await.disable_ipv6
@@ -445,7 +446,7 @@ impl RouteTable {
                     } else {
                         TcpSocket::new_v6()?
                     };
-                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
                     prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
                     let stream = sock.connect(socks_sock_addr).await?;
 
@@ -514,15 +515,45 @@ impl RouteTable {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "inbound_proto is None")
             })?;
 
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
             if let InboundProtocol::TPROXY = inbound_proto {
                 if let Some(bind_range) = &outbound.bind_range {
                     if let Ok(ipv6_net) = context.src_addr.ip().to_ipv6_net() {
                         if bind_range.contains(&ipv6_net) {
+                            // OpenBSD PF identifies the divert-to flow and the
+                            // bind_range upstream flow by the same 5-tuple when
+                            // the client's source port is reused. The server
+                            // reply then matches the divert-to state instead of
+                            // the upstream socket, so UDP source preservation
+                            // must keep the address but let the kernel choose
+                            // a fresh source port.
+                            #[cfg(target_os = "openbsd")]
+                            let bind_src =
+                                std::net::SocketAddr::new(context.src_addr.ip(), 0);
+                            #[cfg(not(target_os = "openbsd"))]
+                            let bind_src = context.src_addr;
                             crate::tproxy::tproxy_bind_src(
                                 SockRef::from(&raw_sock),
-                                context.src_addr,
+                                bind_src,
                             )?;
+
+                            // OpenBSD's divert-reply delivery only reaches a
+                            // connected UDP socket. Keep the upstream socket
+                            // connected for the lifetime of this (source,
+                            // target) session when source preservation is on.
+                            #[cfg(target_os = "openbsd")]
+                            {
+                                let target = match &context.dst_addr {
+                                    TargetAddr::Ip(addr) => Some(*addr),
+                                    TargetAddr::Domain(_, _, Some(addr)) => Some(*addr),
+                                    _ => None,
+                                };
+                                if let Some(addr) = target {
+                                    raw_sock.connect(&socket2::SockAddr::from(
+                                        crate::tproxy::native_sockaddr(addr),
+                                    ))?;
+                                }
+                            }
                         }
                     }
                 }
@@ -530,7 +561,7 @@ impl RouteTable {
                 prepare_socket_bypass_mangle(raw_sock.as_raw_fd()).await?;
             }
 
-            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+            #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd")))]
             let _ = inbound_proto; // Suppress unused variable warning
 
             let sock = UdpSocket::from_std(unsafe {
@@ -556,6 +587,7 @@ impl RouteTable {
                 ))
             }
             "socks" | "socks5" => {
+                #[cfg(not(target_os = "openbsd"))]
                 let socks_server = format!(
                     "{}:{}",
                     proxy_url.host_str().ok_or_else(|| {
@@ -566,6 +598,34 @@ impl RouteTable {
                     })?
                 );
 
+                #[cfg(target_os = "openbsd")]
+                let backing_socket = {
+                    let socks_addr = resolve_target_addr(TargetAddr::Domain(
+                        proxy_url
+                            .host_str()
+                            .ok_or_else(|| std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "missing proxy host",
+                            ))?
+                            .to_owned(),
+                        proxy_url.port_or_known_default().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "missing proxy port",
+                            )
+                        })?,
+                        None,
+                    ))
+                    .await?;
+                    let sock = if socks_addr.is_ipv4() {
+                        TcpSocket::new_v4()?
+                    } else {
+                        TcpSocket::new_v6()?
+                    };
+                    prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
+                    timeout(Duration::from_millis(TIMEOUT), sock.connect(socks_addr)).await??
+                };
+                #[cfg(not(target_os = "openbsd"))]
                 let backing_socket = timeout(
                     Duration::from_millis(TIMEOUT),
                     TcpStream::connect(&socks_server),
@@ -604,7 +664,7 @@ impl RouteTable {
 async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr> {
     let address = match target {
         TargetAddr::Ip(addr) => {
-            if cfg!(target_os = "freebsd") {
+            if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
                 addr
             } else {
                 match get_settings().read().await.disable_ipv6 {
@@ -625,7 +685,7 @@ async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr
                             format!("DNS lookup returned no results for {}:{}", domain, port),
                         )
                     })?;
-                if cfg!(target_os = "freebsd") {
+                if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
                     sock
                 } else {
                     match get_settings().read().await.disable_ipv6 {
@@ -637,7 +697,7 @@ async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr
         },
     };
 
-    Ok(if cfg!(target_os = "freebsd") {
+    Ok(if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
         native_socket_addr(address)
     } else {
         address
@@ -661,7 +721,7 @@ fn sockaddr_is_ipv4(address: &std::net::SocketAddr) -> bool {
 }
 
 fn target_uses_ipv4(target: &TargetAddr, disable_ipv6: bool) -> bool {
-    if cfg!(target_os = "freebsd") {
+    if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
         match target {
             TargetAddr::Ip(address) => address.is_ipv4(),
             TargetAddr::Domain(_, _, Some(address)) => sockaddr_is_ipv4(address),
@@ -685,6 +745,7 @@ pub async fn prepare_socket_bypass_mangle(sockfd: i32) -> tokio::io::Result<()> 
                 nix::sys::socket::setsockopt(&fd, nix::sys::socket::sockopt::Mark, &direct_mark)?;
             }
             crate::settings::InterceptMode::IPFW { .. }
+            | crate::settings::InterceptMode::PF { .. }
             | crate::settings::InterceptMode::MANUAL => {}
         }
     }
@@ -694,7 +755,8 @@ pub async fn prepare_socket_bypass_mangle(sockfd: i32) -> tokio::io::Result<()> 
         match &get_settings().read().await.intercept_mode {
             crate::settings::InterceptMode::TPROXY { .. }
             | crate::settings::InterceptMode::REDIRECT { .. }
-            | crate::settings::InterceptMode::IPFW { .. } => {
+            | crate::settings::InterceptMode::IPFW { .. }
+            | crate::settings::InterceptMode::PF { .. } => {
                 // The FreeBSD ``not sockarg`` output rule keeps rfor's own
                 // connections out of the local-traffic interception path.
                 let cookie = RFOR_SOCKET_COOKIE;
@@ -738,29 +800,34 @@ impl ProxyDgram for UdpSocket {
     }
 
     async fn send_to(&self, buf: &[u8], target: TargetAddr) -> tokio::io::Result<usize> {
-        match target {
-            TargetAddr::Ip(addr) => self.send_to(buf, addr).await,
-            TargetAddr::Domain(domain, port, osock) => {
-                let sock = match osock {
-                    Some(sock) => sock,
-                    None => {
-                        let sock = tokio::net::lookup_host((domain.as_str(), port))
-                            .await?
-                            .next()
-                            .ok_or_else(|| {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::NotFound,
-                                    format!("DNS lookup returned no results for {}:{}", domain, port),
-                                )
-                            })?;
-                        match get_settings().read().await.disable_ipv6 {
-                            false => sock.to_ipv6_sockaddr(),
-                            true => sock,
-                        }
+        let sock = match target {
+            TargetAddr::Ip(addr) => addr,
+            TargetAddr::Domain(domain, port, osock) => match osock {
+                Some(sock) => sock,
+                None => {
+                    let sock = tokio::net::lookup_host((domain.as_str(), port))
+                        .await?
+                        .next()
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!("DNS lookup returned no results for {}:{}", domain, port),
+                            )
+                        })?;
+                    match get_settings().read().await.disable_ipv6 {
+                        false => sock.to_ipv6_sockaddr(),
+                        true => sock,
                     }
-                };
-                self.send_to(buf, sock).await
-            }
+                }
+            },
+        };
+        match self.send_to(buf, sock).await {
+            Ok(size) => Ok(size),
+            // OpenBSD rejects sendto(2) on a connected UDP socket. This path is
+            // used when bind_range connects the upstream socket for
+            // divert-reply source preservation.
+            Err(err) if err.raw_os_error() == Some(nix::libc::EISCONN) => self.send(buf).await,
+            Err(err) => Err(err),
         }
     }
 }
