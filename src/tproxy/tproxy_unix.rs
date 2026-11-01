@@ -8,6 +8,7 @@ use tracing::{error, info, warn, debug};
 use crate::{rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr, get_settings};
 use crate::stats::UDP_STATS;
 use std::{collections::hash_map, mem::MaybeUninit, sync::Arc, time::Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "linux")]
 use std::os::fd::BorrowedFd;
 
@@ -20,13 +21,60 @@ use super::ipfw_freebsd;
 #[cfg(target_os = "openbsd")]
 use super::pf_openbsd;
 
-/// Key for UDP session mapping: (source_addr, target_addr)
-type UdpSessionKey = (std::net::SocketAddr, std::net::SocketAddr);
+/// Normalized key for a UDP session. The constructor is the only way to
+/// build a key, so insertion and removal always use the same address form.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+struct UdpSessionKey {
+    source: std::net::SocketAddr,
+    target: std::net::SocketAddr,
+}
+
+impl UdpSessionKey {
+    fn new(source: std::net::SocketAddr, target: std::net::SocketAddr) -> Self {
+        Self {
+            source: source.to_ipv6_sockaddr(),
+            target: target.to_ipv6_sockaddr(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct UdpSessionId(u64);
+
+static NEXT_UDP_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_udp_session_id() -> UdpSessionId {
+    UdpSessionId(NEXT_UDP_SESSION_ID.fetch_add(1, Ordering::Relaxed))
+}
 
 /// UDP session entry containing a channel sender for forwarding packets
 struct UdpSessionEntry {
+    /// Unique generation, so a finishing task cannot remove a replacement.
+    id: UdpSessionId,
     /// Channel sender for forwarding packets to the session handler
     packet_tx: mpsc::Sender<bytes::Bytes>,
+}
+
+/// Removes the session and updates stats when the relay task exits, including
+/// early error/panic exits. Only removes the matching generation.
+#[must_use = "the lease must be held for the lifetime of the relay task"]
+struct UdpSessionLease {
+    key: UdpSessionKey,
+    id: UdpSessionId,
+}
+
+impl UdpSessionLease {
+    fn new(key: UdpSessionKey, id: UdpSessionId) -> Self {
+        UDP_STATS.session_start();
+        Self { key, id }
+    }
+}
+
+impl Drop for UdpSessionLease {
+    fn drop(&mut self) {
+        UDP_SESSIONS.remove_if(&self.key, |_, entry| entry.id == self.id);
+        UDP_STATS.session_end(0);
+    }
 }
 
 /// Channel buffer size for forwarding packets to existing sessions
@@ -349,40 +397,46 @@ pub async fn tproxy_worker() -> Result<()> {
         return Err(err);
     }
 
-    let (listen_addr, udp_enable, disable_ipv6) = {
-        let settings = get_settings().read().await;
-        let Some(listen_addr) = settings.tproxy_listen.clone() else {
-            return Ok(());
+    // Keep every fallible step after environment_setup inside this block so
+    // the environment is cleaned on every normal error path, not only on a
+    // listener task error or signal.
+    let result = async {
+        let (listen_addr, udp_enable, disable_ipv6) = {
+            let settings = get_settings().read().await;
+            let Some(listen_addr) = settings.tproxy_listen.clone() else {
+                return Ok(());
+            };
+            (listen_addr, settings.udp_enable, settings.disable_ipv6)
         };
-        (listen_addr, settings.udp_enable, settings.disable_ipv6)
-    };
-    info!("tproxy listen: {}", listen_addr);
+        info!("tproxy listen: {}", listen_addr);
 
-    let mut tasks = tokio::task::JoinSet::new();
-    for address in listener_addrs(&listen_addr, disable_ipv6)? {
-        let tcp_addr = address.clone();
-        tasks.spawn(async move { accept_socket_loop(&tcp_addr).await });
-        if udp_enable {
-            let udp_addr = address;
-            tasks.spawn(async move { udp_socket_loop(&udp_addr).await });
+        let mut tasks = tokio::task::JoinSet::new();
+        for address in listener_addrs(&listen_addr, disable_ipv6)? {
+            let tcp_addr = address.clone();
+            tasks.spawn(async move { accept_socket_loop(&tcp_addr).await });
+            if udp_enable {
+                let udp_addr = address;
+                tasks.spawn(async move { udp_socket_loop(&udp_addr).await });
+            }
+        }
+
+        tokio::select! {
+            result = async {
+                loop {
+                    match tasks.join_next().await {
+                        Some(Ok(Ok(()))) => continue,
+                        Some(Ok(Err(err))) => break Err(err),
+                        Some(Err(err)) => {
+                            break Err(anyhow!("tproxy task failed: {}", err))
+                        }
+                        None => break Ok(()),
+                    }
+                }
+            } => result,
+            err = crate::utils::receive_signal() => err,
         }
     }
-
-    let result = tokio::select! {
-        result = async {
-            loop {
-                match tasks.join_next().await {
-                    Some(Ok(Ok(()))) => continue,
-                    Some(Ok(Err(err))) => break Err(err),
-                    Some(Err(err)) => {
-                        break Err(anyhow!("tproxy task failed: {}", err))
-                    }
-                    None => break Ok(()),
-                }
-            }
-        } => result,
-        err = crate::utils::receive_signal() => err,
-    };
+    .await;
 
     clean_environment().await?;
     result
@@ -624,11 +678,7 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
             .await
         {
             Ok((size, source_sockaddr, target_sockaddr)) => {
-                // Normalize addresses for consistent session key
-                let session_key = (
-                    source_sockaddr.to_ipv6_sockaddr(),
-                    target_sockaddr.to_ipv6_sockaddr(),
-                );
+                let session_key = UdpSessionKey::new(source_sockaddr, target_sockaddr);
 
                 let prefilled_data = bytes::Bytes::copy_from_slice(&buffer[..size]);
 
@@ -636,6 +686,7 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
                 // limit has been reached. Do the lookup before enforcing the limit,
                 // and avoid calling UDP_SESSIONS.len() while holding an entry lock.
                 if let Some(session) = UDP_SESSIONS.get(&session_key) {
+                    let session_id = session.id;
                     match session.packet_tx.try_send(prefilled_data) {
                         Ok(_) => {
                             debug!(
@@ -653,7 +704,7 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
                             // Session is closing, remove the stale entry and let the
                             // next packet create a replacement session.
                             drop(session);
-                            UDP_SESSIONS.remove(&session_key);
+                            UDP_SESSIONS.remove_if(&session_key, |_, entry| entry.id == session_id);
                             debug!(
                                 "udp relay: removed stale session {:?} <-> {:?}",
                                 source_sockaddr, target_sockaddr
@@ -677,8 +728,8 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
                 match UDP_SESSIONS.entry(session_key) {
                     Entry::Occupied(entry) => {
                         // Session already exists, forward packet through channel
-                        let session = entry.get();
-                        match session.packet_tx.try_send(prefilled_data) {
+                        let session_id = entry.get().id;
+                        match entry.get().packet_tx.try_send(prefilled_data) {
                             Ok(_) => {
                                 debug!(
                                     "udp relay: forwarded packet to existing session {:?} <-> {:?}, {} bytes",
@@ -694,7 +745,7 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 // Session is closing, remove stale entry and let next packet create new session
                                 drop(entry);
-                                UDP_SESSIONS.remove(&session_key);
+                                UDP_SESSIONS.remove_if(&session_key, |_, entry| entry.id == session_id);
                                 debug!(
                                     "udp relay: removed stale session {:?} <-> {:?}",
                                     source_sockaddr, target_sockaddr
@@ -713,12 +764,12 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
                             continue;
                         }
 
+                        let id = next_udp_session_id();
                         entry.insert(UdpSessionEntry {
+                            id,
                             packet_tx: tx,
                         });
-
-                        // Track UDP session start
-                        UDP_STATS.session_start();
+                        let lease = UdpSessionLease::new(session_key, id);
 
                         info!(
                             "udp relay: create tunnel {:?} <-> {:?} (active sessions: {})",
@@ -731,15 +782,7 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
                                 source_sockaddr,
                                 target_sockaddr,
                             ).await;
-
-                            // Always remove the session when done (DashMap remove is lock-free)
-                            UDP_SESSIONS.remove(&(
-                                source_sockaddr.to_ipv6_sockaddr(),
-                                target_sockaddr.to_ipv6_sockaddr(),
-                            ));
-
-                            // Track UDP session end (bytes are tracked inside relay_udp_packet)
-                            UDP_STATS.session_end(0);
+                            drop(lease);
 
                             if let Err(e) = result {
                                 error!("Failed to relay udp packet: {}", e);
@@ -1475,6 +1518,44 @@ mod tests {
         let native =
             std::net::SocketAddr::V6(SocketAddrV6::new("2001:db8::7".parse().unwrap(), 443, 0, 0));
         assert_eq!(super::native_sockaddr(native), native);
+    }
+
+    #[test]
+    fn udp_session_lease_removes_only_its_generation() {
+        use tokio::sync::mpsc;
+
+        let key = UdpSessionKey::new(
+            "127.0.0.1:65000".parse().unwrap(),
+            "127.0.0.1:65001".parse().unwrap(),
+        );
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let first_id = next_udp_session_id();
+        UDP_SESSIONS.insert(
+            key,
+            UdpSessionEntry {
+                id: first_id,
+                packet_tx: first_tx,
+            },
+        );
+        let lease = UdpSessionLease::new(key, first_id);
+
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        let second_id = next_udp_session_id();
+        UDP_SESSIONS.insert(
+            key,
+            UdpSessionEntry {
+                id: second_id,
+                packet_tx: second_tx,
+            },
+        );
+
+        drop(lease);
+        let preserved = UDP_SESSIONS
+            .get(&key)
+            .map(|entry| entry.id == second_id)
+            .unwrap_or(false);
+        UDP_SESSIONS.remove(&key);
+        assert!(preserved, "old lease removed the replacement session");
     }
 
     #[test]
