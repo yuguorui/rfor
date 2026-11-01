@@ -126,10 +126,11 @@ socket family before transparent binds, TCP connects, and UDP sends.
 
 On OpenBSD, `traffic-intercept.mode: auto` (and `tproxy`) selects the PF
 backend; `mode: pf` is also accepted. `redirect` and `ipfw` are rejected.
-The first version intentionally supports forwarded traffic only:
-`local-traffic: true` is rejected at startup because the loopback route-to/TOS
-marker path has not been live-tested and is not safe to ship as an implicit
-feature yet.
+Local traffic is intentionally unsupported on OpenBSD: PF divert-to only
+tags inbound packets, and the veb/vport detour that was needed for locally
+generated traffic has been removed. `local-traffic: true` is rejected at
+startup; use an explicit proxy (for example an `http_proxy` setting) for
+commands that must egress through rfor.
 Forwarded TCP/UDP over IPv4 and IPv6 has been live-tested on OpenBSD 7.9
 and 8.0 (8.0 after syspatch 001-005).
 Source preservation through `bind_range` is live-tested for IPv4 and IPv6
@@ -222,10 +223,9 @@ OPTIONS:
   privileges. It does not add a default `allow` rule; that remains the
   administrator's policy.
 - On OpenBSD, the PF backend requires root, an enabled PF, and the one-time
-  `anchor "rfor/*"` hook. Only forwarded traffic is supported in this version;
-  `local-traffic: true` is rejected. The PF/relayd `divert-to` mechanism and
-  the scoped `divert-reply` rules are source-verified but not yet live-tested
-  in this repository's test VM.
+  `anchor "rfor/*"` hook. Only forwarded traffic is supported;
+  `local-traffic: true` is rejected at startup. Use an explicit proxy (for
+  example `http_proxy`) for commands that must egress through rfor.
 - `br_netfilter` has some known issues [link](http://patchwork.ozlabs.org/project/netfilter-devel/patch/1518715545-2188-1-git-send-email-gregory.vanderschueren@tessares.net/) with tproxy, which may lead to network timeout in Docker.
    You can mitigate this problem with:
 

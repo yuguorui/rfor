@@ -12,9 +12,8 @@
 //! contain an anchor "rfor/*" reference; the anchor cannot be attached to an
 //! already-running ruleset safely from userland.
 //!
-//! This first OpenBSD backend is forwarded-traffic only. Local output capture
-//! needs a loopback detour and a reliable socket marker; neither path has been
-//! live-tested yet, so local-traffic: true is rejected at startup.
+//! Only forwarded traffic is intercepted.  PF divert-to only tags inbound
+//! packets; locally generated traffic is intentionally unsupported.
 
 use anyhow::{anyhow, Context, Result};
 use std::fmt::Write as _;
@@ -79,15 +78,6 @@ fn validate_ports(ports: &str) -> Result<()> {
     {
         return Err(anyhow!(
             "invalid traffic-intercept.ports value for pf: {ports}"
-        ));
-    }
-    Ok(())
-}
-
-fn ensure_forwarded_only(local_traffic: bool) -> Result<()> {
-    if local_traffic {
-        return Err(anyhow!(
-            "OpenBSD local-traffic interception is not supported in this version; set traffic-intercept.local-traffic: false"
         ));
     }
     Ok(())
@@ -318,20 +308,24 @@ fn load_anchor(anchor: &str, rules: &str) -> Result<()> {
 pub async fn setup(
     tproxy_port: u16,
     ports: &str,
-    local_traffic: bool,
     chain: &str,
     disable_ipv6: bool,
     udp_enable: bool,
     bind_ranges: &[Ipv6Net],
 ) -> Result<()> {
-    ensure_forwarded_only(local_traffic)?;
     if crate::utils::geteuid() != 0 {
         return Err(anyhow!("must be root to configure pf"));
     }
 
-    let (local_v4, local_v6) = local_addresses()?;
+    let anchor = anchor_name(chain, tproxy_port);
+    ensure_anchor_reference(&anchor)?;
+
+    let (local_v4, local_v6) = match local_addresses() {
+        Ok(addresses) => addresses,
+        Err(error) => return Err(error),
+    };
     let (source_v4, source_v6) = source_tables(bind_ranges);
-    let rules = render_rules(
+    let rules = match render_rules(
         tproxy_port,
         ports,
         disable_ipv6,
@@ -340,10 +334,11 @@ pub async fn setup(
         &local_v6,
         &source_v4,
         &source_v6,
-    )?;
-    let anchor = anchor_name(chain, tproxy_port);
+    ) {
+        Ok(rules) => rules,
+        Err(error) => return Err(error),
+    };
 
-    ensure_anchor_reference(&anchor)?;
     let _ = flush_anchor(&anchor);
     if let Err(error) = load_anchor(&anchor, &rules) {
         let _ = flush_anchor(&anchor);
@@ -398,12 +393,6 @@ mod tests {
     fn anchor_names_are_bounded_and_safe() {
         assert_eq!(anchor_name("rfor-proxy", 15080), "rfor/15080_rforproxy");
         assert!(anchor_name(&"x".repeat(200), 65535).len() < 64);
-    }
-
-    #[test]
-    fn local_traffic_is_rejected() {
-        assert!(ensure_forwarded_only(true).is_err());
-        assert!(ensure_forwarded_only(false).is_ok());
     }
 
     #[test]

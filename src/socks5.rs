@@ -14,7 +14,67 @@ use crate::{
     get_settings,
 };
 
+/// SOCKS5 listeners use the default routing table.
+async fn bind_listener(listen_addr: &str) -> Result<TcpListener> {
+    #[cfg(target_os = "openbsd")]
+    {
+        use socket2::{Domain, Type};
+        use std::net::SocketAddr;
+
+        let addr: SocketAddr = listen_addr
+            .parse()
+            .context("invalid socks5-listen address")?;
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = socket2::Socket::new(domain, Type::STREAM, None)?;
+        socket.set_nonblocking(true)?;
+        socket.set_reuse_address(true)?;
+        if addr.is_ipv6() {
+            socket.set_only_v6(true)?;
+        }
+        socket.bind(&socket2::SockAddr::from(addr))?;
+        socket.listen(1024)?;
+        let listener: std::net::TcpListener = socket.into();
+        Ok(TcpListener::from_std(listener)?)
+    }
+    #[cfg(not(target_os = "openbsd"))]
+    {
+        Ok(TcpListener::bind(listen_addr).await?)
+    }
+}
+
+async fn bind_udp_relay(bind_addr: &str) -> Result<UdpSocket> {
+    #[cfg(target_os = "openbsd")]
+    {
+        use socket2::{Domain, Type};
+        use std::net::SocketAddr;
+
+        let addr: SocketAddr = bind_addr.parse().context("invalid UDP relay address")?;
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = socket2::Socket::new(domain, Type::DGRAM, None)?;
+        socket.set_nonblocking(true)?;
+        if addr.is_ipv6() {
+            socket.set_only_v6(true)?;
+        }
+        socket.bind(&socket2::SockAddr::from(addr))?;
+        let socket: std::net::UdpSocket = socket.into();
+        Ok(UdpSocket::from_std(socket)?)
+    }
+    #[cfg(not(target_os = "openbsd"))]
+    {
+        Ok(UdpSocket::bind(bind_addr).await?)
+    }
+}
+
 pub async fn socks5_worker() -> Result<()> {
+
     if get_settings().read().await.socks5_listen.is_none() {
         return Ok(());
     }
@@ -24,7 +84,7 @@ pub async fn socks5_worker() -> Result<()> {
     };
     info!("socks5 listen: {}", listen_addr);
 
-    let listener = TcpListener::bind(listen_addr).await?;
+    let listener = bind_listener(&listen_addr).await?;
 
     loop {
         match listener.accept().await {
@@ -99,7 +159,7 @@ async fn socks5_instance(socket: TcpStream) -> Result<()> {
                     std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
                 )
             };
-            let peer_sock = UdpSocket::bind(bind_addr).await?;
+            let peer_sock = bind_udp_relay(bind_addr).await?;
 
             let udp_port = peer_sock.local_addr()?.port();
             let mut inner = proto

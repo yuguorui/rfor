@@ -2212,10 +2212,15 @@ async fn environment_setup() -> Result<()> {
         .collect();
     drop(settings);
 
+    if local_traffic {
+        return Err(anyhow!(
+            "OpenBSD PF local-traffic is not supported; only forwarded traffic is intercepted"
+        ));
+    }
+
     pf_openbsd::setup(
         port,
         &ports,
-        local_traffic,
         &proxy_chain,
         disable_ipv6,
         udp_enable,
