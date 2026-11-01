@@ -62,10 +62,10 @@ EOF
 if ! docker info >/dev/null 2>&1; then
     fail "Docker is not available"
 fi
-if [ "${RFOR_DOCKER_REBUILD:-0}" = "1" ] || ! docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
-    echo "--- building $DOCKER_IMAGE ---"
-    docker build -t "$DOCKER_IMAGE" "$SCRIPT_DIR"
-fi
+# Always invoke the build so COPY changes (run-in-container.sh) take effect.
+# Docker layer caching makes this a no-op when nothing changed.
+echo "--- building $DOCKER_IMAGE (cached unless inputs changed) ---"
+docker build -t "$DOCKER_IMAGE" "$SCRIPT_DIR"
 
 echo "--- preparing FreeBSD image (first cloud-init may take several minutes) ---"
 docker run --rm \

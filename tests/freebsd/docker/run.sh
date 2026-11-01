@@ -63,32 +63,13 @@ FREEBSD_IMAGE="${FREEBSD_IMAGE:-$CACHE_ROOT/rfor/freebsd-15.1/FreeBSD-15.1-prepa
 RFOR_BIN=$(rfor_abs_path "$RFOR_BIN")
 SSH_KEY=$(rfor_abs_path "$SSH_KEY")
 
-CONF_DIR=$(mktemp -d "$CACHE_ROOT/rfor/freebsd-seed.XXXXXX")
-trap 'rm -rf "$CONF_DIR"' EXIT INT TERM
-PUB=$(cat "$SSH_KEY.pub")
-cat >"$CONF_DIR/meta-data" <<EOF
-instance-id: rfor-freebsd-docker
-local-hostname: freebsd-rfor
-EOF
-cat >"$CONF_DIR/user-data" <<EOF
-#cloud-config
-package_upgrade: false
-runcmd:
-  - mkdir -p /root/.ssh
-  - chmod 700 /root/.ssh
-  - echo "$PUB" > /root/.ssh/authorized_keys
-  - chmod 600 /root/.ssh/authorized_keys
-  - sed -i '' -e 's/^#PermitRootLogin.*/PermitRootLogin prohibit-password/' -e 's/^PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-  - service sshd restart
-EOF
-
 if ! docker info >/dev/null 2>&1; then
     fail "Docker is not available"
 fi
-if [ "${RFOR_DOCKER_REBUILD:-0}" = "1" ] || ! docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
-    echo "--- building $DOCKER_IMAGE ---"
-    docker build -t "$DOCKER_IMAGE" "$SCRIPT_DIR"
-fi
+# Always invoke the build so COPY changes (run-in-container.sh) take effect.
+# Docker layer caching makes this a no-op when nothing changed.
+echo "--- building $DOCKER_IMAGE (cached unless inputs changed) ---"
+docker build -t "$DOCKER_IMAGE" "$SCRIPT_DIR"
 
 exec docker run --rm \
     -v "$FREEBSD_IMAGE:/image/freebsd.qcow2:ro" \
@@ -98,6 +79,5 @@ exec docker run --rm \
     -v "$RESTART_SOAK:/test/restart-soak.sh:ro" \
     -v "$REQUEST_BENCH:/test/request-bench.sh:ro" \
     -v "$HARNESS:/opt/lib.sh:ro" \
-    -v "$CONF_DIR:/seed:ro" \
     -v "$SSH_KEY:/keys/id_ed25519:ro" \
     "$DOCKER_IMAGE"

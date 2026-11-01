@@ -27,7 +27,7 @@ if [ ! -f "$IMAGE" ]; then
     echo "FAIL: FreeBSD image not found inside the container: $IMAGE"
     exit 1
 fi
-if [ ! -f /seed/user-data ] || [ ! -f /seed/meta-data ]; then
+if [ "$PREPARE" = "1" ] && { [ ! -f /seed/user-data ] || [ ! -f /seed/meta-data ]; }; then
     echo "FAIL: cloud-init seed is not mounted at /seed"
     exit 1
 fi
@@ -72,6 +72,16 @@ if ! rfor_wait_ssh root@"$HOST" "$PORT" "$KEY" 1800 /tmp/ssh.log; then
     exit 1
 fi
 echo "PASS: FreeBSD guest is reachable over SSH"
+
+if [ "$PREPARE" = "0" ]; then
+    # Cloud-init runs exactly once while building the prepared overlay.
+    # Test boots must not carry a seed and must not enable it again.
+    if ! rfor_ssh root@"$HOST" "$PORT" "$KEY"         'test "$(sysrc -n cloudinit_enable 2>/dev/null)" = NO'; then
+        echo "FAIL: prepared image still enables cloud-init; rebuild it with tests/freebsd/docker/build-image.sh"
+        exit 1
+    fi
+    echo "PASS: cloud-init is disabled in the prepared image"
+fi
 
 if [ "$PREPARE" = "1" ]; then
     if ! rfor_ssh root@"$HOST" "$PORT" "$KEY" 'pkg install -y curl bind-tools' >/tmp/pkg.log 2>&1; then
