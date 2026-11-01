@@ -900,6 +900,26 @@ async fn udp_socket_bind_to_any_with_flag(
             ));
         }
 
+        // Allow multiple connected transparent reply sockets for the same
+        // target address/port. This is required for concurrent DNS clients;
+        // the connected remote addresses still provide the demultiplex key.
+        #[cfg(any(target_os = "openbsd", target_os = "freebsd"))]
+        {
+            let ret = libc::setsockopt(
+                raw_fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &1 as *const _ as *const libc::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+            if ret < 0 {
+                return Err(anyhow!(
+                    "failed to set SO_REUSEPORT: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+
         let addr = socket2::SockAddr::from(bind_sockaddr);
         let addr_len = addr.len();
         let addr_stor = addr.as_storage();
