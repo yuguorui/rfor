@@ -32,12 +32,21 @@ class ServerFirstHandler(socketserver.BaseRequestHandler):
         self.request.sendall(SERVER_FIRST_BODY)
 
 
+class UdpEchoHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        data, sock = self.request
+        sock.sendto(data, self.client_address)
+
+
 def main():
     http_server = http.server.ThreadingHTTPServer(("0.0.0.0", 18080), HttpHandler)
     tcp_server = ReusableThreadingTCPServer(("0.0.0.0", 18081), ServerFirstHandler)
+    udp_server = socketserver.ThreadingUDPServer(("198.18.0.11", 19000), UdpEchoHandler)
+    udp_server.allow_reuse_address = True
+    udp_server.daemon_threads = True
     stopped = threading.Event()
 
-    for server in (http_server, tcp_server):
+    for server in (http_server, tcp_server, udp_server):
         threading.Thread(target=server.serve_forever, daemon=True).start()
 
     def stop(_signum, _frame):
@@ -49,6 +58,7 @@ def main():
 
     http_server.shutdown()
     tcp_server.shutdown()
+    udp_server.shutdown()
 
 
 if __name__ == "__main__":

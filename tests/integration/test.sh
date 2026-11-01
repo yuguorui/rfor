@@ -2,7 +2,10 @@
 
 set -Eeuo pipefail
 
+source /integration/request-bench.sh
+
 readonly ORIGIN_HOST=198.18.0.10
+readonly UDP_ORIGIN_HOST=198.18.0.11
 readonly HTTP_URL="http://${ORIGIN_HOST}:18080/test"
 readonly EXPECTED_HTTP_BODY=rfor-integration-ok
 readonly EXPECTED_SERVER_FIRST_BODY=server-first-ok
@@ -143,6 +146,62 @@ assert_quic_sni_routing() {
     wait_for_log '-> quic-v2.test:443 ([::ffff:198.18.0.10]:443) [quic-v2] -> Outbound(DIRECT)'
 }
 
+assert_tcp_benchmark() {
+    local mode=$1
+    local prefix=$2
+    local first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
+    local lat=$WORK_DIR/$mode-tcp.lat
+    bench_tcp "$HTTP_URL" 5 "$lat"
+    bench_stats "$mode TCP sequential" "$BENCH_TCP_OK" 5 "$lat"
+    [[ $BENCH_TCP_OK -eq 5 ]] || fail "$mode: TCP sequential succeeded $BENCH_TCP_OK/5"
+
+    local burst_dir=$WORK_DIR/$mode-tcp-burst
+    bench_tcp_burst "$HTTP_URL" 4 "$burst_dir"
+    bench_stats "$mode TCP burst" "$BENCH_BURST_OK" 4 "$burst_dir/times"
+    [[ $BENCH_BURST_OK -eq 4 ]] || fail "$mode: TCP burst succeeded $BENCH_BURST_OK/4"
+
+    local observed
+    observed=$(tail -n "+$first_line" "$RFOR_LOG" | grep --fixed-strings --count -- "$prefix:" || true)
+    [[ $observed -ge 9 ]] || fail "$mode: only $observed benchmark requests reached rfor"
+}
+
+assert_udp_benchmark() {
+    local count=10
+    local lat=$WORK_DIR/TPROXY-udp.lat
+    if ! python3 - "$UDP_ORIGIN_HOST" 19000 "$count" "$lat" <<'PY'
+import socket
+import sys
+import time
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+count = int(sys.argv[3])
+path = sys.argv[4]
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(2)
+values = []
+for _ in range(count):
+    start = time.monotonic()
+    sock.sendto(b"ping", (host, port))
+    data, _ = sock.recvfrom(64)
+    if data != b"ping":
+        raise SystemExit("unexpected UDP reply: %r" % (data,))
+    values.append((time.monotonic() - start) * 1000)
+with open(path, "w", encoding="ascii") as output:
+    for value in values:
+        print("%.3f" % value, file=output)
+PY
+    then
+        fail "TPROXY: UDP echo failed"
+    fi
+    local ok
+    ok=$(wc -l < "$lat")
+    bench_stats "TPROXY UDP echo" "$ok" "$count" "$lat"
+    [[ $ok -eq $count ]] || fail "TPROXY: UDP echo succeeded $ok/$count"
+    grep --quiet 'TPROXY:.*DGRAM.*19000' "$RFOR_LOG" ||
+        fail "TPROXY: UDP benchmark was not observed in the rfor log"
+}
+
 stop_rfor() {
     local mode=$1
     kill -TERM "$RFOR_PID"
@@ -222,6 +281,8 @@ run_tproxy_test() {
     assert_timed_http_forwarding
     assert_server_first_forwarding
     assert_quic_sni_routing
+    assert_tcp_benchmark TPROXY TPROXY
+    assert_udp_benchmark
     grep --quiet 'TPROXY:' "$RFOR_LOG" || fail 'TPROXY traffic was not observed in the route log'
     assert_not_reconciled TPROXY mangle rfor-it-mark
     stop_rfor TPROXY
@@ -239,6 +300,7 @@ run_redirect_test() {
     assert_http_forwarding
     assert_timed_http_forwarding
     assert_server_first_forwarding
+    assert_tcp_benchmark REDIRECT REDIRECT
     grep --quiet 'REDIRECT:' "$RFOR_LOG" || fail 'REDIRECT traffic was not observed in the route log'
     assert_not_reconciled REDIRECT nat rfor-it-redirect
     stop_rfor REDIRECT

@@ -4,7 +4,12 @@ services:
     build:
       context: ../..
       dockerfile: tests/integration/Dockerfile
-    command: ["python3", "/integration/origin.py"]
+    command:
+      - sh
+      - -c
+      - "ip addr add 198.18.0.11/24 dev eth0 2>/dev/null || true; exec python3 /integration/origin.py"
+    cap_add:
+      - NET_ADMIN
     init: true
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:18080/health"]

@@ -6,7 +6,7 @@ udp-enabled: true
 traffic-intercept:
   mode: tproxy
   local-traffic: true
-  ports: ["18080-18081", "443"]
+  ports: ["18080-18081", "443", "19000"]
   tproxy-proxy-chain: rfor-it-proxy
   tproxy-mark-chain: rfor-it-mark
   rule-table: 66
@@ -16,6 +16,7 @@ outbounds:
     url: socks5://198.18.0.30:1080
 
 rules:
+  - IP-CIDR,198.18.0.11/32,DIRECT
   - DOMAIN,split.test,DIRECT
   - DOMAIN,quic.test,DIRECT
   - DOMAIN,quic-v2.test,DIRECT
