@@ -186,15 +186,41 @@ async fn main() -> Result<()> {
     }
 }
 
+fn ansi_enabled(stdout_tty: bool, stderr_tty: bool) -> bool {
+    // tracing's formatter may write to either stream depending on how it is
+    // embedded. Only colorize when both are terminals so a redirected stdout
+    // (for example rc.subr -> syslog) never receives escape sequences.
+    stdout_tty && stderr_tty
+}
+
 fn init_logging() {
+    use std::io::IsTerminal;
+
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "rfor=info".into());
 
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
+        .with_ansi(ansi_enabled(
+            std::io::stdout().is_terminal(),
+            std::io::stderr().is_terminal(),
+        ))
         .with_target(true)
         .with_thread_ids(false)
         .with_file(true)
         .with_line_number(true)
         .init();
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::ansi_enabled;
+
+    #[test]
+    fn ansi_requires_both_streams_to_be_a_tty() {
+        assert!(ansi_enabled(true, true));
+        assert!(!ansi_enabled(false, true));
+        assert!(!ansi_enabled(true, false));
+        assert!(!ansi_enabled(false, false));
+    }
 }
