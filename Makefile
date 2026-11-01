@@ -40,4 +40,7 @@ clean:
 integration-test:
 	./tests/integration/run.sh
 
-.PHONY: rfor clean release integration-test
+docker-tests:
+	./tests/run-docker-tests.sh
+
+.PHONY: rfor clean release integration-test docker-tests
