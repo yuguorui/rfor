@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
     let stats_worker = tokio::spawn(stats::stats_logger_worker());
     let reload_worker = tokio::spawn(reload_worker(profiler_store.clone()));
 
-    tokio::select! {
+    let result = tokio::select! {
         res = async {
             try_join!(
                 flatten(tproxy_worker),
@@ -160,18 +160,30 @@ async fn main() -> Result<()> {
                 flatten(stats_worker),
                 flatten(reload_worker)
             )
-        } => {
-            match res {
-                Ok(_) => return Ok(()),
-                Err(err) => return Err(err),
-            }
-        }
+            .map(|_| ())
+        } => res,
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Received Ctrl+C, shutting down...");
+            Ok(())
+        }
+    };
+
+    // A failure in any non-tproxy worker (or Ctrl-C winning the select) can
+    // cancel tproxy_worker before its own cleanup runs. Always run the
+    // idempotent environment cleanup from the main exit path so local-traffic
+    // routes and PF anchors cannot be left behind by an ordinary error exit.
+    match result {
+        Ok(()) => {
+            tproxy::clean_environment().await?;
+            Ok(())
+        }
+        Err(err) => {
+            if let Err(cleanup_err) = tproxy::clean_environment().await {
+                error!("tproxy cleanup failed after error: {:#}", cleanup_err);
+            }
+            Err(err)
         }
     }
-
-    Ok(())
 }
 
 fn init_logging() {

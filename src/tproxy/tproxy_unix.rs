@@ -2044,7 +2044,7 @@ async fn environment_setup() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn clean_environment() -> Result<()> {
+pub async fn clean_environment() -> Result<()> {
     let settings = get_settings().read().await;
     match &settings.intercept_mode {
         crate::settings::InterceptMode::MANUAL => return Ok(()),
@@ -2131,7 +2131,7 @@ async fn environment_setup() -> Result<()> {
 }
 
 #[cfg(target_os = "freebsd")]
-async fn clean_environment() -> Result<()> {
+pub async fn clean_environment() -> Result<()> {
     let settings = get_settings().read().await;
     let (proxy_chain, port) = match &settings.intercept_mode {
         crate::settings::InterceptMode::MANUAL => return Ok(()),
@@ -2205,7 +2205,7 @@ async fn environment_setup() -> Result<()> {
 }
 
 #[cfg(target_os = "openbsd")]
-async fn clean_environment() -> Result<()> {
+pub async fn clean_environment() -> Result<()> {
     let settings = get_settings().read().await;
     let (proxy_chain, port) = match &settings.intercept_mode {
         crate::settings::InterceptMode::MANUAL => return Ok(()),

@@ -15,3 +15,7 @@ pub fn tproxy_bind_src(
 pub async fn tproxy_worker() -> Result<()> {
     Ok(())
 }
+
+pub async fn clean_environment() -> Result<()> {
+    Ok(())
+}
