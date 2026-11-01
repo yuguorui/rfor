@@ -40,6 +40,32 @@ ipfw add 65534 allow ip from any to any
 Start rfor with `rfor-freebsd.yaml` from this directory. The IPv4/IPv6 firewall rules
 are installed under rule base 62000 and removed on SIGTERM.
 
+## Automated local-traffic benchmark
+
+On a disposable FreeBSD VM with a working uplink:
+
+    pkg install curl bind-tools
+    cargo build --release
+    RFOR_ALLOW_IPFW_TEST=1 ./tests/freebsd/local-traffic.sh
+
+Load ipfw from the VM console first and keep a terminal allow rule; a
+freshly loaded ipfw defaults to deny, which would drop the SSH session
+before the test can install its own rule:
+
+    kldload ipfw
+    ipfw add 65530 allow ip from any to any
+
+The test adds its own terminal rule at 65534 with a marker and removes it
+on exit, leaving the preload rule alone. It installs rfor rules under
+rule base 62000 with the rfor:rfortest marker, runs five sequential TCP
+requests, a four-request
+concurrent TCP burst, and ten UDP DNS queries. It prints
+min/avg/p50/max latency in milliseconds and verifies that SIGTERM removes
+the rules and the rfor_15080_rfortest table. It does not change the
+default route, but it does modify the firewall; run it only on a
+disposable VM. The shared tests/common/request-bench.sh helper must be
+present in the checkout (or copied to /tmp/request-bench.sh).
+
 ## Checks performed
 
 - IPv4 TCP through DIRECT and SOCKS5, with domain SNI/Host routing.
