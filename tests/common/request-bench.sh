@@ -123,6 +123,36 @@ bench_dns() {
     done
 }
 
+bench_dns_burst() {
+    _server=$1
+    _name=$2
+    _count=$3
+    _dir=$4
+    mkdir -p "$_dir"
+    rm -f "$_dir"/*.lat "$_dir"/times 2>/dev/null || true
+    (
+        _i=0
+        while [ "$_i" -lt "$_count" ]; do
+            (
+                _out=$(dig +time=2 +tries=2 +noall +answer +stats "$_name" @"$_server" 2>/dev/null) || _out=""
+                _time=$(printf '%s' "$_out" | awk '/Query time:/{print $4; exit}')
+                if [ -n "$_time" ] && printf '%s' "$_out" | grep -q "^$_name[.]"; then
+                    echo "$_time" >"$_dir/$_i.lat"
+                fi
+            ) &
+            _i=$((_i + 1))
+        done
+        wait
+    ) || true
+    BENCH_DNS_BURST_OK=0
+    : >"$_dir/times"
+    for _f in "$_dir"/*.lat; do
+        [ -f "$_f" ] || continue
+        BENCH_DNS_BURST_OK=$((BENCH_DNS_BURST_OK + 1))
+        cat "$_f" >>"$_dir/times"
+    done
+}
+
 bench_stats() {
     _label=$1
     _ok=$2

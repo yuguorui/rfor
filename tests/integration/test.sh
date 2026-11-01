@@ -156,13 +156,13 @@ assert_tcp_benchmark() {
     [[ $BENCH_TCP_OK -eq 5 ]] || fail "$mode: TCP sequential succeeded $BENCH_TCP_OK/5"
 
     local burst_dir=$WORK_DIR/$mode-tcp-burst
-    bench_tcp_burst "$HTTP_URL" 4 "$burst_dir"
-    bench_stats "$mode TCP burst" "$BENCH_BURST_OK" 4 "$burst_dir/times"
-    [[ $BENCH_BURST_OK -eq 4 ]] || fail "$mode: TCP burst succeeded $BENCH_BURST_OK/4"
+    bench_tcp_burst "$HTTP_URL" 8 "$burst_dir"
+    bench_stats "$mode TCP burst" "$BENCH_BURST_OK" 8 "$burst_dir/times"
+    [[ $BENCH_BURST_OK -eq 8 ]] || fail "$mode: TCP burst succeeded $BENCH_BURST_OK/8"
 
     local observed
     observed=$(tail -n "+$first_line" "$RFOR_LOG" | grep --fixed-strings --count -- "$prefix:" || true)
-    [[ $observed -ge 9 ]] || fail "$mode: only $observed benchmark requests reached rfor"
+    [[ $observed -ge 13 ]] || fail "$mode: only $observed benchmark requests reached rfor"
 }
 
 assert_udp_benchmark() {
@@ -200,6 +200,50 @@ PY
     [[ $ok -eq $count ]] || fail "TPROXY: UDP echo succeeded $ok/$count"
     grep --quiet 'TPROXY:.*DGRAM.*19000' "$RFOR_LOG" ||
         fail "TPROXY: UDP benchmark was not observed in the rfor log"
+}
+
+assert_udp_burst() {
+    local count=8
+    local lat=$WORK_DIR/TPROXY-udp-burst.lat
+    local first_line=$(( $(wc -l < "$RFOR_LOG") + 1 ))
+    if ! python3 - "$UDP_ORIGIN_HOST" 19000 "$count" "$lat" <<'PY'
+import concurrent.futures
+import socket
+import sys
+import time
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+count = int(sys.argv[3])
+path = sys.argv[4]
+
+def one(_):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2)
+    start = time.monotonic()
+    sock.sendto(b"ping", (host, port))
+    data, _ = sock.recvfrom(64)
+    if data != b"ping":
+        raise SystemExit("unexpected UDP reply: %r" % (data,))
+    sock.close()
+    return (time.monotonic() - start) * 1000
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+    values = list(pool.map(one, range(count)))
+with open(path, "w", encoding="ascii") as output:
+    for value in values:
+        print("%.3f" % value, file=output)
+PY
+    then
+        fail "TPROXY: concurrent UDP echo failed"
+    fi
+    local ok
+    ok=$(wc -l < "$lat")
+    bench_stats "TPROXY UDP burst" "$ok" "$count" "$lat"
+    [[ $ok -eq $count ]] || fail "TPROXY: UDP burst succeeded $ok/$count"
+    local observed
+    observed=$(tail -n "+$first_line" "$RFOR_LOG" | grep --fixed-strings --count 'DGRAM' || true)
+    [[ $observed -ge $count ]] || fail "TPROXY: only $observed UDP flows reached rfor"
 }
 
 stop_rfor() {
@@ -283,6 +327,7 @@ run_tproxy_test() {
     assert_quic_sni_routing
     assert_tcp_benchmark TPROXY TPROXY
     assert_udp_benchmark
+    assert_udp_burst
     grep --quiet 'TPROXY:' "$RFOR_LOG" || fail 'TPROXY traffic was not observed in the route log'
     assert_not_reconciled TPROXY mangle rfor-it-mark
     stop_rfor TPROXY

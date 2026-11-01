@@ -58,8 +58,8 @@ before the test can install its own rule:
 The test adds its own terminal rule at 65534 with a marker and removes it
 on exit, leaving the preload rule alone. It installs rfor rules under
 rule base 62000 with the rfor:rfortest marker, runs five sequential TCP
-requests, a four-request concurrent TCP burst, and ten UDP DNS queries. It
-prints
+requests, an eight-request concurrent TCP burst, ten UDP DNS queries, and
+a four-request DNS burst. It prints
 min/avg/p50/max latency in milliseconds and verifies that SIGTERM removes
 the rules and the rfor_15080_rfortest table. It does not change the
 default route, but it does modify the firewall; run it only on a

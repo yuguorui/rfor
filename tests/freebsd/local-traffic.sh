@@ -35,7 +35,7 @@ TCP_URL="${RFOR_TCP_URL:-https://1.1.1.1/}"
 DNS_SERVER="${RFOR_DNS_SERVER:-8.8.8.8}"
 DNS_NAME="${RFOR_DNS_NAME:-example.com}"
 TCP_SEQ_REQUESTS=5
-TCP_BURST_REQUESTS=4
+TCP_BURST_REQUESTS=8
 DNS_REQUESTS=10
 DNS_MIN_OK=7
 ANCHOR="rfor:rfortest"
@@ -166,6 +166,14 @@ if [ "$BENCH_DNS_OK" -lt "$DNS_MIN_OK" ]; then
     fail "local UDP DNS succeeded $BENCH_DNS_OK/$DNS_REQUESTS, need at least $DNS_MIN_OK"
 fi
 pass "FreeBSD local UDP DNS ($BENCH_DNS_OK/$DNS_REQUESTS)"
+
+DNS_BURST_DIR="$TMP/dns-burst"
+bench_dns_burst "$DNS_SERVER" "$DNS_NAME" 4 "$DNS_BURST_DIR"
+bench_stats "FreeBSD UDP DNS burst" "$BENCH_DNS_BURST_OK" 4 "$DNS_BURST_DIR/times"
+if [ "$BENCH_DNS_BURST_OK" -lt 3 ]; then
+    fail "local UDP DNS burst succeeded $BENCH_DNS_BURST_OK/4, need at least 3"
+fi
+pass "FreeBSD local UDP DNS burst ($BENCH_DNS_BURST_OK/4)"
 
 if ! grep -q 'TPROXY:' "$LOG"; then
     fail "local traffic was not observed in the rfor route log"
