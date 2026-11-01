@@ -15,6 +15,7 @@ GWLOG=/tmp/gw-rfor.log
 GWSER=/tmp/gw-serial.log
 CLSER=/tmp/cl-serial.log
 STRESS_COUNT=${RFOR_CLIENT_STRESS_COUNT:-64}
+STRESS_ITERATIONS=${RFOR_CLIENT_STRESS_ITERATIONS:-20}
 cleanup() {
   set +e
   [ -f "$GWPID" ] && kill "$(cat "$GWPID")" 2>/dev/null
@@ -50,7 +51,7 @@ rfor_ssh root@127.0.0.1 "$CL_PORT" "$KEY" 'ifconfig vio1 inet 10.55.0.2/24 up; r
 rfor_scp_to root@127.0.0.1 "$GW_PORT" "$KEY" "$RFOR" /tmp/rfor-client-stress
 cat >/tmp/rfor-client-stress.yaml <<'YAML'
 debug: true
-tproxy-listen: 127.0.0.1:15080
+tproxy-listen: "[::]:15080"
 socks5-listen: 127.0.0.1:11080
 udp-enabled: true
 udp-fullcone: false
@@ -61,12 +62,14 @@ traffic-intercept:
   tproxy-proxy-chain: rfor-client-test
 outbounds:
   - name: DIRECT
+    bind_range:
+      - 2000::/3
 rules:
   - DEFAULT,,DIRECT
 YAML
 rfor_scp_to root@127.0.0.1 "$GW_PORT" "$KEY" /tmp/rfor-client-stress.yaml /tmp/rfor-client-stress.yaml
 rfor_ssh root@127.0.0.1 "$GW_PORT" "$KEY" 'cp -p /etc/pf.conf /tmp/pf.client-stress; grep -q "^pass out on vio1" /etc/pf.conf || printf "\npass in on vio1\npass out on vio1\n" >> /etc/pf.conf; pfctl -nf /etc/pf.conf; pfctl -f /etc/pf.conf; nohup /tmp/rfor-client-stress -c /tmp/rfor-client-stress.yaml -w /tmp >/tmp/gw-rfor.log 2>&1 & echo $! >/tmp/rfor-client-stress.pid; sleep 2; pfctl -s Anchors; grep -c "create tunnel" /tmp/gw-rfor.log || true'
 
-rfor_ssh root@127.0.0.1 "$CL_PORT" "$KEY" "seq 1 $STRESS_COUNT | xargs -P $STRESS_COUNT -I{} dig @223.5.5.5 q{}.example.com +time=1 +tries=1 >/dev/null 2>&1 || true"
+rfor_ssh root@127.0.0.1 "$CL_PORT" "$KEY" "i=0; while [ \$i -lt $STRESS_ITERATIONS ]; do seq 1 $STRESS_COUNT | xargs -P $STRESS_COUNT -I{} dig @223.5.5.5 q{}.example.com +time=1 +tries=1 >/dev/null 2>&1 || true; i=\$((i+1)); done"
 sleep 2
 rfor_ssh root@127.0.0.1 "$GW_PORT" "$KEY" 'echo "--- rfor log ---"; grep -c "create tunnel" /tmp/gw-rfor.log 2>/dev/null || true; ERRORS=$(grep -c "Address already in use" /tmp/gw-rfor.log 2>/dev/null || true); echo "bind_errors=$ERRORS"; grep "Address already in use" /tmp/gw-rfor.log 2>/dev/null | tail -5 || true; echo "--- pf ---"; pfctl -a rfor/15080_rforclienttest -ss 2>/dev/null | grep -c "223.5.5.5:53" || true'

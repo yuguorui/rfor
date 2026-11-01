@@ -14,6 +14,7 @@ IMAGE="${OPENBSD_IMAGE:-$CACHE_ROOT/rfor/openbsd-8.0.qcow2}"
 KEY="${SSH_KEY:-$CACHE_ROOT/rfor/openbsd-test-key}"
 RFOR_BIN="${RFOR_BIN:-$REPO_ROOT/target/x86_64-unknown-openbsd/release/rfor}"
 STRESS_COUNT="${RFOR_CLIENT_STRESS_COUNT:-64}"
+STRESS_ITERATIONS="${RFOR_CLIENT_STRESS_ITERATIONS:-20}"
 
 if [ ! -f "$IMAGE" ]; then
     echo "FAIL: OpenBSD image not found: $IMAGE" >&2
@@ -34,6 +35,7 @@ fi
 
 exec docker run --rm --entrypoint /bin/sh \
     -e RFOR_CLIENT_STRESS_COUNT="$STRESS_COUNT" \
+    -e RFOR_CLIENT_STRESS_ITERATIONS="$STRESS_ITERATIONS" \
     -v "$IMAGE:/image/openbsd.qcow2:ro" \
     -v "$KEY:/keys/id_ed25519:ro" \
     -v "$RFOR_BIN:/opt/rfor:ro" \
