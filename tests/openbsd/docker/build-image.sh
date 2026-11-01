@@ -4,7 +4,7 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../../.." && pwd)
-. "$REPO_ROOT/tests/openbsd/lib.sh"
+. "$REPO_ROOT/tests/common/harness.sh"
 
 DOCKER_IMAGE="${RFOR_OPENBSD_DOCKER_IMAGE:-rfor-openbsd-qemu-test}"
 
@@ -80,7 +80,7 @@ docker run --rm \
     -v "$(dirname "$OPENBSD_IMAGE"):/out" \
     -v "$CONF_DIR:/conf:ro" \
     -v "$SSH_KEY:/keys/id_ed25519:ro" \
-    -v "$REPO_ROOT/tests/openbsd/lib.sh:/opt/lib.sh:ro" \
+    -v "$REPO_ROOT/tests/common/harness.sh:/opt/lib.sh:ro" \
     -e "OPENBSD_IMAGE=/out/$(basename "$OPENBSD_IMAGE")" \
     -e SSH_KEY=/keys/id_ed25519 \
     "$DOCKER_IMAGE" build

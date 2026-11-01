@@ -7,7 +7,7 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
-. "$SCRIPT_DIR/lib.sh"
+. "$SCRIPT_DIR/../common/harness.sh"
 cd "$REPO_ROOT"
 
 RFOR_BIN="${RFOR_BIN:-target/x86_64-unknown-openbsd/release/rfor}"
