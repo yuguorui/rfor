@@ -43,4 +43,7 @@ integration-test:
 docker-tests:
 	./tests/run-docker-tests.sh
 
-.PHONY: rfor clean release integration-test docker-tests
+soak-test:
+	./tests/integration/run-soak.sh
+
+.PHONY: rfor clean release integration-test docker-tests soak-test

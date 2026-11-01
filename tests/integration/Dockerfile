@@ -32,4 +32,4 @@ COPY --from=builder /tmp/rfor /usr/local/bin/rfor
 COPY tests/integration /integration
 COPY tests/common/request-bench.sh /integration/request-bench.sh
 
-RUN chmod +x /integration/run.sh /integration/test.sh
+RUN chmod +x /integration/run.sh /integration/test.sh /integration/soak.sh
