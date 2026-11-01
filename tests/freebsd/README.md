@@ -58,13 +58,30 @@ before the test can install its own rule:
 The test adds its own terminal rule at 65534 with a marker and removes it
 on exit, leaving the preload rule alone. It installs rfor rules under
 rule base 62000 with the rfor:rfortest marker, runs five sequential TCP
-requests, a four-request
-concurrent TCP burst, and ten UDP DNS queries. It prints
+requests, a four-request concurrent TCP burst, and ten UDP DNS queries. It
+prints
 min/avg/p50/max latency in milliseconds and verifies that SIGTERM removes
 the rules and the rfor_15080_rfortest table. It does not change the
 default route, but it does modify the firewall; run it only on a
 disposable VM. The shared tests/common/request-bench.sh helper must be
 present in the checkout (or copied to /tmp/request-bench.sh).
+
+## Docker/QEMU backend
+
+The same in-VM test can run from the repository through Docker and QEMU:
+
+    cargo test --release --test freebsd_local_traffic -- --ignored --nocapture
+
+or:
+
+    ./tests/freebsd/docker/run.sh
+
+The backend boots the cached FreeBSD 15.1 aarch64 cloud image, injects the
+test key with cloud-init, loads ipfw with a terminal allow rule, installs
+curl/bind-tools, and runs tests/freebsd/local-traffic.sh. The qcow2 is
+mounted read-only with snapshot=on; it is never baked into the image. See
+docker/README.md for cache paths and overrides. TCG boot and the cloud-init
+package upgrade take several minutes.
 
 ## Checks performed
 
