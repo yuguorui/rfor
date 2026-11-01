@@ -200,30 +200,32 @@ fn render_rules(
         ]
     };
 
-    // Only configured bind_range sources get divert-reply rules. There is no
-    // catch-all non-local source rule: a packet with an unrelated spoofed
-    // source must not be admitted by this anchor.
+    // Only configured bind_range sources and intercepted ports get
+    // divert-reply rules. Non-intercepted ports must keep normal forwarding;
+    // otherwise a broad bind_range would capture unrelated direct flows such
+    // as PT peer traffic. There is no catch-all non-local source rule: a
+    // packet with an unrelated spoofed source must not be admitted here.
     if !source_v4.is_empty() {
         writeln!(
             rules,
-            "pass out quick inet proto tcp from <rfor_src4> to any divert-reply"
+            "pass out quick inet proto tcp from <rfor_src4> to any port {port_set} divert-reply"
         )?;
         if udp_enable {
             writeln!(
                 rules,
-                "pass out quick inet proto udp from <rfor_src4> to any divert-reply"
+                "pass out quick inet proto udp from <rfor_src4> to any port {port_set} divert-reply"
             )?;
         }
     }
     if !disable_ipv6 && !source_v6.is_empty() {
         writeln!(
             rules,
-            "pass out quick inet6 proto tcp from <rfor_src6> to any divert-reply"
+            "pass out quick inet6 proto tcp from <rfor_src6> to any port {port_set} divert-reply"
         )?;
         if udp_enable {
             writeln!(
                 rules,
-                "pass out quick inet6 proto udp from <rfor_src6> to any divert-reply"
+                "pass out quick inet6 proto udp from <rfor_src6> to any port {port_set} divert-reply"
             )?;
         }
     }
@@ -425,8 +427,14 @@ mod tests {
         );
         assert!(rules.contains("table <rfor_src4> { 192.0.2.0/24 }"));
         assert!(rules.contains("table <rfor_src6> { 2001:db8::/32 }"));
-        assert!(rules.contains("from <rfor_src4> to any divert-reply"));
-        assert!(rules.contains("from <rfor_src6> to any divert-reply"));
+        assert!(rules.contains(
+            "from <rfor_src4> to any port { 80,443,8080:8082 } divert-reply"
+        ));
+        assert!(rules.contains(
+            "from <rfor_src6> to any port { 80,443,8080:8082 } divert-reply"
+        ));
+        assert!(!rules.contains("from <rfor_src4> to any divert-reply"));
+        assert!(!rules.contains("from <rfor_src6> to any divert-reply"));
         assert!(!rules.contains("from ! <rfor_np4> to any divert-reply"));
         assert!(!rules.contains("route-to"));
     }

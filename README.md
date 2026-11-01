@@ -162,9 +162,11 @@ explicitly.
 
 Source preservation is opt-in through an outbound `bind_range`. rfor converts
 IPv4-mapped IPv6 ranges to IPv4 PF tables and installs `divert-reply` rules
-only for those configured source ranges; there is no catch-all
-non-local-source `divert-reply` rule. A `bind_range` of `::ffff:0:0/96` is
-intentionally broad and should be avoided on an exposed gateway.
+only for those configured source ranges and only for the ports in
+`traffic-intercept.ports`; non-intercepted direct flows such as PT peer ports
+keep normal forwarding. There is no catch-all non-local-source
+`divert-reply` rule. A `bind_range` of `::ffff:0:0/96` is intentionally broad
+and should be avoided on an exposed gateway.
 
 On OpenBSD, UDP source preservation keeps the original source address but
 lets the kernel choose a fresh source port and connects the upstream socket
