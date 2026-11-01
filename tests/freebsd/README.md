@@ -76,12 +76,13 @@ or:
 
     ./tests/freebsd/docker/run.sh
 
-The backend boots the cached FreeBSD 15.1 aarch64 cloud image, injects the
-test key with cloud-init, loads ipfw with a terminal allow rule, installs
-curl/bind-tools, and runs tests/freebsd/local-traffic.sh. The qcow2 is
-mounted read-only with snapshot=on; it is never baked into the image. See
-docker/README.md for cache paths and overrides. TCG boot and the cloud-init
-package upgrade take several minutes.
+The first run prepares the FreeBSD 15.1 aarch64 cloud image once:
+cloud-init installs curl/bind-tools, ipfw is configured open at boot, and
+cloud-init is disabled. Later runs boot the prepared image without a seed,
+so cloud-init does not rerun and there is no package upgrade. The backend
+runs both local-traffic.sh and ten ipfw restart/cleanup cycles. The prepared
+overlay is mounted read-only with snapshot=on and never baked into the
+image. See docker/README.md for cache paths and overrides.
 
 ## Checks performed
 

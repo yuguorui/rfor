@@ -8,10 +8,12 @@ REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../../.." && pwd)
 
 DOCKER_IMAGE="${RFOR_FREEBSD_DOCKER_IMAGE:-rfor-freebsd-qemu-test}"
 CACHE_ROOT=$(rfor_cache_root)
-FREEBSD_IMAGE="${FREEBSD_IMAGE:-$CACHE_ROOT/rfor/freebsd-15.1/FreeBSD-15.1.qcow2}"
+FREEBSD_BASE_IMAGE="${FREEBSD_BASE_IMAGE:-$CACHE_ROOT/rfor/freebsd-15.1/FreeBSD-15.1.qcow2}"
+FREEBSD_IMAGE="${FREEBSD_IMAGE:-$CACHE_ROOT/rfor/freebsd-15.1/FreeBSD-15.1-prepared.qcow2}"
 RFOR_BIN="${RFOR_BIN:-$REPO_ROOT/target/aarch64-unknown-freebsd/release/rfor}"
 SSH_KEY="${SSH_KEY:-$CACHE_ROOT/rfor/freebsd-test-key}"
 LOCAL_TRAFFIC="$REPO_ROOT/tests/freebsd/local-traffic.sh"
+RESTART_SOAK="$REPO_ROOT/tests/freebsd/restart-soak.sh"
 REQUEST_BENCH="$REPO_ROOT/tests/common/request-bench.sh"
 HARNESS="$REPO_ROOT/tests/common/harness.sh"
 
@@ -21,15 +23,23 @@ fail() {
 }
 
 if [ ! -f "$FREEBSD_IMAGE" ]; then
-    echo "FAIL: FreeBSD image not found: $FREEBSD_IMAGE"
-    echo "Download and decompress the official cloud image:"
-    echo "  curl -fL -o /tmp/freebsd.qcow2.xz \\"
-    echo "    https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz"
-    echo "  sha256 9722aea499610802de9a14bb645707fc4f6df49ff765cd9ce372b783c4693963"
-    echo "  xz -d /tmp/freebsd.qcow2.xz"
-    echo "  mkdir -p $(dirname "$FREEBSD_IMAGE")"
-    echo "  mv /tmp/freebsd.qcow2 $FREEBSD_IMAGE"
-    exit 1
+    if [ ! -f "$FREEBSD_BASE_IMAGE" ]; then
+        echo "FAIL: official FreeBSD image not found: $FREEBSD_BASE_IMAGE"
+        echo "Download and decompress it first:"
+        echo "  curl -fL -o /tmp/freebsd.qcow2.xz \\"
+        echo "    https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz"
+        echo "  sha256 9722aea499610802de9a14bb645707fc4f6df49ff765cd9ce372b783c4693963"
+        echo "  xz -d /tmp/freebsd.qcow2.xz"
+        echo "  mkdir -p $(dirname "$FREEBSD_BASE_IMAGE")"
+        echo "  mv /tmp/freebsd.qcow2 $FREEBSD_BASE_IMAGE"
+        exit 1
+    fi
+    echo "--- preparing FreeBSD image (one-time cloud-init) ---"
+    FREEBSD_IMAGE="$FREEBSD_IMAGE" \
+    FREEBSD_BASE_IMAGE="$FREEBSD_BASE_IMAGE" \
+    SSH_KEY="$SSH_KEY" \
+    RFOR_FREEBSD_DOCKER_IMAGE="$DOCKER_IMAGE" \
+    sh "$SCRIPT_DIR/build-image.sh"
 fi
 if [ ! -f "$SSH_KEY" ]; then
     mkdir -p "$(dirname "$SSH_KEY")"
@@ -48,7 +58,8 @@ if [ ! -f "$RFOR_BIN" ]; then
     echo "    --target aarch64-unknown-freebsd --release"
     exit 1
 fi
-FREEBSD_IMAGE=$(rfor_abs_path "$FREEBSD_IMAGE")
+FREEBSD_BASE_IMAGE="${FREEBSD_BASE_IMAGE:-$CACHE_ROOT/rfor/freebsd-15.1/FreeBSD-15.1.qcow2}"
+FREEBSD_IMAGE="${FREEBSD_IMAGE:-$CACHE_ROOT/rfor/freebsd-15.1/FreeBSD-15.1-prepared.qcow2}"
 RFOR_BIN=$(rfor_abs_path "$RFOR_BIN")
 SSH_KEY=$(rfor_abs_path "$SSH_KEY")
 
@@ -81,8 +92,10 @@ fi
 
 exec docker run --rm \
     -v "$FREEBSD_IMAGE:/image/freebsd.qcow2:ro" \
+    -v "$FREEBSD_BASE_IMAGE:/image/$(basename "$FREEBSD_BASE_IMAGE"):ro" \
     -v "$RFOR_BIN:/test/rfor:ro" \
     -v "$LOCAL_TRAFFIC:/test/local-traffic.sh:ro" \
+    -v "$RESTART_SOAK:/test/restart-soak.sh:ro" \
     -v "$REQUEST_BENCH:/test/request-bench.sh:ro" \
     -v "$HARNESS:/opt/lib.sh:ro" \
     -v "$CONF_DIR:/seed:ro" \
