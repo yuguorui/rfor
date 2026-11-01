@@ -755,6 +755,23 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
     }
 }
 
+fn unmap_ipv4_mapped(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    if let std::net::SocketAddr::V6(v6) = addr {
+        if let Some(v4) = v6.ip().to_ipv4_mapped() {
+            return std::net::SocketAddr::V4(std::net::SocketAddrV4::new(v4, v6.port()));
+        }
+    }
+    addr
+}
+
+fn udp_native_sockaddr(addr: std::net::SocketAddr, disable_ipv6: bool) -> std::net::SocketAddr {
+    if disable_ipv6 {
+        unmap_ipv4_mapped(addr)
+    } else {
+        native_sockaddr(addr)
+    }
+}
+
 /// FreeBSD and OpenBSD bind transparent reply sockets in the target's native
 /// family. Internal rfor addresses use IPv4-mapped IPv6, so unmap them before
 /// bind or connect on an AF_INET socket.
@@ -787,7 +804,7 @@ async fn udp_socket_bind_to_any_with_flag(
     // transparent bind options.
     #[cfg(target_os = "linux")]
     let bind_sockaddr = if disable_ipv6 {
-        bind_sockaddr
+        unmap_ipv4_mapped(bind_sockaddr)
     } else {
         bind_sockaddr.to_ipv6_sockaddr()
     };
@@ -1015,8 +1032,8 @@ async fn relay_udp_packet(
     );
     drop(settings);
 
-    // AF_INET sockets cannot send to an IPv4-mapped IPv6 SocketAddr on FreeBSD.
-    let wire_target = native_sockaddr(target_sockaddr);
+    // A native AF_INET socket cannot use an IPv4-mapped IPv6 address.
+    let wire_target = udp_native_sockaddr(target_sockaddr, disable_ipv6);
 
     // Try to parse host from packets, supporting QUIC SNI aggregation
     let (host, buffered_packets) =
@@ -1065,7 +1082,10 @@ async fn relay_udp_packet(
                         {
                             Ok(sock) => {
                                 if let Err(e) = sock
-                                    .send_to(&resp, native_sockaddr(source_sockaddr))
+                                    .send_to(
+                                        &resp,
+                                        udp_native_sockaddr(source_sockaddr, disable_ipv6),
+                                    )
                                     .await
                                 {
                                     debug!("failed to send NXDOMAIN response: {}", e);
@@ -1084,7 +1104,9 @@ async fn relay_udp_packet(
     // Prepare the intermediate socket which is connected to the source, which should bind to the target address,
     // and pretend to be the target.
     let source_socket = udp_socket_bind_to_any_with_flag(target_sockaddr, disable_ipv6).await?;
-    source_socket.connect(native_sockaddr(source_sockaddr)).await?;
+    source_socket
+        .connect(udp_native_sockaddr(source_sockaddr, disable_ipv6))
+        .await?;
 
     // Send all buffered packets (including the initial packet)
     for packet in &buffered_packets {
@@ -1264,7 +1286,13 @@ async fn relay_udp_packet(
                                                 // Create new socket with graceful error handling
                                                 match udp_socket_bind_to_any_with_flag(resp_ip, disable_ipv6).await {
                                                     Ok(sock) => {
-                                                        match sock.connect(native_sockaddr(source_sockaddr)).await {
+                                                        match sock
+                                                            .connect(udp_native_sockaddr(
+                                                                source_sockaddr,
+                                                                disable_ipv6,
+                                                            ))
+                                                            .await
+                                                        {
                                                             Ok(_) => {
                                                                 let ret = sock.send(&dst_buffer[..size]).await;
                                                                 socket_sets.insert(resp_ip, FullconeSocketEntry {
@@ -1413,6 +1441,23 @@ mod tests {
             canonical_ipv6(IpAddr::V6(Ipv6Addr::LOCALHOST)),
             Ipv6Addr::LOCALHOST
         );
+    }
+
+    #[test]
+    fn unmap_ipv4_mapped_unmaps_socket_address() {
+        use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
+
+        let v4 = Ipv4Addr::new(192, 0, 2, 7);
+        let mapped =
+            std::net::SocketAddr::V6(SocketAddrV6::new(v4.to_ipv6_mapped(), 19000, 0, 0));
+        assert_eq!(
+            super::unmap_ipv4_mapped(mapped),
+            std::net::SocketAddr::V4(SocketAddrV4::new(v4, 19000))
+        );
+
+        let native =
+            std::net::SocketAddr::V6(SocketAddrV6::new("2001:db8::7".parse().unwrap(), 443, 0, 0));
+        assert_eq!(super::unmap_ipv4_mapped(native), native);
     }
 
     #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
