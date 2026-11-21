@@ -1077,6 +1077,13 @@ async fn sniff_host_with_quic_aggregation(
     (None, buffered_packets)
 }
 
+/// A connected UDP reply socket receives `ECONNREFUSED` when the client closes
+/// its local UDP port and answers a trailing reply with ICMP Port Unreachable.
+/// Treat that as a normal session close rather than an error.
+fn is_udp_peer_closed(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::ConnectionRefused
+}
+
 async fn relay_udp_packet(
     mut packet_rx: mpsc::Receiver<bytes::Bytes>,
     source_sockaddr: std::net::SocketAddr,
@@ -1278,6 +1285,13 @@ async fn relay_udp_packet(
                             }
                         }
                     }
+                    Err(e) if is_udp_peer_closed(&e) => {
+                        debug!(
+                            "udp source {:?} closed port (ICMP port unreachable): {}",
+                            source_sockaddr, e
+                        );
+                        break;
+                    }
                     Err(e) => {
                         error!("Failed to receive udp packet from source: {}", e);
                         break;
@@ -1393,6 +1407,13 @@ async fn relay_udp_packet(
                                     UDP_STATS.add_bytes(size as u64);
                                 }
                             }
+                            Err(e) if is_udp_peer_closed(&e) => {
+                                debug!(
+                                    "udp source {:?} closed port while sending reply (ICMP port unreachable): {}",
+                                    source_sockaddr, e
+                                );
+                                break;
+                            }
                             Err(e) => {
                                 error!("Failed to send back udp packet to source: {}", e);
                                 break;
@@ -1485,7 +1506,10 @@ pub fn tproxy_bind_src(sock: SockRef, src_sock: std::net::SocketAddr) -> tokio::
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_ipv6, is_local_ip};
+    use super::{
+        canonical_ipv6, is_local_ip, is_udp_peer_closed, next_udp_session_id, UdpSessionEntry,
+        UdpSessionKey, UdpSessionLease, UDP_SESSIONS,
+    };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
@@ -1585,6 +1609,18 @@ mod tests {
         assert!(is_local_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap());
         assert!(is_local_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)).unwrap());
         assert!(is_local_ip(IpAddr::V6(mapped_loopback)).unwrap());
+    }
+
+    #[test]
+    fn udp_peer_closed_matches_only_connection_refused() {
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert!(is_udp_peer_closed(&refused));
+
+        let timed_out = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert!(!is_udp_peer_closed(&timed_out));
+
+        let other = std::io::Error::other("other error");
+        assert!(!is_udp_peer_closed(&other));
     }
 }
 
