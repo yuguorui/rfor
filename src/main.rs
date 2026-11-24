@@ -136,6 +136,14 @@ async fn main() -> Result<()> {
         settings.to_yaml()
     );
 
+    #[cfg(target_os = "macos")]
+    if matches!(settings.intercept_mode, settings::InterceptMode::MANUAL) {
+        if let Some(iface) = settings.egress_interface.as_deref() {
+            tproxy::configure_manual_egress(iface)?;
+            info!("macOS manual egress interface bound: {}", iface);
+        }
+    }
+
     let profiler = settings
         .pprof
         .as_ref()

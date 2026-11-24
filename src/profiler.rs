@@ -1,14 +1,13 @@
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use std::fs::File;
 
 pub struct Profiler {
     #[cfg(all(
         any(target_os = "linux", target_os = "macos"),
-        any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64"
-        )
+        any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     guard: pprof::ProfilerGuard<'static>,
     pub path: String,
@@ -19,11 +18,7 @@ pub fn start(path: &str) -> anyhow::Result<Profiler> {
 
     #[cfg(all(
         any(target_os = "linux", target_os = "macos"),
-        any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64"
-        )
+        any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
         let builder = pprof::ProfilerGuardBuilder::default().frequency(1000);
@@ -43,11 +38,7 @@ pub fn start(path: &str) -> anyhow::Result<Profiler> {
 
     #[cfg(not(all(
         any(target_os = "linux", target_os = "macos"),
-        any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64"
-        )
+        any(target_arch = "x86_64", target_arch = "aarch64")
     )))]
     {
         tracing::warn!("Pprof is not supported on this platform.");
@@ -61,11 +52,7 @@ impl Drop for Profiler {
     fn drop(&mut self) {
         #[cfg(all(
             any(target_os = "linux", target_os = "macos"),
-            any(
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "riscv64"
-            )
+            any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         {
             tracing::info!("Stopping profiler and generating report...");

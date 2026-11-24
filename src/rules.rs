@@ -20,9 +20,11 @@ use url::Url;
 use tracing::info;
 
 use crate::get_settings;
-#[cfg(not(target_os = "openbsd"))]
+#[cfg(not(any(target_os = "openbsd", target_os = "macos")))]
 use crate::utils::rfor_bind_addr;
-use crate::utils::{to_io_err, ToV6Net, ToV6SockAddr};
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+use crate::utils::ToV6Net;
+use crate::utils::{to_io_err, ToV6SockAddr};
 
 use fast_socks5::client as socks_client;
 
@@ -172,7 +174,12 @@ impl Display for TargetAddr {
 #[derive(Debug, Clone)]
 pub enum InboundProtocol {
     SOCKS5,
-    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "macos"
+    ))]
     TPROXY,
     REDIRECT,
     UNKNOWN,
@@ -324,7 +331,11 @@ impl RouteTable {
 
         if outbound.url.is_none() {
             let sock_addr = resolve_target_addr(context.dst_addr.clone()).await?;
-            let use_ipv4 = if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
+            let use_ipv4 = if cfg!(any(
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "macos"
+            )) {
                 sock_addr.is_ipv4()
             } else {
                 get_settings().read().await.disable_ipv6
@@ -358,10 +369,23 @@ impl RouteTable {
                     }
                 }
 
-                prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
+                prepare_socket_bypass_mangle_for_addr(sock.as_raw_fd(), Some(sock_addr.ip()))
+                    .await?;
             }
 
-            #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd")))]
+            #[cfg(target_os = "macos")]
+            {
+                let _ = inbound_proto;
+                prepare_socket_bypass_mangle_for_addr(sock.as_raw_fd(), Some(sock_addr.ip()))
+                    .await?;
+            }
+
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "macos"
+            )))]
             let _ = inbound_proto; // Suppress unused variable warning
 
             return timeout(Duration::from_millis(TIMEOUT), sock.connect(sock_addr)).await?;
@@ -438,7 +462,11 @@ impl RouteTable {
                         None,
                     ))
                     .await?;
-                    let use_ipv4 = if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
+                    let use_ipv4 = if cfg!(any(
+                        target_os = "freebsd",
+                        target_os = "openbsd",
+                        target_os = "macos"
+                    )) {
                         socks_sock_addr.is_ipv4()
                     } else {
                         get_settings().read().await.disable_ipv6
@@ -448,8 +476,17 @@ impl RouteTable {
                     } else {
                         TcpSocket::new_v6()?
                     };
-                    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
-                    prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "freebsd",
+                        target_os = "openbsd",
+                        target_os = "macos"
+                    ))]
+                    prepare_socket_bypass_mangle_for_addr(
+                        sock.as_raw_fd(),
+                        Some(socks_sock_addr.ip()),
+                    )
+                    .await?;
                     let stream = sock.connect(socks_sock_addr).await?;
 
                     let mut socks = socks_client::Socks5Stream::use_stream(
@@ -517,6 +554,12 @@ impl RouteTable {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "inbound_proto is None")
             })?;
 
+            let target_ip = match &context.dst_addr {
+                TargetAddr::Ip(addr) => Some(addr.ip()),
+                TargetAddr::Domain(_, _, Some(addr)) => Some(addr.ip()),
+                TargetAddr::Domain(_, _, None) => None,
+            };
+
             #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
             if let InboundProtocol::TPROXY = inbound_proto {
                 if let Some(bind_range) = &outbound.bind_range {
@@ -560,11 +603,24 @@ impl RouteTable {
                     }
                 }
 
-                prepare_socket_bypass_mangle(raw_sock.as_raw_fd()).await?;
+                prepare_socket_bypass_mangle_for_addr(raw_sock.as_raw_fd(), target_ip).await?;
             }
 
-            #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd")))]
-            let _ = inbound_proto; // Suppress unused variable warning
+            #[cfg(target_os = "macos")]
+            {
+                let _ = inbound_proto;
+                prepare_socket_bypass_mangle_for_addr(raw_sock.as_raw_fd(), target_ip).await?;
+            }
+
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "macos"
+            )))]
+            {
+                let _ = (inbound_proto, target_ip); // Suppress unused variable warning
+            }
 
             let sock = UdpSocket::from_std(unsafe {
                 use std::os::fd::FromRawFd;
@@ -589,7 +645,7 @@ impl RouteTable {
                 ))
             }
             "socks" | "socks5" => {
-                #[cfg(not(target_os = "openbsd"))]
+                #[cfg(not(any(target_os = "openbsd", target_os = "macos")))]
                 let socks_server = format!(
                     "{}:{}",
                     proxy_url.host_str().ok_or_else(|| {
@@ -600,8 +656,8 @@ impl RouteTable {
                     })?
                 );
 
-                #[cfg(target_os = "openbsd")]
-                let (backing_socket, socks_udp_bind) = {
+                #[cfg(any(target_os = "openbsd", target_os = "macos"))]
+                let (backing_socket, socks_udp_bind, socks_ip) = {
                     let socks_addr = resolve_target_addr(TargetAddr::Domain(
                         proxy_url
                             .host_str()
@@ -629,12 +685,16 @@ impl RouteTable {
                     } else {
                         TcpSocket::new_v6()?
                     };
-                    prepare_socket_bypass_mangle(sock.as_raw_fd()).await?;
+                    prepare_socket_bypass_mangle_for_addr(
+                        sock.as_raw_fd(),
+                        Some(socks_addr.ip()),
+                    )
+                    .await?;
                     let backing =
                         timeout(Duration::from_millis(TIMEOUT), sock.connect(socks_addr)).await??;
-                    (backing, socks_udp_bind)
+                    (backing, socks_udp_bind, socks_addr.ip())
                 };
-                #[cfg(not(target_os = "openbsd"))]
+                #[cfg(not(any(target_os = "openbsd", target_os = "macos")))]
                 let (backing_socket, socks_udp_bind) = (
                     timeout(
                         Duration::from_millis(TIMEOUT),
@@ -644,24 +704,52 @@ impl RouteTable {
                     rfor_bind_addr().await,
                 );
 
-                let sock = if proxy_url.username().is_empty() {
-                    let fut = socks_client::Socks5Datagram::bind(
-                        backing_socket,
-                        socks_udp_bind,
-                    );
-                    timeout(Duration::from_millis(TIMEOUT), fut)
-                        .await?
-                        .map_err(to_io_err)?
-                } else {
-                    let fut = socks_client::Socks5Datagram::bind_with_password(
-                        backing_socket,
-                        socks_udp_bind,
-                        proxy_url.username(),
-                        proxy_url.password().unwrap_or(""),
-                    );
-                    timeout(Duration::from_millis(TIMEOUT), fut)
-                        .await?
-                        .map_err(to_io_err)?
+                #[cfg(target_os = "macos")]
+                let sock = {
+                    let out_udp = UdpSocket::bind(&socks_udp_bind).await?;
+                    prepare_socket_bypass_mangle_for_addr(out_udp.as_raw_fd(), Some(socks_ip))
+                        .await?;
+                    if proxy_url.username().is_empty() {
+                        let fut = socks_client::Socks5Datagram::use_socket(backing_socket, out_udp);
+                        timeout(Duration::from_millis(TIMEOUT), fut)
+                            .await?
+                            .map_err(to_io_err)?
+                    } else {
+                        let fut = socks_client::Socks5Datagram::use_socket_with_password(
+                            backing_socket,
+                            out_udp,
+                            proxy_url.username(),
+                            proxy_url.password().unwrap_or(""),
+                        );
+                        timeout(Duration::from_millis(TIMEOUT), fut)
+                            .await?
+                            .map_err(to_io_err)?
+                    }
+                };
+
+                #[cfg(not(target_os = "macos"))]
+                let sock = {
+                    #[cfg(target_os = "openbsd")]
+                    let _ = socks_ip;
+                    if proxy_url.username().is_empty() {
+                        let fut = socks_client::Socks5Datagram::bind(
+                            backing_socket,
+                            socks_udp_bind,
+                        );
+                        timeout(Duration::from_millis(TIMEOUT), fut)
+                            .await?
+                            .map_err(to_io_err)?
+                    } else {
+                        let fut = socks_client::Socks5Datagram::bind_with_password(
+                            backing_socket,
+                            socks_udp_bind,
+                            proxy_url.username(),
+                            proxy_url.password().unwrap_or(""),
+                        );
+                        timeout(Duration::from_millis(TIMEOUT), fut)
+                            .await?
+                            .map_err(to_io_err)?
+                    }
                 };
                 Ok(Box::new(sock))
             }
@@ -676,7 +764,7 @@ impl RouteTable {
 async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr> {
     let address = match target {
         TargetAddr::Ip(addr) => {
-            if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
+            if cfg!(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos")) {
                 addr
             } else {
                 match get_settings().read().await.disable_ipv6 {
@@ -697,7 +785,7 @@ async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr
                             format!("DNS lookup returned no results for {}:{}", domain, port),
                         )
                     })?;
-                if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
+                if cfg!(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos")) {
                     sock
                 } else {
                     match get_settings().read().await.disable_ipv6 {
@@ -709,7 +797,7 @@ async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr
         },
     };
 
-    Ok(if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
+    Ok(if cfg!(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos")) {
         native_socket_addr(address)
     } else {
         address
@@ -733,9 +821,9 @@ fn sockaddr_is_ipv4(address: &std::net::SocketAddr) -> bool {
 }
 
 fn target_uses_ipv4(target: &TargetAddr, disable_ipv6: bool) -> bool {
-    if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
+    if cfg!(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos")) {
         match target {
-            TargetAddr::Ip(address) => address.is_ipv4(),
+            TargetAddr::Ip(address) => sockaddr_is_ipv4(address),
             TargetAddr::Domain(_, _, Some(address)) => sockaddr_is_ipv4(address),
             TargetAddr::Domain(_, _, None) => disable_ipv6,
         }
@@ -744,9 +832,35 @@ fn target_uses_ipv4(target: &TargetAddr, disable_ipv6: bool) -> bool {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn socket_is_ipv4(sockfd: i32) -> tokio::io::Result<bool> {
+    let mut storage: nix::libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<nix::libc::sockaddr_storage>() as nix::libc::socklen_t;
+    let ret = unsafe {
+        nix::libc::getsockname(
+            sockfd,
+            &mut storage as *mut _ as *mut nix::libc::sockaddr,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(storage.ss_family as i32 == nix::libc::AF_INET)
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
 pub async fn prepare_socket_bypass_mangle(sockfd: i32) -> tokio::io::Result<()> {
+    prepare_socket_bypass_mangle_for_addr(sockfd, None).await
+}
+
+pub async fn prepare_socket_bypass_mangle_for_addr(
+    sockfd: i32,
+    dst_ip: Option<std::net::IpAddr>,
+) -> tokio::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
+        let _ = dst_ip;
         use std::os::fd::BorrowedFd;
         match &get_settings().read().await.intercept_mode {
             crate::settings::InterceptMode::TPROXY { direct_mark, .. }
@@ -758,17 +872,20 @@ pub async fn prepare_socket_bypass_mangle(sockfd: i32) -> tokio::io::Result<()> 
             }
             crate::settings::InterceptMode::IPFW { .. }
             | crate::settings::InterceptMode::PF { .. }
+            | crate::settings::InterceptMode::UTUN { .. }
             | crate::settings::InterceptMode::MANUAL => {}
         }
     }
 
     #[cfg(target_os = "freebsd")]
     {
+        let _ = dst_ip;
         match &get_settings().read().await.intercept_mode {
             crate::settings::InterceptMode::TPROXY { .. }
             | crate::settings::InterceptMode::REDIRECT { .. }
             | crate::settings::InterceptMode::IPFW { .. }
-            | crate::settings::InterceptMode::PF { .. } => {
+            | crate::settings::InterceptMode::PF { .. }
+            | crate::settings::InterceptMode::UTUN { .. } => {
                 // The FreeBSD ``not sockarg`` output rule keeps rfor's own
                 // connections out of the local-traffic interception path.
                 let cookie = RFOR_SOCKET_COOKIE;
@@ -789,9 +906,24 @@ pub async fn prepare_socket_bypass_mangle(sockfd: i32) -> tokio::io::Result<()> 
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    #[cfg(target_os = "macos")]
     {
-        let _ = sockfd; // Suppress unused variable warning
+        if dst_ip.is_some_and(|ip| ip.is_loopback()) {
+            return Ok(());
+        }
+        let is_ipv4 = match dst_ip {
+            Some(std::net::IpAddr::V4(_)) => true,
+            Some(std::net::IpAddr::V6(v6)) => v6.to_ipv4_mapped().is_some(),
+            None => socket_is_ipv4(sockfd)?,
+        };
+        if let Some(ifindex) = crate::tproxy::utun_macos::egress_ifindex(is_ipv4) {
+            crate::tproxy::utun_macos::bind_socket_to_ifindex(sockfd, is_ipv4, ifindex)?;
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
+    {
+        let _ = (sockfd, dst_ip); // Suppress unused variable warning
     }
 
     Ok(())
@@ -832,6 +964,15 @@ impl ProxyDgram for UdpSocket {
                     }
                 }
             },
+        };
+        let sock = if cfg!(any(
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "macos"
+        )) {
+            native_socket_addr(sock)
+        } else {
+            sock
         };
         match self.send_to(buf, sock).await {
             Ok(size) => Ok(size),

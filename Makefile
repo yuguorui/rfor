@@ -43,7 +43,10 @@ integration-test:
 docker-tests:
 	./tests/run-docker-tests.sh
 
+macos-test:
+	./tests/macos/tart/run.sh
+
 soak-test:
 	./tests/integration/run-soak.sh
 
-.PHONY: rfor clean release integration-test docker-tests soak-test
+.PHONY: rfor clean release integration-test docker-tests macos-test soak-test

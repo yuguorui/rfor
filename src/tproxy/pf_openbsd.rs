@@ -23,6 +23,8 @@ use std::process::{Command, Output, Stdio};
 
 use ipnet::{Ipv4Net, Ipv6Net};
 
+use crate::settings::BypassCidrs;
+
 const ANCHOR_PARENT: &str = "rfor";
 
 const RESERVED_V4: &[&str] = &[
@@ -154,18 +156,12 @@ fn render_rules(
     local_v6: &[String],
     source_v4: &[String],
     source_v6: &[String],
+    bypass_cidrs: &BypassCidrs,
 ) -> Result<String> {
     validate_ports(ports)?;
 
-    let mut v4: Vec<String> = RESERVED_V4.iter().map(|s| (*s).to_owned()).collect();
-    v4.extend(local_v4.iter().cloned());
-    v4.sort();
-    v4.dedup();
-
-    let mut v6: Vec<String> = RESERVED_V6.iter().map(|s| (*s).to_owned()).collect();
-    v6.extend(local_v6.iter().cloned());
-    v6.sort();
-    v6.dedup();
+    let v4 = bypass_cidrs.merged_v4(RESERVED_V4, local_v4);
+    let v6 = bypass_cidrs.merged_v6(RESERVED_V6, local_v6);
 
     let mut rules = String::new();
     writeln!(rules, "# rfor OpenBSD PF anchor")?;
@@ -312,6 +308,7 @@ pub async fn setup(
     disable_ipv6: bool,
     udp_enable: bool,
     bind_ranges: &[Ipv6Net],
+    bypass_cidrs: &BypassCidrs,
 ) -> Result<()> {
     if crate::utils::geteuid() != 0 {
         return Err(anyhow!("must be root to configure pf"));
@@ -334,6 +331,7 @@ pub async fn setup(
         &local_v6,
         &source_v4,
         &source_v6,
+        bypass_cidrs,
     ) {
         Ok(rules) => rules,
         Err(error) => return Err(error),
@@ -385,8 +383,33 @@ mod tests {
             &["2001:db8::1/128".to_owned()],
             source_v4,
             source_v6,
+            &BypassCidrs::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn bypass_cidrs_are_merged_into_pf_tables() {
+        let bypass = BypassCidrs {
+            v4: vec!["30.0.0.0/8".to_owned()],
+            v6: vec!["2001:db8:cafe::/48".to_owned()],
+        };
+        let rules = render_rules(
+            15080,
+            "80,443",
+            false,
+            true,
+            &["192.0.2.10/32".to_owned()],
+            &["2001:db8::1/128".to_owned()],
+            &[],
+            &[],
+            &bypass,
+        )
+        .unwrap();
+        assert!(rules.contains("table <rfor_np4> {"));
+        assert!(rules.contains("30.0.0.0/8"));
+        assert!(rules.contains("table <rfor_np6> {"));
+        assert!(rules.contains("2001:db8:cafe::/48"));
     }
 
     #[test]

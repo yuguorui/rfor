@@ -39,13 +39,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 once_cell = "1.19"
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+[target.'cfg(all(any(target_os = "linux", target_os = "macos"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 pprof = { version = "0.15.0", features = ["flamegraph"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 iptables = "0.5"
 rtnetlink = "0.14"
 netlink-packet-route = "0.19"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+netstack-smoltcp = "0.2.5"
 
 [build-dependencies]
 protobuf-codegen = "3"

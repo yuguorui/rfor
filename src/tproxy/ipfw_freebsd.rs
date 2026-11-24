@@ -134,6 +134,7 @@ pub async fn setup(
     chain: &str,
     enable_ipv6: bool,
     udp_enable: bool,
+    bypass_cidrs: &crate::settings::BypassCidrs,
 ) -> Result<()> {
     if ports.trim().is_empty() {
         return Err(anyhow!(
@@ -159,15 +160,9 @@ pub async fn setup(
 
     let setup_result = (|| -> Result<()> {
         let local = local_addresses()?;
-        let mut addresses_v4: Vec<String> = RESERVED_V4.iter().map(|s| (*s).to_owned()).collect();
-        addresses_v4.extend(
-            local
-                .iter()
-                .filter(|address| !address.contains(':'))
-                .cloned(),
-        );
-        addresses_v4.sort();
-        addresses_v4.dedup();
+        let (local_v4, local_v6): (Vec<String>, Vec<String>) =
+            local.into_iter().partition(|address| !address.contains(':'));
+        let addresses_v4 = bypass_cidrs.merged_v4(RESERVED_V4, &local_v4);
 
         for address in addresses_v4 {
             run_ok(vec![
@@ -179,16 +174,7 @@ pub async fn setup(
         }
 
         if enable_ipv6 {
-            let mut addresses_v6: Vec<String> =
-                RESERVED_V6.iter().map(|s| (*s).to_owned()).collect();
-            addresses_v6.extend(
-                local
-                    .iter()
-                    .filter(|address| address.contains(':'))
-                    .cloned(),
-            );
-            addresses_v6.sort();
-            addresses_v6.dedup();
+            let addresses_v6 = bypass_cidrs.merged_v6(RESERVED_V6, &local_v6);
             for address in addresses_v6 {
                 run_ok(vec![
                     "table".to_owned(),

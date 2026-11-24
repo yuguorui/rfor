@@ -82,22 +82,21 @@ pub async fn transfer_tcp(in_sock: &mut TcpStream, rt_context: RouteContext) -> 
     transfer_tcp_with_initial_data(in_sock, rt_context, Vec::new()).await
 }
 
-pub async fn transfer_tcp_with_initial_data(
-    in_sock: &mut TcpStream,
-    rt_context: RouteContext,
-    initial_data: Vec<u8>,
-) -> Result<()> {
+async fn connect_outbound_and_write_initial(
+    rt_context: &RouteContext,
+    initial_data: &[u8],
+) -> Result<Option<TcpStream>> {
     let mut out_sock = match get_settings()
         .read()
         .await
         .routetable
-        .get_tcp_sock(&rt_context)
+        .get_tcp_sock(rt_context)
         .await
     {
         Ok(sock) => sock,
         Err(err) => match err.kind() {
             std::io::ErrorKind::PermissionDenied => {
-                return Ok(());
+                return Ok(None);
             }
             _ => {
                 return Err(err.into());
@@ -105,13 +104,27 @@ pub async fn transfer_tcp_with_initial_data(
         },
     };
 
-    setup_tcp_keepalive(in_sock);
     setup_tcp_keepalive(&out_sock);
+    if !initial_data.is_empty() {
+        out_sock.write_all(initial_data).await?;
+    }
+    Ok(Some(out_sock))
+}
+
+pub async fn transfer_tcp_with_initial_data(
+    in_sock: &mut TcpStream,
+    rt_context: RouteContext,
+    initial_data: Vec<u8>,
+) -> Result<()> {
+    let Some(mut out_sock) =
+        connect_outbound_and_write_initial(&rt_context, &initial_data).await?
+    else {
+        return Ok(());
+    };
+
+    setup_tcp_keepalive(in_sock);
 
     let initial_bytes = initial_data.len() as u64;
-    if !initial_data.is_empty() {
-        out_sock.write_all(&initial_data).await?;
-    }
     drop(initial_data);
 
     // Track session start
@@ -131,6 +144,37 @@ pub async fn transfer_tcp_with_initial_data(
     };
 
     // Track session end with bytes transferred
+    TCP_STATS.session_end(initial_bytes + bytes_transferred);
+
+    Ok(())
+}
+
+/// Relay a generic async stream (such as a userspace `utun` TCP flow) to the
+/// routed outbound socket, flushing any sniffed `initial_data` first.
+pub async fn transfer_stream_with_initial_data<S>(
+    in_sock: &mut S,
+    rt_context: RouteContext,
+    initial_data: Vec<u8>,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let Some(mut out_sock) =
+        connect_outbound_and_write_initial(&rt_context, &initial_data).await?
+    else {
+        return Ok(());
+    };
+
+    let initial_bytes = initial_data.len() as u64;
+    drop(initial_data);
+
+    TCP_STATS.session_start();
+
+    let bytes_transferred = match tokio::io::copy_bidirectional(in_sock, &mut out_sock).await {
+        Ok((from_client, from_server)) => from_client + from_server,
+        Err(_) => 0,
+    };
+
     TCP_STATS.session_end(initial_bytes + bytes_transferred);
 
     Ok(())

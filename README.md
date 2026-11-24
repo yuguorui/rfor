@@ -13,7 +13,7 @@ Features
     - TLS/QUIC SNI sniffing
     - DNS query sniffing (route intercepted DNS requests by the queried domain)
     - [GeoIP](https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat)/[GeoSite](https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat)/[MMDB](https://raw.githubusercontent.com/alecthw/mmdb_china_ip_list/release/Country.mmdb) support
-- Auto configuration and cleanup for transparent proxy with Linux TPROXY/iptables, FreeBSD ipfw, and OpenBSD PF divert-to (No more manual firewall state🥳)
+- Auto configuration and cleanup for transparent proxy with Linux TPROXY/iptables, FreeBSD ipfw, OpenBSD PF divert-to, and macOS utun (No more manual firewall state🥳)
 - Optional source IP preserving when connects directly
 - Native IPv6 support
 - UDP transparent proxy
@@ -42,9 +42,14 @@ pkg install rust protobuf
 cargo build --release
 ```
 
-`pprof`/flamegraph is not available on FreeBSD or OpenBSD because the current
-`pprof` crate does not compile for those targets. All other features, including
-the SOCKS5 server and the forwarded-transparent path, are available.
+On macOS, install Rust and `protobuf` (or rely on the vendored `protoc`) and build natively:
+
+```bash
+brew install protobuf
+cargo build --release
+```
+
+`pprof`/flamegraph is supported on Linux and macOS (`x86_64` and `aarch64`), and is not available on FreeBSD or OpenBSD because the current `pprof` crate does not compile for those targets. All other features, including the SOCKS5 server and transparent proxy backends, are available.
 
 Usage
 -----
@@ -64,6 +69,9 @@ traffic-intercept:
   mode: auto                # auto(tproxy)/redirect/manual, set to "manual" when you want set iptables by hand.
   local-traffic: true       # set to true to allow intercept local traffic
   ports: [80,443,8080]      # ports you are interested
+#   bypass-cidrs:           # optional extra IPv4/IPv6 CIDRs to bypass (additive to private/reserved ranges)
+#     - "30.0.0.0/8"
+#     - "2001:db8:cafe::/48"
 #   proxy-mark: 0xff42
 #   direct-mark: 0xff43
 #   tproxy-proxy-chain: rfor-proxy
@@ -192,6 +200,61 @@ privileged DIOCNATLOOK. TCP recovers it with `getsockname(2)`; UDP uses
 `IP_RECVDSTADDR`/`IP_RECVDSTPORT` or `IPV6_PKTINFO`/`IPV6_RECVDSTPORT`.
 The automated OpenBSD test recipe is in `tests/openbsd/README.md`.
 
+### macOS transparent proxy
+
+On macOS, `traffic-intercept.mode: auto` (and aliases `tproxy`, `utun`, `tun`)
+selects the native `utun` + userspace `netstack-smoltcp` backend. `redirect`,
+`ipfw`, and `pf` are rejected at startup; use `auto`/`utun` or `manual`.
+
+```yaml
+traffic-intercept:
+  mode: auto
+  local-traffic: true
+  ports: [80, 443, 53]
+  # utun-name: utun9          # optional; auto-assigned when omitted
+  # egress-interface: en0     # optional; auto-detected from default route
+  # bypass-cidrs:             # optional extra IPv4/IPv6 CIDRs (e.g. corporate non-RFC1918 ranges)
+  #   - "30.0.0.0/8"
+  #   - "2001:db8:cafe::/48"
+```
+
+- **`bypass-cidrs` (IPv4 & IPv6)**: optional list of additional CIDRs/IPs under
+  `traffic-intercept.bypass-cidrs` (additive to built-in private/reserved
+  ranges and supported across all auto-interception backends). Useful for
+  corporate networks that assign public IP space internally: entries are
+  added as bypass routes on macOS `local-traffic: true` (while skipping any
+  subnet already covered by a kernel on-link route) and excluded from
+  capture in macOS `local-traffic: false` PF tables, Linux iptables/ip6tables,
+  FreeBSD ipfw tables, and OpenBSD PF tables. Prefix length `/0` is always
+  rejected, and `/1` is rejected in macOS `local-traffic: true` mode so it
+  does not collide with split-default routes.
+
+- **`local-traffic: true` (host-local + forwarded)**: creates a `utun`
+  interface, detects the default egress interface (`route -n get default`),
+  installs private/interface-scoped bypass routes plus split-default routes
+  (`0.0.0.0/1`, `128.0.0.0/1`, and `::/1`, `8000::/1` when IPv6 egress exists),
+  and binds outbound sockets via `IP_BOUND_IF`/`IPV6_BOUND_IF` (skipping
+  loopback upstreams). TCP and UDP connections on non-configured ports (or UDP
+  when `udp-enabled: false`) are forwarded directly over the egress interface
+  without matching `rules`. No `/etc/pf.conf` edits are required; shutdown
+  removes installed routes and closing the `utun` descriptor tears down the
+  interface so crashes fail open. If you also run a second local `rfor` instance
+  on the same host (such as a `mode: manual` loopback SOCKS5 upstream), set
+  top-level `egress-interface: <iface>` on it so its outbound sockets bind with
+  `IP_BOUND_IF`/`IPV6_BOUND_IF` and avoid looping back into `utun`.
+- **`local-traffic: false` (forwarded traffic only)**: brings up `utun` without
+  modifying host routes, enables PF with a reference token (`pfctl -E` /
+  `pfctl -X` on exit), and loads `route-to (<utunX> ...)` rules into anchor
+  `rfor/<chain>`. Host-local traffic is left untouched. Add `anchor "rfor/*"`
+  to `/etc/pf.conf` (and enable `sysctl net.inet.ip.forwarding=1`) before
+  starting `rfor`:
+
+```pf
+anchor "rfor/*"
+```
+
+See `tests/macos/README.md` for the automated macOS VM test recipe via `tart`.
+
 DNS requests (UDP/TCP port 53) intercepted by tproxy/redirect are sniffed for
 the queried domain, so the domain rules above also apply to DNS traffic itself.
 The query is still forwarded to the original DNS server; only the routing
@@ -226,6 +289,10 @@ OPTIONS:
   `anchor "rfor/*"` hook. Only forwarded traffic is supported;
   `local-traffic: true` is rejected at startup. Use an explicit proxy (for
   example `http_proxy`) for commands that must egress through rfor.
+- On macOS, the `utun` backend requires root. Forwarded-only mode
+  (`local-traffic: false`) requires `anchor "rfor/*"` in `/etc/pf.conf` and
+  `net.inet.ip.forwarding=1`. Source IP preservation (`bind_range`) is not
+  supported on macOS `utun`.
 - `br_netfilter` has some known issues [link](http://patchwork.ozlabs.org/project/netfilter-devel/patch/1518715545-2188-1-git-send-email-gregory.vanderschueren@tessares.net/) with tproxy, which may lead to network timeout in Docker.
    You can mitigate this problem with:
 

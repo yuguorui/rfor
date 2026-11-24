@@ -1,0 +1,22 @@
+debug: false
+socks5-listen: "127.0.0.1:11081"
+
+udp-enabled: true
+udp-timeout: 60
+
+drop-reply:
+  dns: nxdomain
+
+traffic-intercept:
+  mode: auto
+  local-traffic: true
+  ports: [80, 443, 53]
+
+outbounds:
+  - name: DIRECT
+  - name: DROP
+    url: drop://0.0.0.0
+
+rules:
+  - DEFAULT,,DIRECT
+  - DOMAIN,ads.test,DROP

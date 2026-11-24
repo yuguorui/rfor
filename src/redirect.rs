@@ -14,42 +14,57 @@ mod linux_impl {
     use tokio::net::TcpListener;
 
     pub async fn redirect_worker() -> Result<()> {
-        match &get_settings().read().await.intercept_mode {
-            crate::settings::InterceptMode::REDIRECT {
-                local_traffic,
-                ports,
-                direct_mark,
-                proxy_chain,
-            } => {
-                let listen_addr = rfor_bind_addr().await;
-
-                let listener = match &get_settings().read().await.redirect_listen {
-                    Some(addr) => TcpListener::bind(addr).await?,
-                    None => TcpListener::bind(format!("{}:0", listen_addr)).await?,
-                };
-
-                let port = listener.local_addr()?.port();
-                info!("redirect listen: {}", listener.local_addr()?);
-
-                if let Err(err) =
-                    set_nat_iptables(proxy_chain, port, *direct_mark, ports, *local_traffic).await
-                {
-                    cleanup_nat_iptables(proxy_chain).unwrap_or(());
-                    return Err(err);
-                }
-
-                tokio::select! {
-                    _ = accept_socket_loop(listener) => {},
-                    Err(err) = crate::utils::receive_signal() => {
-                        cleanup_nat_iptables(proxy_chain).unwrap_or(());
-                        return Err(err);
-                    },
-                };
+        let (local_traffic, ports, direct_mark, proxy_chain, redirect_listen, bypass_cidrs) = {
+            let settings = get_settings().read().await;
+            match &settings.intercept_mode {
+                crate::settings::InterceptMode::REDIRECT {
+                    local_traffic,
+                    ports,
+                    direct_mark,
+                    proxy_chain,
+                } => (
+                    *local_traffic,
+                    ports.clone(),
+                    *direct_mark,
+                    proxy_chain.clone(),
+                    settings.redirect_listen.clone(),
+                    settings.bypass_cidrs.clone(),
+                ),
+                _ => return Ok(()),
             }
-            _ => {
-                return Ok(());
-            }
+        };
+
+        let listen_addr = rfor_bind_addr().await;
+
+        let listener = match redirect_listen {
+            Some(addr) => TcpListener::bind(addr).await?,
+            None => TcpListener::bind(format!("{}:0", listen_addr)).await?,
+        };
+
+        let port = listener.local_addr()?.port();
+        info!("redirect listen: {}", listener.local_addr()?);
+
+        if let Err(err) = set_nat_iptables(
+            &proxy_chain,
+            port,
+            direct_mark,
+            &ports,
+            local_traffic,
+            &bypass_cidrs,
+        )
+        .await
+        {
+            cleanup_nat_iptables(&proxy_chain).unwrap_or(());
+            return Err(err);
         }
+
+        tokio::select! {
+            _ = accept_socket_loop(listener) => {},
+            Err(err) = crate::utils::receive_signal() => {
+                cleanup_nat_iptables(&proxy_chain).unwrap_or(());
+                return Err(err);
+            },
+        };
 
         Ok(())
     }
@@ -154,7 +169,7 @@ mod linux_impl {
         direct_mark: u32,
         ports: &str,
         local_traffic: bool,
-        reserved_ip: &[&str],
+        reserved_ip: &[String],
     ) -> Result<(), Box<dyn std::error::Error>> {
 
         let table = "nat";
@@ -202,15 +217,9 @@ mod linux_impl {
         direct_mark: u32,
         ports: &str,
         local_traffic: bool,
+        bypass_cidrs: &crate::settings::BypassCidrs,
     ) -> Result<()> {
-        __setup_nat_iptables(
-            &iptables::new(false)
-                .map_err(|e| anyhow::anyhow!("command iptables not found: {}", e))?,
-            proxy_chain,
-            redirect_port,
-            direct_mark,
-            ports,
-            local_traffic,
+        let reserved_v4 = bypass_cidrs.merged_v4(
             &[
                 "0.0.0.0/8",
                 "127.0.0.0/8",
@@ -221,6 +230,17 @@ mod linux_impl {
                 "169.254.0.0/16",
                 "255.255.255.255/32",
             ],
+            &[],
+        );
+        __setup_nat_iptables(
+            &iptables::new(false)
+                .map_err(|e| anyhow::anyhow!("command iptables not found: {}", e))?,
+            proxy_chain,
+            redirect_port,
+            direct_mark,
+            ports,
+            local_traffic,
+            &reserved_v4,
         )
         .map_err(|e| {
             error!("failed adding ipv4 iptable rules: {}", e);
@@ -231,14 +251,7 @@ mod linux_impl {
         })?;
 
         if !get_settings().read().await.disable_ipv6 {
-            __setup_nat_iptables(
-                &iptables::new(true)
-                    .map_err(|e| anyhow::anyhow!("command ip6tables not found: {}", e))?,
-                proxy_chain,
-                redirect_port,
-                direct_mark,
-                ports,
-                local_traffic,
+            let reserved_v6 = bypass_cidrs.merged_v6(
                 &[
                     "::1/128",
                     "100::/64",
@@ -249,6 +262,17 @@ mod linux_impl {
                     "::ffff:0:0/96",
                     "::ffff:0:0:0/96",
                 ],
+                &[],
+            );
+            __setup_nat_iptables(
+                &iptables::new(true)
+                    .map_err(|e| anyhow::anyhow!("command ip6tables not found: {}", e))?,
+                proxy_chain,
+                redirect_port,
+                direct_mark,
+                ports,
+                local_traffic,
+                &reserved_v6,
             )
             .map_err(|e| {
                 error!("failed adding ipv6 iptable rules: {}", e);

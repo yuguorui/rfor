@@ -6,8 +6,7 @@ mod tls_parse;
 use std::io;
 use std::time::Duration;
 
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::{timeout_at, Instant};
 
 const TCP_SNIFF_TIMEOUT: Duration = Duration::from_millis(500);
@@ -58,7 +57,12 @@ pub struct SniffedTcp {
 }
 
 // Re-export QUIC aggregator for cross-packet SNI parsing
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "macos"
+))]
 pub use quic_parser::{QuicParseResult, QuicSniAggregator};
 
 pub fn parse_tcp_host(data: &[u8]) -> HostParseResult {
@@ -81,15 +85,21 @@ pub fn parse_tcp_host(data: &[u8]) -> HostParseResult {
     }
 }
 
-pub async fn sniff_tcp(stream: &mut TcpStream) -> io::Result<Option<SniffedTcp>> {
+pub async fn sniff_tcp<S>(stream: &mut S) -> io::Result<Option<SniffedTcp>>
+where
+    S: AsyncRead + Unpin,
+{
     sniff_tcp_with_limits(stream, TCP_SNIFF_TIMEOUT, TCP_SNIFF_MAX_BYTES).await
 }
 
-async fn sniff_tcp_with_limits(
-    stream: &mut TcpStream,
+async fn sniff_tcp_with_limits<S>(
+    stream: &mut S,
     timeout: Duration,
     max_bytes: usize,
-) -> io::Result<Option<SniffedTcp>> {
+) -> io::Result<Option<SniffedTcp>>
+where
+    S: AsyncRead + Unpin,
+{
     let deadline = Instant::now() + timeout;
     let mut data = Vec::with_capacity(max_bytes.min(4096));
     let mut chunk = [0u8; 4096];
@@ -154,7 +164,7 @@ pub fn parse_host(remaining: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     async fn connected_streams() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

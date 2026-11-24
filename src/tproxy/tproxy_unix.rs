@@ -8,12 +8,11 @@ use tracing::{error, info, warn, debug};
 use crate::{rules::prepare_socket_bypass_mangle, utils::ToV6SockAddr, get_settings};
 use crate::stats::UDP_STATS;
 use std::{collections::hash_map, mem::MaybeUninit, sync::Arc, time::Instant};
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "linux")]
 use std::os::fd::BorrowedFd;
 
-use dashmap::DashMap;
-use once_cell::sync::Lazy;
+use super::common;
+use super::common::{canonical_ipv6, is_udp_peer_closed, unmap_ipv4_mapped};
 
 #[cfg(target_os = "freebsd")]
 use super::ipfw_freebsd;
@@ -21,79 +20,12 @@ use super::ipfw_freebsd;
 #[cfg(target_os = "openbsd")]
 use super::pf_openbsd;
 
-/// Normalized key for a UDP session. The constructor is the only way to
-/// build a key, so insertion and removal always use the same address form.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-struct UdpSessionKey {
-    source: std::net::SocketAddr,
-    target: std::net::SocketAddr,
-}
-
-impl UdpSessionKey {
-    fn new(source: std::net::SocketAddr, target: std::net::SocketAddr) -> Self {
-        Self {
-            source: source.to_ipv6_sockaddr(),
-            target: target.to_ipv6_sockaddr(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct UdpSessionId(u64);
-
-static NEXT_UDP_SESSION_ID: AtomicU64 = AtomicU64::new(1);
-
-fn next_udp_session_id() -> UdpSessionId {
-    UdpSessionId(NEXT_UDP_SESSION_ID.fetch_add(1, Ordering::Relaxed))
-}
-
-/// UDP session entry containing a channel sender for forwarding packets
-struct UdpSessionEntry {
-    /// Unique generation, so a finishing task cannot remove a replacement.
-    id: UdpSessionId,
-    /// Channel sender for forwarding packets to the session handler
-    packet_tx: mpsc::Sender<bytes::Bytes>,
-}
-
-/// Removes the session and updates stats when the relay task exits, including
-/// early error/panic exits. Only removes the matching generation.
-#[must_use = "the lease must be held for the lifetime of the relay task"]
-struct UdpSessionLease {
-    key: UdpSessionKey,
-    id: UdpSessionId,
-}
-
-impl UdpSessionLease {
-    fn new(key: UdpSessionKey, id: UdpSessionId) -> Self {
-        UDP_STATS.session_start();
-        Self { key, id }
-    }
-}
-
-impl Drop for UdpSessionLease {
-    fn drop(&mut self) {
-        UDP_SESSIONS.remove_if(&self.key, |_, entry| entry.id == self.id);
-        UDP_STATS.session_end(0);
-    }
-}
-
-/// Channel buffer size for forwarding packets to existing sessions
-const UDP_SESSION_CHANNEL_SIZE: usize = 32;
-
-/// DNS exchanges are request/response flows. Avoid retaining each Unbound
-/// query session for the generic UDP idle timeout.
-const DNS_UDP_TIMEOUT_SECS: u64 = 10;
-
 // OpenBSD exposes these as ancillary-data options but the libc crate does not
 // currently define them.
 #[cfg(target_os = "openbsd")]
 const IP_RECVDSTPORT: i32 = 33;
 #[cfg(target_os = "openbsd")]
 const IPV6_RECVDSTPORT: i32 = 64;
-
-/// Global map to track active UDP sessions with packet forwarding channels
-static UDP_SESSIONS: Lazy<DashMap<UdpSessionKey, UdpSessionEntry>> =
-    Lazy::new(|| DashMap::new());
 
 #[cfg(target_os = "linux")]
 fn setup_iptransparent_opts(sock: &SockRef) -> std::io::Result<()> {
@@ -652,7 +584,6 @@ fn recvmsg_wrapper(
 async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     use tokio::io::Interest;
-    use dashmap::mapref::entry::Entry;
 
     let settings = get_settings().read().await;
     if !settings.udp_enable {
@@ -678,133 +609,40 @@ async fn udp_socket_loop(listen_addr: &str) -> Result<()> {
             .await
         {
             Ok((size, source_sockaddr, target_sockaddr)) => {
-                let session_key = UdpSessionKey::new(source_sockaddr, target_sockaddr);
-
                 let prefilled_data = bytes::Bytes::copy_from_slice(&buffer[..size]);
-
-                // Existing sessions must remain usable after the global new-session
-                // limit has been reached. Do the lookup before enforcing the limit,
-                // and avoid calling UDP_SESSIONS.len() while holding an entry lock.
-                if let Some(session) = UDP_SESSIONS.get(&session_key) {
-                    let session_id = session.id;
-                    match session.packet_tx.try_send(prefilled_data) {
-                        Ok(_) => {
-                            debug!(
-                                "udp relay: forwarded packet to existing session {:?} <-> {:?}, {} bytes",
-                                source_sockaddr, target_sockaddr, size
-                            );
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            warn!(
-                                "udp relay: channel full for session {:?} <-> {:?}, packet dropped",
-                                source_sockaddr, target_sockaddr
-                            );
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            // Session is closing, remove the stale entry and let the
-                            // next packet create a replacement session.
-                            drop(session);
-                            UDP_SESSIONS.remove_if(&session_key, |_, entry| entry.id == session_id);
-                            debug!(
-                                "udp relay: removed stale session {:?} <-> {:?}",
-                                source_sockaddr, target_sockaddr
-                            );
-                        }
-                    }
+                let Some(session) = common::dispatch_udp_session(
+                    source_sockaddr,
+                    target_sockaddr,
+                    prefilled_data,
+                    max_sessions,
+                ) else {
                     continue;
-                }
+                };
 
-                // The limit only applies to packets that would create a new session.
-                if max_sessions > 0 && UDP_SESSIONS.len() >= max_sessions {
-                    warn!(
-                        "udp relay: max sessions limit ({}) reached, dropping new session {:?} <-> {:?}",
-                        max_sessions, source_sockaddr, target_sockaddr
-                    );
-                    continue;
-                }
+                info!(
+                    "udp relay: create tunnel {:?} <-> {:?} (active sessions: {})",
+                    source_sockaddr, target_sockaddr, session.active_sessions
+                );
 
-                // Use DashMap entry API to atomically check and insert. A session may
-                // have been created after the fast-path lookup above.
-                match UDP_SESSIONS.entry(session_key) {
-                    Entry::Occupied(entry) => {
-                        // Session already exists, forward packet through channel
-                        let session_id = entry.get().id;
-                        match entry.get().packet_tx.try_send(prefilled_data) {
-                            Ok(_) => {
-                                debug!(
-                                    "udp relay: forwarded packet to existing session {:?} <-> {:?}, {} bytes",
-                                    source_sockaddr, target_sockaddr, size
-                                );
-                            }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                warn!(
-                                    "udp relay: channel full for session {:?} <-> {:?}, packet dropped",
-                                    source_sockaddr, target_sockaddr
-                                );
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                // Session is closing, remove stale entry and let next packet create new session
-                                drop(entry);
-                                UDP_SESSIONS.remove_if(&session_key, |_, entry| entry.id == session_id);
-                                debug!(
-                                    "udp relay: removed stale session {:?} <-> {:?}",
-                                    source_sockaddr, target_sockaddr
-                                );
-                            }
-                        }
-                        continue;
+                tokio::spawn(async move {
+                    let result = relay_udp_packet(
+                        session.packet_rx,
+                        source_sockaddr,
+                        target_sockaddr,
+                    )
+                    .await;
+                    drop(session.lease);
+
+                    if let Err(e) = result {
+                        error!("Failed to relay udp packet: {}", e);
                     }
-                    Entry::Vacant(entry) => {
-                        // Create new session with channel
-                        let (tx, rx) = mpsc::channel(UDP_SESSION_CHANNEL_SIZE);
-
-                        // Use try_send since channel should be empty (freshly created)
-                        if let Err(e) = tx.try_send(prefilled_data) {
-                            error!("Failed to send init packet to new session: {}", e);
-                            continue;
-                        }
-
-                        let id = next_udp_session_id();
-                        entry.insert(UdpSessionEntry {
-                            id,
-                            packet_tx: tx,
-                        });
-                        let lease = UdpSessionLease::new(session_key, id);
-
-                        info!(
-                            "udp relay: create tunnel {:?} <-> {:?} (active sessions: {})",
-                            source_sockaddr, target_sockaddr, UDP_SESSIONS.len()
-                        );
-
-                        tokio::spawn(async move {
-                            let result = relay_udp_packet(
-                                rx,
-                                source_sockaddr,
-                                target_sockaddr,
-                            ).await;
-                            drop(lease);
-
-                            if let Err(e) = result {
-                                error!("Failed to relay udp packet: {}", e);
-                            }
-                        });
-                    }
-                }
+                });
             }
             Err(e) => {
                 return Err(e.into());
             }
         };
     }
-}
-
-fn unmap_ipv4_mapped(addr: std::net::SocketAddr) -> std::net::SocketAddr {
-    if let std::net::SocketAddr::V6(v6) = addr {
-        if let Some(v4) = v6.ip().to_ipv4_mapped() {
-            return std::net::SocketAddr::V4(std::net::SocketAddrV4::new(v4, v6.port()));
-        }
-    }
-    addr
 }
 
 fn udp_native_sockaddr(addr: std::net::SocketAddr, disable_ipv6: bool) -> std::net::SocketAddr {
@@ -942,148 +780,6 @@ async fn udp_socket_bind_to_any_with_flag(
     return Ok(source_socket);
 }
 
-/// Maximum number of packets to buffer while waiting for QUIC SNI aggregation
-const QUIC_SNI_MAX_BUFFERED_PACKETS: usize = 16;
-
-/// Timeout for QUIC SNI aggregation (milliseconds)
-const QUIC_SNI_AGGREGATION_TIMEOUT_MS: u64 = 300;
-
-/// Sniff host from UDP packets, supporting QUIC SNI aggregation across multiple packets.
-///
-/// This function first tries to parse the host from the initial packet using HTTP, TLS, and QUIC parsers.
-/// If QUIC parsing indicates that more packets are needed (fragmented ClientHello), it will
-/// wait for additional packets and aggregate CRYPTO frames to extract the SNI.
-///
-/// Returns:
-/// - The sniffed host and protocol (if found)
-/// - A vector of all buffered packets that should be forwarded
-async fn sniff_host_with_quic_aggregation(
-    packet_rx: &mut mpsc::Receiver<bytes::Bytes>,
-) -> (Option<crate::sniffer::SniffedHost>, Vec<bytes::Bytes>) {
-    use crate::sniffer::{QuicParseResult, QuicSniAggregator, SniffedHost, SniffedProtocol};
-
-    let mut buffered_packets = Vec::new();
-
-    // Wait for the first packet to determine the destination address (for domain sniffing)
-    let init_packet = match packet_rx.recv().await {
-        Some(packet) => packet,
-        None => {
-            return (None, buffered_packets);
-        }
-    };
-
-    buffered_packets.push(init_packet.clone());
-
-    // DNS queries carry the requested domain in the question section. Sniff
-    // the payload itself so DNS is identified even on non-standard ports.
-    if let Some(host) = crate::sniffer::dns_parse::parse_host(&init_packet) {
-        debug!("DNS query domain parsed from first packet: {}", host);
-        return (
-            Some(SniffedHost {
-                host,
-                protocol: Some(SniffedProtocol::Dns),
-            }),
-            buffered_packets,
-        );
-    }
-
-    let mut aggregator = QuicSniAggregator::new();
-    match aggregator.process_packet(&init_packet) {
-        QuicParseResult::Success(host) => {
-            debug!("QUIC SNI parsed from first packet: {}", host.host);
-            return (Some(host), buffered_packets);
-        }
-        QuicParseResult::NeedMoreData(dest_cid) => {
-            debug!(
-                "QUIC SNI needs more packets, dest_cid: {:x?}, waiting for additional packets",
-                dest_cid
-            );
-            // Continue to aggregate more packets
-        }
-        QuicParseResult::Failed(e) => {
-            debug!("QUIC parsing failed: {}, trying other protocols", e);
-            // Not a valid QUIC Initial packet, or parsing failed.
-            // Fallback to legacy parsers for HTTP/TLS (e.g. DTLS or other UDP protocols)
-            if let Some(host) = crate::sniffer::parse_host(&init_packet) {
-                return (
-                    Some(SniffedHost {
-                        host,
-                        protocol: None,
-                    }),
-                    buffered_packets,
-                );
-            }
-            return (None, buffered_packets);
-        }
-    }
-
-    // Set up timeout for aggregation
-    let timeout = tokio::time::sleep(std::time::Duration::from_millis(QUIC_SNI_AGGREGATION_TIMEOUT_MS));
-    tokio::pin!(timeout);
-
-    // Try to receive more packets for aggregation
-    loop {
-        if buffered_packets.len() >= QUIC_SNI_MAX_BUFFERED_PACKETS {
-            debug!(
-                "QUIC SNI aggregation: reached max buffered packets ({}), giving up",
-                QUIC_SNI_MAX_BUFFERED_PACKETS
-            );
-            break;
-        }
-
-        tokio::select! {
-            Some(packet) = packet_rx.recv() => {
-                buffered_packets.push(packet.clone());
-
-                match aggregator.process_packet(&packet) {
-                    QuicParseResult::Success(host) => {
-                        debug!(
-                            "QUIC SNI parsed after {} packets: {}",
-                            buffered_packets.len(),
-                            host.host
-                        );
-                        return (Some(host), buffered_packets);
-                    }
-                    QuicParseResult::NeedMoreData(_) => {
-                        debug!(
-                            "QUIC SNI still needs more packets after {} packets",
-                            buffered_packets.len()
-                        );
-                        // Continue waiting for more packets
-                    }
-                    QuicParseResult::Failed(e) => {
-                        debug!(
-                            "QUIC parsing failed after {} packets: {}",
-                            buffered_packets.len(),
-                            e
-                        );
-                        // This packet caused parsing to fail permanently
-                        break;
-                    }
-                }
-            }
-            _ = &mut timeout => {
-                debug!(
-                    "QUIC SNI aggregation timeout after {}ms with {} packets",
-                    QUIC_SNI_AGGREGATION_TIMEOUT_MS,
-                    buffered_packets.len()
-                );
-                break;
-            }
-        }
-    }
-
-    // Failed to parse SNI from aggregated packets
-    (None, buffered_packets)
-}
-
-/// A connected UDP reply socket receives `ECONNREFUSED` when the client closes
-/// its local UDP port and answers a trailing reply with ICMP Port Unreachable.
-/// Treat that as a normal session close rather than an error.
-fn is_udp_peer_closed(err: &std::io::Error) -> bool {
-    err.kind() == std::io::ErrorKind::ConnectionRefused
-}
-
 async fn relay_udp_packet(
     mut packet_rx: mpsc::Receiver<bytes::Bytes>,
     source_sockaddr: std::net::SocketAddr,
@@ -1105,71 +801,45 @@ async fn relay_udp_packet(
     // A native AF_INET socket cannot use an IPv4-mapped IPv6 address.
     let wire_target = udp_native_sockaddr(target_sockaddr, disable_ipv6);
 
-    // Try to parse host from packets, supporting QUIC SNI aggregation
-    let (host, buffered_packets) =
-        sniff_host_with_quic_aggregation(&mut packet_rx).await;
-
-    // If no packets received, just return
-    if buffered_packets.is_empty() {
-        return Ok(());
-    }
-
-    let sniffed_proto = host.as_ref().and_then(|h| h.protocol);
-    let dst_addr = match host {
-        None => crate::rules::TargetAddr::Ip(wire_target),
-        Some(host) => {
-            crate::rules::TargetAddr::Domain(host.host, target_sockaddr.port(), Some(target_sockaddr))
-        }
-    };
-
-    let target_socket = match get_settings()
-        .read()
-        .await
-        .routetable
-        .get_dgram_sock(&crate::rules::RouteContext {
-            src_addr: source_sockaddr,
-            dst_addr: dst_addr.clone(),
-            inbound_proto: Some(crate::rules::InboundProtocol::TPROXY),
-            socket_type: crate::rules::SocketType::DGRAM,
-            sniffed_proto,
-        })
-        .await
-    {
-        Ok(sock) => sock,
-        Err(err) => match err.kind() {
-            // Intentional DROP outbound, mirror the TCP path in transfer_tcp
-            // and return quietly instead of logging an error.
-            std::io::ErrorKind::PermissionDenied => {
-                // Optionally answer DNS queries with NXDOMAIN so clients fail
-                // fast instead of waiting for the DNS timeout.
-                if dns_drop_nxdomain {
-                    if let Some(resp) =
-                        crate::sniffer::dns_parse::build_nxdomain_response(&buffered_packets[0])
-                    {
-                        // Reply from the original DNS server's address, like the
-                        // normal relay path does with source_socket.
-                        match udp_socket_bind_to_any_with_flag(target_sockaddr, disable_ipv6).await
-                        {
-                            Ok(sock) => {
-                                if let Err(e) = sock
-                                    .send_to(
-                                        &resp,
-                                        udp_native_sockaddr(source_sockaddr, disable_ipv6),
-                                    )
-                                    .await
-                                {
-                                    debug!("failed to send NXDOMAIN response: {}", e);
-                                }
+    let (target_socket, dst_addr, sniffed_proto, buffered_packets) =
+        match common::prepare_udp_route(
+            &mut packet_rx,
+            source_sockaddr,
+            target_sockaddr,
+            wire_target,
+            dns_drop_nxdomain,
+        )
+        .await?
+        {
+            common::UdpRouteOutcome::Empty => return Ok(()),
+            common::UdpRouteOutcome::Dropped { nxdomain_reply } => {
+                // Reply from the original DNS server's address, like the normal
+                // relay path does with source_socket.
+                if let Some(resp) = nxdomain_reply {
+                    match udp_socket_bind_to_any_with_flag(target_sockaddr, disable_ipv6).await {
+                        Ok(sock) => {
+                            if let Err(e) = sock
+                                .send_to(
+                                    &resp,
+                                    udp_native_sockaddr(source_sockaddr, disable_ipv6),
+                                )
+                                .await
+                            {
+                                debug!("failed to send NXDOMAIN response: {}", e);
                             }
-                            Err(e) => debug!("failed to bind NXDOMAIN reply socket: {}", e),
                         }
+                        Err(e) => debug!("failed to bind NXDOMAIN reply socket: {}", e),
                     }
                 }
                 return Ok(());
             }
-            _ => return Err(err.into()),
-        },
-    };
+            common::UdpRouteOutcome::Ready {
+                target_socket,
+                dst_addr,
+                sniffed_proto,
+                buffered_packets,
+            } => (target_socket, dst_addr, sniffed_proto, buffered_packets),
+        };
 
     // Prepare the intermediate socket which is connected to the source, which should bind to the target address,
     // and pretend to be the target.
@@ -1194,55 +864,12 @@ async fn relay_udp_packet(
         last_active: Instant,
     }
 
-    // Rate limiter for new fullcone socket creation
-    struct RateLimiter {
-        tokens: u32,
-        last_refill: Instant,
-        max_tokens: u32,
-    }
-
-    impl RateLimiter {
-        fn new(rate: u32) -> Self {
-            Self {
-                tokens: rate,
-                last_refill: Instant::now(),
-                max_tokens: rate,
-            }
-        }
-
-        fn try_acquire(&mut self) -> bool {
-            if self.max_tokens == 0 {
-                return true; // Rate limiting disabled
-            }
-
-            let now = Instant::now();
-            let elapsed = now.duration_since(self.last_refill);
-
-            // Refill tokens based on elapsed time (1 token per 1/rate seconds)
-            if elapsed.as_secs() >= 1 {
-                self.tokens = self.max_tokens;
-                self.last_refill = now;
-            }
-
-            if self.tokens > 0 {
-                self.tokens -= 1;
-                true
-            } else {
-                false
-            }
-        }
-    }
-
     let mut socket_sets = hash_map::HashMap::<std::net::SocketAddr, FullconeSocketEntry>::new();
-    let mut rate_limiter = RateLimiter::new(fullcone_rate_limit);
+    let mut rate_limiter = common::FullconeRateLimiter::new(fullcone_rate_limit);
 
     // Apply the shorter DNS timeout only after the payload has been identified
     // as DNS; do not infer the protocol from the destination port.
-    let timeout = if sniffed_proto == Some(crate::sniffer::SniffedProtocol::Dns) {
-        std::time::Duration::from_secs(DNS_UDP_TIMEOUT_SECS)
-    } else {
-        std::time::Duration::from_secs(udp_timeout)
-    };
+    let timeout = common::udp_session_timeout(sniffed_proto, udp_timeout);
     let socket_idle_timeout = std::time::Duration::from_secs(fullcone_socket_timeout);
     let sleep = tokio::time::sleep(timeout);
     tokio::pin!(sleep);
@@ -1303,30 +930,8 @@ async fn relay_udp_packet(
                     Ok((size, addr)) => {
                         sleep.as_mut().set(tokio::time::sleep(timeout));
 
-                        // Extract the actual IP address from the response
-                        let response_addr = match &addr {
-                            crate::rules::TargetAddr::Ip(ip) => Some(*ip),
-                            crate::rules::TargetAddr::Domain(_, _, Some(ip)) => Some(*ip),
-                            crate::rules::TargetAddr::Domain(domain, port, None) => {
-                                // Domain without resolved IP - this typically comes from SOCKS5 proxy
-                                // responses. Full-cone NAT requires IP addresses for proper mapping,
-                                // so we cannot reliably handle this case.
-                                //
-                                // Note: We intentionally avoid DNS resolution here because:
-                                // 1. DNS results are unstable (load balancing, CDN, etc.)
-                                // 2. The resolved IP may differ from the actual source
-                                // 3. It would add latency and potential failure points
-                                //
-                                // If you need full-cone support through a proxy, ensure the proxy
-                                // returns IP addresses instead of domain names.
-                                warn!(
-                                    "udp relay (fullcone): received response from domain {}:{} without resolved IP, \
-                                     full-cone NAT requires IP addresses. ",
-                                    domain, port
-                                );
-                                None
-                            }
-                        };
+                        // Note: full-cone NAT requires IP addresses rather than unresolved domain names.
+                        let response_addr = common::extract_udp_response_ip(&addr);
 
                         let r = match response_addr {
                             Some(resp_ip) => {
@@ -1442,14 +1047,6 @@ async fn relay_udp_packet(
     Ok(())
 }
 
-/// Compare IPv4 and IPv6 addresses using rfor's canonical IPv6 form.
-fn canonical_ipv6(ip: std::net::IpAddr) -> std::net::Ipv6Addr {
-    match ip {
-        std::net::IpAddr::V4(ip) => ip.to_ipv6_mapped(),
-        std::net::IpAddr::V6(ip) => ip,
-    }
-}
-
 fn is_local_ip(ip: std::net::IpAddr) -> std::io::Result<bool> {
     use nix::sys::socket::{AddressFamily, SockaddrLike};
 
@@ -1506,51 +1103,13 @@ pub fn tproxy_bind_src(sock: SockRef, src_sock: std::net::SocketAddr) -> tokio::
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        canonical_ipv6, is_local_ip, is_udp_peer_closed, next_udp_session_id, UdpSessionEntry,
-        UdpSessionKey, UdpSessionLease, UDP_SESSIONS,
-    };
+    use super::is_local_ip;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-    #[test]
-    fn addresses_use_canonical_ipv6_form() {
-        let mapped_loopback = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
-
-        assert_eq!(
-            canonical_ipv6(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            mapped_loopback
-        );
-        assert_eq!(
-            canonical_ipv6(IpAddr::V6(mapped_loopback)),
-            mapped_loopback
-        );
-        assert_eq!(
-            canonical_ipv6(IpAddr::V6(Ipv6Addr::LOCALHOST)),
-            Ipv6Addr::LOCALHOST
-        );
-    }
-
-    #[test]
-    fn unmap_ipv4_mapped_unmaps_socket_address() {
-        use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
-
-        let v4 = Ipv4Addr::new(192, 0, 2, 7);
-        let mapped =
-            std::net::SocketAddr::V6(SocketAddrV6::new(v4.to_ipv6_mapped(), 19000, 0, 0));
-        assert_eq!(
-            super::unmap_ipv4_mapped(mapped),
-            std::net::SocketAddr::V4(SocketAddrV4::new(v4, 19000))
-        );
-
-        let native =
-            std::net::SocketAddr::V6(SocketAddrV6::new("2001:db8::7".parse().unwrap(), 443, 0, 0));
-        assert_eq!(super::unmap_ipv4_mapped(native), native);
-    }
 
     #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
     #[test]
     fn native_sockaddr_unmaps_ipv4_mapped_sources() {
-        use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
+        use std::net::{SocketAddrV4, SocketAddrV6};
 
         let v4 = Ipv4Addr::new(192, 0, 2, 7);
         let mapped = std::net::SocketAddr::V6(SocketAddrV6::new(v4.to_ipv6_mapped(), 1234, 0, 0));
@@ -1565,62 +1124,12 @@ mod tests {
     }
 
     #[test]
-    fn udp_session_lease_removes_only_its_generation() {
-        use tokio::sync::mpsc;
-
-        let key = UdpSessionKey::new(
-            "127.0.0.1:65000".parse().unwrap(),
-            "127.0.0.1:65001".parse().unwrap(),
-        );
-        let (first_tx, _first_rx) = mpsc::channel(1);
-        let first_id = next_udp_session_id();
-        UDP_SESSIONS.insert(
-            key,
-            UdpSessionEntry {
-                id: first_id,
-                packet_tx: first_tx,
-            },
-        );
-        let lease = UdpSessionLease::new(key, first_id);
-
-        let (second_tx, _second_rx) = mpsc::channel(1);
-        let second_id = next_udp_session_id();
-        UDP_SESSIONS.insert(
-            key,
-            UdpSessionEntry {
-                id: second_id,
-                packet_tx: second_tx,
-            },
-        );
-
-        drop(lease);
-        let preserved = UDP_SESSIONS
-            .get(&key)
-            .map(|entry| entry.id == second_id)
-            .unwrap_or(false);
-        UDP_SESSIONS.remove(&key);
-        assert!(preserved, "old lease removed the replacement session");
-    }
-
-    #[test]
     fn interface_addresses_include_loopback() {
         let mapped_loopback = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
 
         assert!(is_local_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap());
         assert!(is_local_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)).unwrap());
         assert!(is_local_ip(IpAddr::V6(mapped_loopback)).unwrap());
-    }
-
-    #[test]
-    fn udp_peer_closed_matches_only_connection_refused() {
-        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-        assert!(is_udp_peer_closed(&refused));
-
-        let timed_out = std::io::Error::from(std::io::ErrorKind::TimedOut);
-        assert!(!is_udp_peer_closed(&timed_out));
-
-        let other = std::io::Error::other("other error");
-        assert!(!is_udp_peer_closed(&other));
     }
 }
 
@@ -1629,40 +1138,13 @@ async fn handle_tcp(
     peer_addr: std::net::SocketAddr,
     local_addr: std::net::SocketAddr,
 ) -> Result<()> {
-    use crate::rules::{InboundProtocol, RouteContext, TargetAddr};
-    use crate::utils::{is_valid_domain, transfer_tcp_with_initial_data};
+    use crate::utils::transfer_tcp_with_initial_data;
 
-    let Some(sniffed) = crate::sniffer::sniff_tcp(inbound).await? else {
+    let Some(sniffed) = common::sniff_tcp_route(inbound, peer_addr, local_addr).await? else {
         return Ok(());
     };
-    let mut domain = sniffed.host.filter(|s| is_valid_domain(s.host.as_str()));
-
-    // DNS-over-TCP: sniff the queried domain so DNS traffic can be routed
-    // with the regular domain rules.
-    if domain.is_none() && inbound.local_addr()?.port() == 53 {
-        domain = crate::sniffer::dns_parse::parse_host_tcp(&sniffed.data)
-            .filter(|s| is_valid_domain(s.as_str()))
-            .map(|host| crate::sniffer::SniffedHost {
-                host,
-                protocol: Some(crate::sniffer::SniffedProtocol::Dns),
-            });
-    }
-
-    let sniffed_proto = domain.as_ref().and_then(|d| d.protocol);
-    let target_addr = match domain {
-        Some(domain) => TargetAddr::Domain(domain.host, local_addr.port(), Some(local_addr)),
-        None => TargetAddr::Ip(local_addr),
-    };
-
-    let rt_context = RouteContext {
-        src_addr: peer_addr,
-        dst_addr: target_addr,
-        inbound_proto: Some(InboundProtocol::TPROXY),
-        socket_type: crate::rules::SocketType::STREAM,
-        sniffed_proto,
-    };
-
-    transfer_tcp_with_initial_data(inbound, rt_context.to_owned(), sniffed.data)
+    let rt_context = sniffed.context.to_owned();
+    transfer_tcp_with_initial_data(inbound, sniffed.context, sniffed.initial_data)
         .await
         .context(format!("Failed request `{}`", rt_context))?;
 
@@ -1718,7 +1200,7 @@ fn __setup_iptables(
     ports: &str,
     local_traffic: bool,
     udp_enable: bool,
-    reserved_ip: &[&str],
+    reserved_ip: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
 
     let table = "mangle";
@@ -1833,7 +1315,21 @@ async fn set_iptables(
     direct_mark: u32,
     ports: &str,
     local_traffic: bool,
+    bypass_cidrs: &crate::settings::BypassCidrs,
 ) -> Result<()> {
+    let reserved_v4 = bypass_cidrs.merged_v4(
+        &[
+            "0.0.0.0/8",
+            "127.0.0.0/8",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "100.64.0.0/10",
+            "169.254.0.0/16",
+            "255.255.255.255/32",
+        ],
+        &[],
+    );
     __setup_iptables(
         &iptables::new(false)
             .map_err(|e| anyhow!("command iptables not found: {}", e))?,
@@ -1845,16 +1341,7 @@ async fn set_iptables(
         ports,
         local_traffic,
         get_settings().read().await.udp_enable,
-        &[
-            "0.0.0.0/8",
-            "127.0.0.0/8",
-            "10.0.0.0/8",
-            "172.16.0.0/12",
-            "192.168.0.0/16",
-            "100.64.0.0/10",
-            "169.254.0.0/16",
-            "255.255.255.255/32",
-        ],
+        &reserved_v4,
     )
     .map_err(|e| {
         error!("failed adding ipv4 iptable rules: {}", e);
@@ -1865,6 +1352,19 @@ async fn set_iptables(
     })?;
 
     if !get_settings().read().await.disable_ipv6 {
+        let reserved_v6 = bypass_cidrs.merged_v6(
+            &[
+                "::1/128",
+                "100::/64",
+                "2002::/16",
+                "fc00::/7",
+                "fe80::/10",
+                "ff00::/8",
+                "::ffff:0:0/96",
+                "::ffff:0:0:0/96",
+            ],
+            &[],
+        );
         __setup_iptables(
             &iptables::new(true)
                 .map_err(|e| anyhow!("command ip6tables not found: {}", e))?,
@@ -1876,16 +1376,7 @@ async fn set_iptables(
             ports,
             local_traffic,
             get_settings().read().await.udp_enable,
-            &[
-                "::1/128",
-                "100::/64",
-                "2002::/16",
-                "fc00::/7",
-                "fe80::/10",
-                "ff00::/8",
-                "::ffff:0:0/96",
-                "::ffff:0:0:0/96",
-            ],
+            &reserved_v6,
         )
         .map_err(|e| {
             error!("failed adding ipv6 iptable rules: {}", e);
@@ -2076,6 +1567,7 @@ async fn environment_setup() -> Result<()> {
                 *direct_mark,
                 ports,
                 *local_traffic,
+                &settings.bypass_cidrs,
             )
             .await
             {
@@ -2095,6 +1587,9 @@ async fn environment_setup() -> Result<()> {
         }
         crate::settings::InterceptMode::PF { .. } => {
             return Err(anyhow!("pf mode is only supported on OpenBSD"))
+        }
+        crate::settings::InterceptMode::UTUN { .. } => {
+            return Err(anyhow!("utun mode is only supported on macOS"))
         }
     }
 }
@@ -2131,13 +1626,16 @@ pub async fn clean_environment() -> Result<()> {
         crate::settings::InterceptMode::PF { .. } => {
             return Err(anyhow!("pf mode is only supported on OpenBSD"))
         }
+        crate::settings::InterceptMode::UTUN { .. } => {
+            return Err(anyhow!("utun mode is only supported on macOS"))
+        }
     }
 }
 
 #[cfg(target_os = "freebsd")]
 async fn environment_setup() -> Result<()> {
     let settings = get_settings().read().await;
-    let (local_traffic, ports, rule_base, proxy_chain, udp_enable, disable_ipv6, port) =
+    let (local_traffic, ports, rule_base, proxy_chain, bypass_cidrs, udp_enable, disable_ipv6, port) =
         match &settings.intercept_mode {
             crate::settings::InterceptMode::MANUAL => return Ok(()),
             crate::settings::InterceptMode::IPFW {
@@ -2150,6 +1648,7 @@ async fn environment_setup() -> Result<()> {
                 ports.clone(),
                 *rule_base,
                 proxy_chain.clone(),
+                settings.bypass_cidrs.clone(),
                 settings.udp_enable,
                 settings.disable_ipv6,
                 settings
@@ -2182,6 +1681,7 @@ async fn environment_setup() -> Result<()> {
         &proxy_chain,
         enable_ipv6,
         udp_enable,
+        &bypass_cidrs,
     )
     .await
 }
@@ -2212,7 +1712,7 @@ pub async fn clean_environment() -> Result<()> {
 #[cfg(target_os = "openbsd")]
 async fn environment_setup() -> Result<()> {
     let settings = get_settings().read().await;
-    let (local_traffic, ports, proxy_chain, udp_enable, disable_ipv6, port) =
+    let (local_traffic, ports, proxy_chain, bypass_cidrs, udp_enable, disable_ipv6, port) =
         match &settings.intercept_mode {
             crate::settings::InterceptMode::MANUAL => return Ok(()),
             crate::settings::InterceptMode::PF {
@@ -2223,6 +1723,7 @@ async fn environment_setup() -> Result<()> {
                 *local_traffic,
                 ports.clone(),
                 proxy_chain.clone(),
+                settings.bypass_cidrs.clone(),
                 settings.udp_enable,
                 settings.disable_ipv6,
                 settings
@@ -2261,6 +1762,7 @@ async fn environment_setup() -> Result<()> {
         disable_ipv6,
         udp_enable,
         &bind_ranges,
+        &bypass_cidrs,
     )
     .await
 }

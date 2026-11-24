@@ -145,19 +145,20 @@ async fn socks5_instance(socket: TcpStream) -> Result<()> {
             return Err(ReplyError::CommandNotSupported.into());
         }
         fast_socks5::Socks5Command::UDPAssociate => {
-            // Bind the relay in the client's address family. A dual-stack
-            // [::]:0 socket only works where bindv6only=0; OpenBSD defaults
-            // to v6-only, which would make IPv4 UDP associates time out.
-            let (bind_addr, relay_ip) = if local_addr.is_ipv4() {
-                (
-                    "0.0.0.0:0",
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                )
+            // Bind the relay in the client's address family and reply with the
+            // normalized local IP of the control socket so clients (including
+            // fast-socks5 on macOS) can connect() directly to BND.ADDR:BND.PORT.
+            let local_ip = match local_addr.ip() {
+                std::net::IpAddr::V6(v6) => v6
+                    .to_ipv4_mapped()
+                    .map(std::net::IpAddr::V4)
+                    .unwrap_or(std::net::IpAddr::V6(v6)),
+                ip => ip,
+            };
+            let (bind_addr, relay_ip) = if local_ip.is_ipv4() {
+                ("0.0.0.0:0", local_ip)
             } else {
-                (
-                    "[::]:0",
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                )
+                ("[::]:0", local_ip)
             };
             let peer_sock = bind_udp_relay(bind_addr).await?;
 

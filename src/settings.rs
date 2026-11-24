@@ -67,7 +67,42 @@ pub enum InterceptMode {
         ports: String,
         proxy_chain: String,
     },
+    UTUN {
+        local_traffic: bool,
+        ports: String,
+        utun_name: Option<String>,
+        egress_interface: Option<String>,
+        proxy_chain: String,
+    },
     MANUAL,
+}
+
+#[derive(Serialize, Default, Clone, Debug, PartialEq, Eq)]
+pub struct BypassCidrs {
+    pub v4: Vec<String>,
+    pub v6: Vec<String>,
+}
+
+impl BypassCidrs {
+    #[allow(dead_code)]
+    pub(crate) fn merged_v4(&self, base: &[&str], local: &[String]) -> Vec<String> {
+        merge_cidr_lists(base, local, &self.v4)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn merged_v6(&self, base: &[&str], local: &[String]) -> Vec<String> {
+        merge_cidr_lists(base, local, &self.v6)
+    }
+}
+
+#[allow(dead_code)]
+fn merge_cidr_lists(base: &[&str], local: &[String], bypass: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = base.iter().map(|s| (*s).to_owned()).collect();
+    out.extend(local.iter().cloned());
+    out.extend(bypass.iter().cloned());
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[derive(Serialize)]
@@ -81,6 +116,8 @@ pub struct Settings {
     #[serde(skip)]
     pub routetable: RouteTable,
     pub intercept_mode: InterceptMode,
+    pub bypass_cidrs: BypassCidrs,
+    pub egress_interface: Option<String>,
     pub udp_enable: bool,
     pub udp_timeout: u64,
     pub udp_fullcone: bool,
@@ -147,12 +184,14 @@ impl Settings {
 
         /* 5. Parse the Intercept Mode */
         let intercept_mode = parse_intercept_mode(&s)?;
+        let bypass_cidrs = parse_bypass_cidrs(&s)?;
 
         /* 6. Parse the UDP enabling */
         let udp_enable = match &intercept_mode {
             InterceptMode::TPROXY { .. }
             | InterceptMode::IPFW { .. }
             | InterceptMode::PF { .. }
+            | InterceptMode::UTUN { .. }
             | InterceptMode::MANUAL => {
                 // The canonical key is `udp-enabled`; keep `udp-enable` as a
                 // deprecated alias so existing configs keep working.
@@ -193,6 +232,8 @@ impl Settings {
             redirect_listen: s.get::<String>("redirect-listen").ok(),
             routetable: route,
             intercept_mode,
+            bypass_cidrs,
+            egress_interface: parse_egress_interface(&s),
             udp_enable,
             udp_timeout: s.get_int("udp-timeout").unwrap_or(60) as u64,
             udp_fullcone: s.get_bool("udp-fullcone").unwrap_or(false),
@@ -303,14 +344,39 @@ fn ensure_default_outbounds(route: &mut RouteTable) -> Result<(), ConfigError> {
 }
 
 fn validate_settings(settings: &Settings) -> Result<(), ConfigError> {
-    // At least one listener should be configured
+    // At least one listener should be configured (or macOS utun interception active)
     if settings.tproxy_listen.is_none()
         && settings.socks5_listen.is_none()
         && settings.redirect_listen.is_none()
+        && !matches!(settings.intercept_mode, InterceptMode::UTUN { .. })
     {
         return Err(ConfigError::Message(
             "At least one listener (tproxy-listen, socks5-listen, or redirect-listen) must be configured.".to_string()
         ));
+    }
+
+    if matches!(
+        settings.intercept_mode,
+        InterceptMode::UTUN {
+            local_traffic: true,
+            ..
+        }
+    ) {
+        for cidr in settings
+            .bypass_cidrs
+            .v4
+            .iter()
+            .chain(settings.bypass_cidrs.v6.iter())
+        {
+            if let Ok(net) = cidr.parse::<IpNet>() {
+                if net.prefix_len() < 2 {
+                    return Err(ConfigError::Message(format!(
+                        "bypass-cidrs entry '{}' with prefix length < 2 conflicts with macOS utun split-default routes",
+                        cidr
+                    )));
+                }
+            }
+        }
     }
 
     Ok(())
@@ -348,9 +414,9 @@ fn sanitize_port_ranges(s: &Vec<config::Value>) -> Result<Vec<[u16; 2]>, ConfigE
     // reduce the ranges
     ranges.sort();
     let mut i = 0;
-    while i < ranges.len() - 1 {
+    while i + 1 < ranges.len() {
         if ranges[i][1] >= ranges[i + 1][0] {
-            ranges[i][1] = ranges[i + 1][1];
+            ranges[i][1] = ranges[i][1].max(ranges[i + 1][1]);
             ranges.remove(i + 1);
         } else {
             i += 1;
@@ -417,7 +483,7 @@ fn parse_intercept_mode(s: &Config) -> Result<InterceptMode, ConfigError> {
 
     match mode.as_str() {
         "manual" => return Ok(InterceptMode::MANUAL),
-        "auto" | "tproxy" | "ipfw" | "pf" | "redirect" => {
+        "auto" | "tproxy" | "ipfw" | "pf" | "utun" | "tun" | "redirect" => {
             let capture_local_traffic = table
                 .get("local-traffic")
                 .and_then(|v| v.clone().into_bool().ok())
@@ -456,9 +522,9 @@ fn parse_intercept_mode(s: &Config) -> Result<InterceptMode, ConfigError> {
                 parse_optional_int_field_u8(table.clone(), "rule-table", DEFAULT_IPRULE_TABLE);
 
             if mode == "redirect" {
-                if cfg!(any(target_os = "freebsd", target_os = "openbsd")) {
+                if cfg!(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos")) {
                     return Err(ConfigError::Message(
-                        "redirect mode is not supported on this BSD; use auto/tproxy (ipfw or pf) or manual"
+                        "redirect mode is not supported on this platform; use auto/tproxy or manual"
                             .to_string(),
                     ));
                 }
@@ -473,6 +539,12 @@ fn parse_intercept_mode(s: &Config) -> Result<InterceptMode, ConfigError> {
             if mode == "pf" && !cfg!(target_os = "openbsd") {
                 return Err(ConfigError::Message(
                     "pf mode is only supported on OpenBSD; use auto/tproxy".to_string(),
+                ));
+            }
+
+            if (mode == "utun" || mode == "tun") && !cfg!(target_os = "macos") {
+                return Err(ConfigError::Message(
+                    "utun/tun mode is only supported on macOS; use auto/tproxy".to_string(),
                 ));
             }
 
@@ -509,6 +581,30 @@ fn parse_intercept_mode(s: &Config) -> Result<InterceptMode, ConfigError> {
                 });
             }
 
+            if mode == "utun" || mode == "tun" || cfg!(target_os = "macos") {
+                if !cfg!(target_os = "macos") {
+                    return Err(ConfigError::Message(
+                        "utun/tun mode is only supported on macOS; use auto/tproxy".to_string(),
+                    ));
+                }
+                let utun_name = table
+                    .get("utun-name")
+                    .and_then(|v| v.clone().into_string().ok())
+                    .and_then(non_empty_trimmed);
+                let egress_interface = table
+                    .get("egress-interface")
+                    .and_then(|v| v.clone().into_string().ok())
+                    .and_then(non_empty_trimmed)
+                    .or_else(|| parse_egress_interface(s));
+                return Ok(InterceptMode::UTUN {
+                    local_traffic: capture_local_traffic,
+                    ports: ports.unwrap_or_default(),
+                    utun_name,
+                    egress_interface,
+                    proxy_chain,
+                });
+            }
+
             Ok(InterceptMode::TPROXY {
                 local_traffic: capture_local_traffic,
                 ports: ports.unwrap_or_default(),
@@ -520,7 +616,8 @@ fn parse_intercept_mode(s: &Config) -> Result<InterceptMode, ConfigError> {
             })
         }
         _ => Err(ConfigError::Message(
-            "either `auto/tproxy`, `ipfw`, `redirect` or `manual` is expected.".to_owned(),
+            "either `auto/tproxy`, `utun/tun`, `ipfw`, `pf`, `redirect` or `manual` is expected."
+                .to_owned(),
         )),
     }
 }
@@ -569,6 +666,87 @@ fn parse_optional_string_field(
         .get(field)
         .and_then(|v| v.clone().into_string().ok())
         .unwrap_or_else(|| default.to_string())
+}
+
+fn non_empty_trimmed(raw: String) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+fn parse_egress_interface(s: &Config) -> Option<String> {
+    s.get::<String>("egress-interface")
+        .ok()
+        .and_then(non_empty_trimmed)
+        .or_else(|| {
+            s.get_table("traffic-intercept").ok().and_then(|table| {
+                table
+                    .get("egress-interface")
+                    .and_then(|v| v.clone().into_string().ok())
+                    .and_then(non_empty_trimmed)
+            })
+        })
+}
+
+fn parse_bypass_cidrs(s: &Config) -> Result<BypassCidrs, ConfigError> {
+    let Ok(table) = s.get_table("traffic-intercept") else {
+        return Ok(BypassCidrs::default());
+    };
+    let Some(raw_list) = table.get("bypass-cidrs") else {
+        return Ok(BypassCidrs::default());
+    };
+
+    let items = raw_list
+        .clone()
+        .into_array()
+        .map_err(|e| ConfigError::Message(format!("bypass-cidrs must be an array: {}", e)))?;
+
+    let mut out = BypassCidrs::default();
+    for item in items {
+        let raw = item.into_string().map_err(|e| {
+            ConfigError::Message(format!("bypass-cidrs item must be a string: {}", e))
+        })?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(ConfigError::Message(
+                "bypass-cidrs item must not be empty".to_string(),
+            ));
+        }
+
+        let net = match trimmed.parse::<IpNet>() {
+            Ok(net) => net.trunc(),
+            Err(net_err) => trimmed
+                .parse::<std::net::IpAddr>()
+                .map(IpNet::from)
+                .map_err(|_| {
+                    ConfigError::Message(format!(
+                        "Invalid bypass-cidrs CIDR '{}': {}",
+                        trimmed, net_err
+                    ))
+                })?,
+        };
+
+        if net.prefix_len() == 0 {
+            return Err(ConfigError::Message(format!(
+                "bypass-cidrs cannot contain default route '{}'",
+                trimmed
+            )));
+        }
+
+        match net {
+            IpNet::V4(v4) => out.v4.push(v4.to_string()),
+            IpNet::V6(v6) => out.v6.push(v6.to_string()),
+        }
+    }
+
+    out.v4.sort();
+    out.v4.dedup();
+    out.v6.sort();
+    out.v6.dedup();
+    Ok(out)
 }
 
 fn parse_route_rules(s: &Config, route: &mut RouteTable) -> Result<(), ConfigError> {
@@ -806,4 +984,217 @@ fn parse_route_rules(s: &Config, route: &mut RouteTable) -> Result<(), ConfigErr
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::FileFormat;
+
+    fn parse_config_yaml(yaml: &str) -> Config {
+        Config::builder()
+            .add_source(File::from_str(yaml, FileFormat::Yaml))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn sanitize_port_ranges_handles_empty_and_overlapping_ranges() {
+        let empty = sanitize_port_ranges(&vec![]).unwrap();
+        assert!(empty.is_empty());
+
+        let vals = vec![
+            config::Value::from("80"),
+            config::Value::from("443"),
+            config::Value::from("8080-8085"),
+            config::Value::from("8082-8084"),
+        ];
+        let merged = sanitize_port_ranges(&vals).unwrap();
+        assert_eq!(merged, vec![[80, 80], [443, 443], [8080, 8085]]);
+        assert_eq!(port_range_to_string(&merged), "80,443,8080:8085");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_intercept_mode_parses_utun_and_rejects_unsupported() {
+        for mode in ["auto", "tproxy", "utun", "tun"] {
+            let cfg = parse_config_yaml(&format!(
+                "traffic-intercept:\n  mode: {mode}\n  local-traffic: true\n  ports: [80, 443, \"8080-8082\"]\n  utun-name: utun9\n  egress-interface: en0\n  tproxy-proxy-chain: rfor-mac\n"
+            ));
+            match parse_intercept_mode(&cfg).unwrap() {
+                InterceptMode::UTUN {
+                    local_traffic,
+                    ports,
+                    utun_name,
+                    egress_interface,
+                    proxy_chain,
+                } => {
+                    assert!(local_traffic);
+                    assert_eq!(ports, "80,443,8080:8082");
+                    assert_eq!(utun_name.as_deref(), Some("utun9"));
+                    assert_eq!(egress_interface.as_deref(), Some("en0"));
+                    assert_eq!(proxy_chain, "rfor-mac");
+                }
+                _ => panic!("expected UTUN variant for mode {mode}"),
+            }
+        }
+
+        for bad_mode in ["redirect", "ipfw", "pf"] {
+            let cfg = parse_config_yaml(&format!("traffic-intercept:\n  mode: {bad_mode}\n"));
+            assert!(
+                parse_intercept_mode(&cfg).is_err(),
+                "{bad_mode} should be rejected on macOS"
+            );
+        }
+
+        let manual = parse_config_yaml("traffic-intercept:\n  mode: manual\n");
+        assert!(matches!(
+            parse_intercept_mode(&manual).unwrap(),
+            InterceptMode::MANUAL
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn validate_settings_allows_utun_without_tproxy_listen() {
+        let settings = Settings {
+            debug: false,
+            pprof: None,
+            disable_ipv6: false,
+            tproxy_listen: None,
+            socks5_listen: None,
+            redirect_listen: None,
+            routetable: RouteTable::new(),
+            intercept_mode: InterceptMode::UTUN {
+                local_traffic: true,
+                ports: "80,443".to_string(),
+                utun_name: None,
+                egress_interface: None,
+                proxy_chain: "rfor-proxy".to_string(),
+            },
+            bypass_cidrs: BypassCidrs::default(),
+            egress_interface: None,
+            udp_enable: true,
+            udp_timeout: 60,
+            udp_fullcone: false,
+            udp_fullcone_max_sockets: 64,
+            udp_fullcone_socket_timeout: 30,
+            udp_fullcone_rate_limit: 10,
+            udp_max_sessions: 1024,
+            drop_reply: DropReply::default(),
+        };
+        assert!(validate_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn parse_egress_interface_supports_top_level_and_manual_intercept() {
+        let top_level = parse_config_yaml("egress-interface: \" en0 \"\ntraffic-intercept:\n  mode: manual\n");
+        assert_eq!(parse_egress_interface(&top_level).as_deref(), Some("en0"));
+
+        let nested = parse_config_yaml(
+            "traffic-intercept:\n  mode: manual\n  egress-interface: \"en1\"\n",
+        );
+        assert_eq!(parse_egress_interface(&nested).as_deref(), Some("en1"));
+
+        let blank = parse_config_yaml("egress-interface: \"   \"\ntraffic-intercept:\n  mode: manual\n");
+        assert_eq!(parse_egress_interface(&blank), None);
+
+        let missing = parse_config_yaml("traffic-intercept:\n  mode: manual\n");
+        assert_eq!(parse_egress_interface(&missing), None);
+    }
+
+    #[test]
+    fn parse_bypass_cidrs_supports_v4_v6_bare_ips_and_truncates() {
+        let cfg = parse_config_yaml(
+            "traffic-intercept:\n  mode: auto\n  bypass-cidrs:\n    - \" 30.221.100.46/19 \"\n    - \"29.29.29.29\"\n    - \"30.221.96.0/19\"\n    - \"2001:db8::1/64\"\n    - \"2001:db8:cafe::1\"\n    - \"2001:db8::/64\"\n",
+        );
+        let parsed = parse_bypass_cidrs(&cfg).unwrap();
+        assert_eq!(
+            parsed,
+            BypassCidrs {
+                v4: vec!["29.29.29.29/32".to_string(), "30.221.96.0/19".to_string()],
+                v6: vec![
+                    "2001:db8::/64".to_string(),
+                    "2001:db8:cafe::1/128".to_string()
+                ],
+            }
+        );
+
+        let absent = parse_config_yaml("socks5-listen: 127.0.0.1:1080\n");
+        assert_eq!(parse_bypass_cidrs(&absent).unwrap(), BypassCidrs::default());
+    }
+
+    #[test]
+    fn parse_bypass_cidrs_rejects_invalid_and_default_routes() {
+        for yaml in [
+            "traffic-intercept:\n  mode: auto\n  bypass-cidrs: \"30.0.0.0/8\"\n",
+            "traffic-intercept:\n  mode: auto\n  bypass-cidrs:\n    - \"   \"\n",
+            "traffic-intercept:\n  mode: auto\n  bypass-cidrs:\n    - \"not-a-cidr\"\n",
+            "traffic-intercept:\n  mode: auto\n  bypass-cidrs:\n    - \"0.0.0.0/0\"\n",
+            "traffic-intercept:\n  mode: auto\n  bypass-cidrs:\n    - \"::/0\"\n",
+        ] {
+            let cfg = parse_config_yaml(yaml);
+            assert!(
+                parse_bypass_cidrs(&cfg).is_err(),
+                "expected error for yaml:\n{yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_settings_rejects_slash_one_bypass_only_for_utun_local_traffic() {
+        let make_settings = |local_traffic: bool, bypass_cidrs: BypassCidrs| Settings {
+            debug: false,
+            pprof: None,
+            disable_ipv6: false,
+            tproxy_listen: None,
+            socks5_listen: None,
+            redirect_listen: None,
+            routetable: RouteTable::new(),
+            intercept_mode: InterceptMode::UTUN {
+                local_traffic,
+                ports: "80,443".to_string(),
+                utun_name: None,
+                egress_interface: None,
+                proxy_chain: "rfor-proxy".to_string(),
+            },
+            bypass_cidrs,
+            egress_interface: None,
+            udp_enable: true,
+            udp_timeout: 60,
+            udp_fullcone: false,
+            udp_fullcone_max_sockets: 64,
+            udp_fullcone_socket_timeout: 30,
+            udp_fullcone_rate_limit: 10,
+            udp_max_sessions: 1024,
+            drop_reply: DropReply::default(),
+        };
+
+        assert!(validate_settings(&make_settings(
+            true,
+            BypassCidrs {
+                v4: vec!["0.0.0.0/1".to_string()],
+                v6: Vec::new(),
+            }
+        ))
+        .is_err());
+
+        assert!(validate_settings(&make_settings(
+            true,
+            BypassCidrs {
+                v4: Vec::new(),
+                v6: vec!["::/1".to_string()],
+            }
+        ))
+        .is_err());
+
+        assert!(validate_settings(&make_settings(
+            false,
+            BypassCidrs {
+                v4: vec!["0.0.0.0/1".to_string()],
+                v6: vec!["::/1".to_string()],
+            }
+        ))
+        .is_ok());
+    }
 }
