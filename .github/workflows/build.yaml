@@ -72,9 +72,184 @@ jobs:
           name: rfor-${{ matrix.arch }}
           path: rfor-*.tar.gz
 
+  build-darwin:
+    name: Build darwin (aarch64 & x86_64)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Run unit tests
+        run: cargo test --no-fail-fast --target aarch64-apple-darwin
+
+      - name: Build release
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '12.0'
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Sign binaries
+        id: sign
+        shell: bash
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$MACOS_CERT_P12_BASE64" ] || [ -z "$MACOS_CERT_PASSWORD" ]; then
+            echo "macOS signing secrets not configured; skipping codesign."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CERT_PATH="$RUNNER_TEMP/build-cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/rfor-signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 24)
+
+          printf '%s' "$MACOS_CERT_P12_BASE64" | tr -d '\n\r ' | base64 -d > "$CERT_PATH"
+          chmod 600 "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          SIGN_IDENTITY="$MACOS_SIGN_IDENTITY"
+          if [ -z "$SIGN_IDENTITY" ]; then
+            SIGN_IDENTITY=$(
+              security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+                | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' \
+                | head -n 1
+            )
+          fi
+          if [ -z "$SIGN_IDENTITY" ]; then
+            echo "::error::No Developer ID Application signing identity found in imported certificate"
+            exit 1
+          fi
+
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            BIN_PATH="target/$target/release/rfor"
+            codesign --force --options runtime --timestamp \
+              --keychain "$KEYCHAIN_PATH" \
+              --sign "$SIGN_IDENTITY" \
+              "$BIN_PATH"
+            codesign --verify --strict --verbose=2 "$BIN_PATH"
+          done
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Notarize binaries
+        if: steps.sign.outputs.signed == 'true'
+        shell: bash
+        env:
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          NOTARY_DIR="$RUNNER_TEMP/rfor-notarize"
+          ZIP_PATH="$RUNNER_TEMP/rfor-notarize.zip"
+          RESULT_PATH="$RUNNER_TEMP/notary-result.json"
+          KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+
+          AUTH_ARGS=()
+          if [ -n "$APPLE_API_KEY_P8_BASE64" ] && [ -n "$APPLE_API_KEY_ID" ] && [ -n "$APPLE_API_ISSUER_ID" ]; then
+            printf '%s' "$APPLE_API_KEY_P8_BASE64" | tr -d '\n\r ' | base64 -d > "$KEY_PATH"
+            chmod 600 "$KEY_PATH"
+            AUTH_ARGS=(--key "$KEY_PATH" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID")
+          elif [ -n "$APPLE_ID" ] && [ -n "$APPLE_TEAM_ID" ] && [ -n "$APPLE_APP_PASSWORD" ]; then
+            AUTH_ARGS=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD")
+          else
+            echo "Apple notarization credentials not configured; skipping notarization."
+            exit 0
+          fi
+
+          rm -rf "$NOTARY_DIR" "$ZIP_PATH"
+          mkdir -p "$NOTARY_DIR/aarch64" "$NOTARY_DIR/x86_64"
+          cp -a target/aarch64-apple-darwin/release/rfor "$NOTARY_DIR/aarch64/rfor"
+          cp -a target/x86_64-apple-darwin/release/rfor "$NOTARY_DIR/x86_64/rfor"
+          ditto -c -k "$NOTARY_DIR" "$ZIP_PATH"
+
+          xcrun notarytool submit "$ZIP_PATH" "${AUTH_ARGS[@]}" --wait --output-format json > "$RESULT_PATH"
+          cat "$RESULT_PATH"
+
+          STATUS=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1])).get('status', ''))" "$RESULT_PATH")
+          SUBMISSION_ID=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1])).get('id', ''))" "$RESULT_PATH")
+          if [ -n "$SUBMISSION_ID" ]; then
+            xcrun notarytool log "$SUBMISSION_ID" "${AUTH_ARGS[@]}" || true
+          fi
+          if [ "$STATUS" != "Accepted" ]; then
+            echo "::error::Notarization failed with status '$STATUS' (id=$SUBMISSION_ID)"
+            exit 1
+          fi
+
+      - name: Download geoip.dat
+        run: curl -fsSL -o geoip.dat https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat
+
+      - name: Download geosite.dat
+        run: curl -fsSL -o geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+
+      - name: Get version
+        id: version
+        run: echo "version=$(grep -E '^version' Cargo.toml | tr -d '"' | cut -d ' ' -f 3)" >> "$GITHUB_OUTPUT"
+
+      - name: Package release
+        shell: bash
+        env:
+          COPYFILE_DISABLE: '1'
+        run: |
+          set -euo pipefail
+          for spec in aarch64:aarch64-apple-darwin x86_64:x86_64-apple-darwin; do
+            arch=${spec%%:*}
+            target=${spec#*:}
+            artifact_name=rfor-${{ steps.version.outputs.version }}-darwin-$arch
+            mkdir -p "$artifact_name"
+            cp -a geoip.dat geosite.dat "$artifact_name/"
+            cp -a conf/* "$artifact_name/"
+            cp -a "target/$target/release/rfor" "$artifact_name/"
+            tar czf "$artifact_name.tar.gz" "$artifact_name"
+          done
+
+      - name: Upload aarch64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rfor-darwin-aarch64
+          path: rfor-*-darwin-aarch64.tar.gz
+
+      - name: Upload x86_64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rfor-darwin-x86_64
+          path: rfor-*-darwin-x86_64.tar.gz
+
+      - name: Clean up signing credentials
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/rfor-signing.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/rfor-signing.keychain-db" || true
+          fi
+          rm -rf \
+            "$RUNNER_TEMP/rfor-notarize" \
+            "$RUNNER_TEMP/build-cert.p12" \
+            "$RUNNER_TEMP/AuthKey.p8" \
+            "$RUNNER_TEMP/rfor-notarize.zip" \
+            "$RUNNER_TEMP/notary-result.json"
+
   release:
     name: Release
-    needs: build
+    needs: [build, build-darwin]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
