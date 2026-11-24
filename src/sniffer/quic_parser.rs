@@ -583,15 +583,16 @@ fn decrypt_initial_payload(
     let payload_end = (header.packet_len as usize + hdr_len).min(remaining.len());
     let mut payload = remaining[hdr_len + packet_number_len..payload_end].to_vec();
 
-    keys.local
+    let decrypted = keys
+        .local
         .packet
         .decrypt_in_place(packet_number, &reconstructed, &mut payload)
         .map_err(|_| QuicParseError::DecryptionFailed)?;
 
-    debug!("Decrypted QUIC payload length: {}", payload.len());
+    debug!("Decrypted QUIC payload length: {}", decrypted.len());
 
     // Parse frames to extract CRYPTO frames
-    extract_crypto_frames(&payload)
+    extract_crypto_frames(decrypted)
 }
 
 /// Skip over an ACK frame's fields (RFC 9000 Section 19.3)
@@ -1183,6 +1184,38 @@ mod tests {
                 assert_eq!(host.protocol, Some(crate::sniffer::SniffedProtocol::QuicV2));
             }
             other => panic!("expected SNI from python-crafted v2 Initial, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_ignores_aead_tag_bytes_resembling_quic_frames() {
+        let host = "tag-edge.example.com";
+        let hello = client_hello(host);
+        let dcid = b"tag-edge-dcid";
+
+        let packet = (0u64..4096)
+            .map(|pn| {
+                build_initial_packet(
+                    VERSION1,
+                    rustls::quic::Version::V1,
+                    dcid,
+                    pn,
+                    &[(0, hello.as_slice())],
+                )
+            })
+            .find(|pkt| matches!(pkt[pkt.len() - 16], FRAME_TYPE_CRYPTO | FRAME_TYPE_ACK))
+            .expect("expected at least one AEAD tag starting with CRYPTO or ACK frame type");
+
+        let mut aggregator = QuicSniAggregator::new();
+        match aggregator.process_packet(&packet) {
+            QuicParseResult::Success(parsed) => {
+                assert_eq!(parsed.host, host);
+                assert_eq!(parsed.protocol, Some(crate::sniffer::SniffedProtocol::QuicV1));
+            }
+            other => panic!(
+                "expected SNI despite trailing AEAD tag byte, got {:?}",
+                other
+            ),
         }
     }
 }
