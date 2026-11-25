@@ -157,9 +157,12 @@ if __name__ == "__main__":
         count = int(sys.argv[4])
         out_path = sys.argv[5]
         def one(_):
-            rcode, ancount, dt_ms = query(server, name)
-            if rcode == 0 and ancount >= 1:
-                return dt_ms
+            try:
+                rcode, ancount, dt_ms = query(server, name)
+                if rcode == 0 and ancount >= 1:
+                    return dt_ms
+            except Exception:
+                pass
             return None
         ok = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
@@ -266,8 +269,10 @@ rules:
 YAML
 
 start_rfor() {
+    local conf="${1:-$CONF}"
+    local log_filter="${2:-rfor=info}"
     : >"$LOG"
-    "$RFOR_BIN" -c "$CONF" -w "$TMP" >"$LOG" 2>&1 &
+    RUST_LOG="$log_filter" "$RFOR_BIN" -c "$conf" -w "$TMP" >"$LOG" 2>&1 &
     PID=$!
     local j=0
     while [ "$j" -lt 40 ]; do
@@ -438,6 +443,57 @@ pass "upstream SOCKS5 observed both TCP and UDP flows"
 # 7. Clean SIGTERM teardown
 stop_and_verify_clean
 pass "SIGTERM cleaned utun interface and restored routing table"
+
+# 7a. Non-intercepted UDP port bypass and udp-enabled: false bypass (relay_udp_bypass)
+UDP_BYPASS_CONF="$TMP/rfor-udp-port-bypass.yaml"
+cat >"$UDP_BYPASS_CONF" <<'YAML'
+debug: true
+udp-enabled: true
+udp-timeout: 15
+traffic-intercept:
+  mode: auto
+  local-traffic: true
+  ports: [80, 443]
+outbounds:
+  - name: DIRECT
+rules:
+  - DEFAULT,,DIRECT
+YAML
+
+start_rfor "$UDP_BYPASS_CONF" "rfor=debug" || fail "rfor utun failed to start for UDP port-bypass test"
+for _ in 1 2 3; do
+    "$PYTHON_BIN" "$DNS_HELPER" check "$DNS_SERVER" "$DNS_NAME" 0 >/dev/null || fail "non-intercepted UDP port 53 query failed"
+done
+grep -q 'udp bypass: create tunnel .*<-> 8\.8\.8\.8:53' "$LOG" || fail "expected udp bypass log for non-intercepted port 53"
+if grep -q '8\.8\.8\.8:53.*Outbound(' "$LOG"; then
+    fail "non-intercepted UDP port 53 unexpectedly entered RouteTable"
+fi
+stop_and_verify_clean
+pass "non-intercepted UDP port 53 bypassed RouteTable via relay_udp_bypass"
+
+UDP_DISABLED_CONF="$TMP/rfor-udp-disabled.yaml"
+cat >"$UDP_DISABLED_CONF" <<'YAML'
+debug: true
+udp-enabled: false
+udp-timeout: 15
+traffic-intercept:
+  mode: auto
+  local-traffic: true
+  ports: [80, 443, 53]
+outbounds:
+  - name: DIRECT
+rules:
+  - DEFAULT,,DIRECT
+YAML
+
+start_rfor "$UDP_DISABLED_CONF" "rfor=debug" || fail "rfor utun failed to start for udp-enabled=false test"
+"$PYTHON_BIN" "$DNS_HELPER" check "$DNS_SERVER" "$DNS_NAME" 0 >/dev/null || fail "UDP query failed when udp-enabled=false"
+grep -q 'udp bypass: create tunnel .*<-> 8\.8\.8\.8:53' "$LOG" || fail "expected udp bypass log when udp-enabled=false"
+if grep -q '8\.8\.8\.8:53.*Outbound(' "$LOG"; then
+    fail "UDP unexpectedly entered RouteTable when udp-enabled=false"
+fi
+stop_and_verify_clean
+pass "udp-enabled: false relayed UDP via relay_udp_bypass"
 
 # 8. Restart soak (repeated start -> live traffic -> SIGTERM -> baseline check)
 cycle=0

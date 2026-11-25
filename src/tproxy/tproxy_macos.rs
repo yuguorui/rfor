@@ -1005,4 +1005,164 @@ mod tests {
     ) -> Vec<u8> {
         build_ipv4_tcp_segment(src, sport, dst, dport, seq, ack, 0x18, payload)
     }
+
+    fn ipv6_udp_checksum(
+        src: std::net::Ipv6Addr,
+        dst: std::net::Ipv6Addr,
+        udp: &[u8],
+    ) -> u16 {
+        let mut sum: u32 = 0;
+        for chunk in src.octets().chunks_exact(2) {
+            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+        }
+        for chunk in dst.octets().chunks_exact(2) {
+            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+        }
+        for chunk in (udp.len() as u32).to_be_bytes().chunks_exact(2) {
+            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+        }
+        sum += 17u32;
+        for chunk in udp.chunks(2) {
+            let word = if chunk.len() == 2 {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], 0])
+            };
+            sum += word as u32;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        let csum = !(sum as u16);
+        if csum == 0 {
+            0xffff
+        } else {
+            csum
+        }
+    }
+
+    fn build_ipv6_udp_packet(
+        src: std::net::Ipv6Addr,
+        sport: u16,
+        dst: std::net::Ipv6Addr,
+        dport: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let udp_len = (8 + payload.len()) as u16;
+        let mut udp = Vec::with_capacity(udp_len as usize);
+        udp.extend_from_slice(&sport.to_be_bytes());
+        udp.extend_from_slice(&dport.to_be_bytes());
+        udp.extend_from_slice(&udp_len.to_be_bytes());
+        udp.extend_from_slice(&[0, 0]);
+        udp.extend_from_slice(payload);
+        let csum = ipv6_udp_checksum(src, dst, &udp);
+        udp[6..8].copy_from_slice(&csum.to_be_bytes());
+
+        let mut pkt = Vec::with_capacity(40 + udp.len());
+        pkt.extend_from_slice(&[
+            0x60,
+            0x00,
+            0x00,
+            0x00,
+            (udp_len >> 8) as u8,
+            udp_len as u8,
+            17,
+            64,
+        ]);
+        pkt.extend_from_slice(&src.octets());
+        pkt.extend_from_slice(&dst.octets());
+        pkt.extend_from_slice(&udp);
+        pkt
+    }
+
+    #[test]
+    fn allow_fullcone_peer_tracks_rate_limits_evicts_oldest_and_expires_idle() {
+        let p1: SocketAddr = "203.0.113.10:9001".parse().unwrap();
+        let p2: SocketAddr = "203.0.113.10:9002".parse().unwrap();
+        let p3: SocketAddr = "203.0.113.10:9003".parse().unwrap();
+
+        let mut peers = HashMap::new();
+        let mut rate = common::FullconeRateLimiter::new(2);
+        assert!(allow_fullcone_peer(&mut peers, &mut rate, p1, 4, Duration::from_secs(30)));
+        assert!(allow_fullcone_peer(&mut peers, &mut rate, p2, 4, Duration::from_secs(30)));
+        // Refreshing an existing peer must not consume a new-peer rate token.
+        assert!(allow_fullcone_peer(&mut peers, &mut rate, p1, 4, Duration::from_secs(30)));
+        // A third distinct peer exceeds the 2/sec rate limit.
+        assert!(!allow_fullcone_peer(&mut peers, &mut rate, p3, 4, Duration::from_secs(30)));
+        assert_eq!(peers.len(), 2);
+
+        // Max peers cap evicts the oldest active peer.
+        let mut capped = HashMap::new();
+        let mut unlimited = common::FullconeRateLimiter::new(0);
+        assert!(allow_fullcone_peer(&mut capped, &mut unlimited, p1, 2, Duration::from_secs(30)));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(allow_fullcone_peer(&mut capped, &mut unlimited, p2, 2, Duration::from_secs(30)));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(allow_fullcone_peer(&mut capped, &mut unlimited, p3, 2, Duration::from_secs(30)));
+        assert_eq!(capped.len(), 2);
+        assert!(!capped.contains_key(&p1));
+        assert!(capped.contains_key(&p2));
+        assert!(capped.contains_key(&p3));
+
+        // Idle expiry prunes stale entries when a new peer arrives.
+        let mut expiring = HashMap::new();
+        assert!(allow_fullcone_peer(&mut expiring, &mut unlimited, p1, 4, Duration::from_millis(10)));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(allow_fullcone_peer(&mut expiring, &mut unlimited, p2, 4, Duration::from_millis(10)));
+        assert!(!expiring.contains_key(&p1));
+        assert!(expiring.contains_key(&p2));
+    }
+
+    #[tokio::test]
+    async fn netstack_ipv6_udp_preserves_client_and_destination_endpoints() {
+        let (stack, runner, udp_socket, _tcp_listener) = StackBuilder::default()
+            .enable_tcp(false)
+            .enable_udp(true)
+            .enable_icmp(false)
+            .mtu(1500)
+            .build()
+            .unwrap();
+
+        let runner_handle = runner.map(tokio::spawn);
+        let (mut stack_sink, mut stack_stream) = stack.split();
+        let (mut udp_rx, mut udp_tx) = udp_socket.unwrap().split();
+
+        let src_v6: std::net::Ipv6Addr = "fd72:666f:7200::1".parse().unwrap();
+        let dst_v6: std::net::Ipv6Addr = "2001:db8:50::1".parse().unwrap();
+        let client_v6 = SocketAddr::new(src_v6.into(), 51000);
+        let target_v6 = SocketAddr::new(dst_v6.into(), 9001);
+
+        let pkt = build_ipv6_udp_packet(src_v6, 51000, dst_v6, 9001, b"udp6-probe");
+        stack_sink.send(pkt).await.unwrap();
+
+        let (recv_payload, got_client, got_target) =
+            tokio::time::timeout(Duration::from_secs(2), udp_rx.next())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(recv_payload, b"udp6-probe");
+        assert_eq!(got_client, client_v6);
+        assert_eq!(got_target, target_v6);
+
+        udp_tx
+            .send((b"udp6-reply".to_vec(), got_target, got_client))
+            .await
+            .unwrap();
+        let raw_reply = tokio::time::timeout(Duration::from_secs(2), stack_stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw_reply[0] >> 4, 6);
+        assert_eq!(raw_reply[6], 17);
+        assert_eq!(&raw_reply[8..24], &dst_v6.octets());
+        assert_eq!(&raw_reply[24..40], &src_v6.octets());
+        assert_eq!(u16::from_be_bytes([raw_reply[40], raw_reply[41]]), 9001);
+        assert_eq!(u16::from_be_bytes([raw_reply[42], raw_reply[43]]), 51000);
+        assert_eq!(&raw_reply[48..], b"udp6-reply");
+
+        if let Some(handle) = runner_handle {
+            handle.abort();
+        }
+    }
 }

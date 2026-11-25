@@ -38,7 +38,7 @@ SSH_OPTS = [
 ]
 
 
-def open_utun(local_ip: str, peer_ip: str) -> tuple[int, str]:
+def open_utun(local_ip: str, peer_ip: str, local_v6: str | None = None) -> tuple[int, str]:
     libc = ctypes.CDLL(None, use_errno=True)
     libc.socket.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
     libc.connect.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
@@ -99,6 +99,11 @@ def open_utun(local_ip: str, peer_ip: str) -> tuple[int, str]:
             ],
             check=True,
         )
+        if local_v6:
+            subprocess.run(
+                ["ifconfig", ifname, "inet6", local_v6, "prefixlen", "64"],
+                check=True,
+            )
         return fd, ifname
     except Exception:
         os.close(fd)
@@ -112,7 +117,7 @@ def write_all(wfd: int, data: bytes | memoryview) -> None:
         mv = mv[written:]
 
 
-def run_guest(local_ip: str, peer_ip: str) -> int:
+def run_guest(local_ip: str, peer_ip: str, local_v6: str | None = None) -> int:
     stop = False
 
     def handle_sig(_signum: int, _frame: object) -> None:
@@ -122,7 +127,7 @@ def run_guest(local_ip: str, peer_ip: str) -> int:
     signal.signal(signal.SIGTERM, handle_sig)
     signal.signal(signal.SIGINT, handle_sig)
 
-    fd, ifname = open_utun(local_ip, peer_ip)
+    fd, ifname = open_utun(local_ip, peer_ip, local_v6)
     sys.stderr.write(f"READY {ifname}\n")
     sys.stderr.flush()
 
@@ -171,11 +176,13 @@ def spawn_guest_ssh(
     target: str,
     local_ip: str,
     peer_ip: str,
+    local_v6: str | None = None,
 ) -> subprocess.Popen[bytes]:
+    v6_arg = f" {local_v6}" if local_v6 else ""
     remote_cmd = (
         "PY=$(command -v /opt/homebrew/bin/python3 || command -v /usr/local/bin/python3 || command -v python3); "
         f'[ -n "$PY" ] || {{ echo "python3 not found" >&2; exit 1; }}; '
-        f'exec sudo "$PY" /tmp/rfor-utun-wire.py --guest {local_ip} {peer_ip}'
+        f'exec sudo "$PY" /tmp/rfor-utun-wire.py --guest {local_ip} {peer_ip}{v6_arg}'
     )
     return subprocess.Popen(
         ["ssh", "-p", "22", "-i", ssh_key, *SSH_OPTS, target, remote_cmd],
@@ -230,6 +237,8 @@ def run_bridge(
     gw_link_ip: str,
     client_link_ip: str,
     ready_file: str,
+    gw_link_v6: str | None = None,
+    client_link_v6: str | None = None,
 ) -> int:
     self_path = os.path.abspath(__file__)
     for target in (gw_target, client_target):
@@ -246,8 +255,8 @@ def run_bridge(
     signal.signal(signal.SIGTERM, handle_sig)
     signal.signal(signal.SIGINT, handle_sig)
 
-    p_gw = spawn_guest_ssh(ssh_key, gw_target, gw_link_ip, client_link_ip)
-    p_cl = spawn_guest_ssh(ssh_key, client_target, client_link_ip, gw_link_ip)
+    p_gw = spawn_guest_ssh(ssh_key, gw_target, gw_link_ip, client_link_ip, gw_link_v6)
+    p_cl = spawn_guest_ssh(ssh_key, client_target, client_link_ip, gw_link_ip, client_link_v6)
 
     try:
         assert p_gw.stderr is not None and p_cl.stderr is not None
@@ -298,16 +307,19 @@ def main() -> int:
 
     mode = sys.argv[1]
     if mode == "--guest":
-        if len(sys.argv) != 4:
-            sys.stderr.write("Usage: utun-wire.py --guest <local-ip> <peer-ip>\n")
+        if len(sys.argv) not in (4, 5):
+            sys.stderr.write("Usage: utun-wire.py --guest <local-ip> <peer-ip> [local-v6]\n")
             return 2
-        return run_guest(sys.argv[2], sys.argv[3])
+        local_v6 = sys.argv[4] if len(sys.argv) == 5 else None
+        return run_guest(sys.argv[2], sys.argv[3], local_v6)
     if mode == "--bridge":
-        if len(sys.argv) != 8:
+        if len(sys.argv) not in (8, 10):
             sys.stderr.write(
-                "Usage: utun-wire.py --bridge <ssh-key> <gw-target> <client-target> <gw-link-ip> <client-link-ip> <ready-file>\n"
+                "Usage: utun-wire.py --bridge <ssh-key> <gw-target> <client-target> <gw-link-ip> <client-link-ip> <ready-file> [gw-link-v6 client-link-v6]\n"
             )
             return 2
+        gw_link_v6 = sys.argv[8] if len(sys.argv) == 10 else None
+        client_link_v6 = sys.argv[9] if len(sys.argv) == 10 else None
         return run_bridge(
             sys.argv[2],
             sys.argv[3],
@@ -315,6 +327,8 @@ def main() -> int:
             sys.argv[5],
             sys.argv[6],
             sys.argv[7],
+            gw_link_v6,
+            client_link_v6,
         )
 
     sys.stderr.write(f"Unknown mode: {mode}\n")
