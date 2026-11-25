@@ -1,5 +1,5 @@
 #!/bin/sh
-# macOS local-traffic integration test (utun + netstack-smoltcp + IP_BOUND_IF).
+# macOS local-traffic integration test (utun + smoltcp + IP_BOUND_IF).
 #
 # Installs split-default routes onto a dynamically created utun interface and
 # exercises local TCP, HTTPS/TLS SNI, HTTP Host, UDP DNS, SOCKS5 TCP/UDP
@@ -132,7 +132,15 @@ if __name__ == "__main__":
     name = sys.argv[3]
     if mode == "check":
         expect_rcode = int(sys.argv[4])
-        rcode, ancount, dt_ms = query(server, name)
+        last_err = None
+        for _attempt in range(3):
+            try:
+                rcode, ancount, dt_ms = query(server, name)
+                break
+            except (TimeoutError, socket.timeout) as exc:
+                last_err = exc
+        else:
+            raise last_err
         if rcode != expect_rcode:
             raise SystemExit(f"expected rcode={expect_rcode}, got {rcode} (ancount={ancount})")
         if expect_rcode == 0 and ancount < 1:
@@ -175,6 +183,9 @@ if __name__ == "__main__":
         print(ok)
 PY
 
+ORIG_EGRESS_IF=""
+ORIG_GW=""
+
 cleanup() {
     if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
         kill -TERM "$PID" 2>/dev/null || true
@@ -183,6 +194,9 @@ cleanup() {
     if [ -n "$UPSTREAM_PID" ] && kill -0 "$UPSTREAM_PID" 2>/dev/null; then
         kill -TERM "$UPSTREAM_PID" 2>/dev/null || true
         wait "$UPSTREAM_PID" 2>/dev/null || true
+    fi
+    if [ -n "$ORIG_GW" ] && ! route -n get default >/dev/null 2>&1; then
+        route -n add default "$ORIG_GW" >/dev/null 2>&1 || true
     fi
     rm -rf "$TMP"
 }
@@ -291,6 +305,7 @@ start_rfor() {
 }
 
 stop_and_verify_clean() {
+    local ignore_default_flags="${1:-0}"
     if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
         kill -TERM "$PID"
         wait "$PID" 2>/dev/null || true
@@ -299,13 +314,23 @@ stop_and_verify_clean() {
 
     local cur_utuns="$TMP/cur.utuns"
     local cur_routes="$TMP/cur.routes"
+    local base_cmp="$BASE_ROUTES"
+    local cur_cmp="$cur_routes"
+    if [ "$ignore_default_flags" = "1" ]; then
+        base_cmp="$TMP/base.routes.norm"
+        cur_cmp="$TMP/cur.routes.norm"
+        awk '{if ($1 == "default") $3 = "*"; print}' "$BASE_ROUTES" >"$base_cmp"
+    fi
     local settled=0
     local j=0
     while [ "$j" -lt 20 ]; do
         snapshot_utun >"$cur_utuns"
         snapshot_v4_routes >"$cur_routes"
+        if [ "$ignore_default_flags" = "1" ]; then
+            awk '{if ($1 == "default") $3 = "*"; print}' "$cur_routes" >"$cur_cmp"
+        fi
         if diff -u "$BASE_UTUNS" "$cur_utuns" >/dev/null 2>&1 &&
-            diff -u "$BASE_ROUTES" "$cur_routes" >/dev/null 2>&1; then
+            diff -u "$base_cmp" "$cur_cmp" >/dev/null 2>&1; then
             settled=1
             break
         fi
@@ -314,7 +339,7 @@ stop_and_verify_clean() {
     done
     if [ "$settled" != "1" ]; then
         diff -u "$BASE_UTUNS" "$cur_utuns" >&2 || true
-        diff -u "$BASE_ROUTES" "$cur_routes" >&2 || true
+        diff -u "$base_cmp" "$cur_cmp" >&2 || true
         fail "utun interface or routes did not return to baseline after SIGTERM"
     fi
     if netstat -rn -f inet6 | awk '$1 ~ /^2001:db8:cafe::/ {found=1} END {exit !found}'; then
@@ -504,5 +529,204 @@ while [ "$cycle" -lt "$SOAK_CYCLES" ]; do
     stop_and_verify_clean
     pass "soak cycle $cycle/$SOAK_CYCLES: started, served traffic, and cleaned up"
 done
+
+# 9. Offline startup -> low CPU -> automatic PF_ROUTE reconciliation, and live disconnect/reconnect recovery.
+ORIG_EGRESS_IF=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2; exit}')
+ORIG_GW=$(route -n get default 2>/dev/null | awk '/gateway:/ {print $2; exit}')
+[ -n "$ORIG_EGRESS_IF" ] && [ -n "$ORIG_GW" ] || fail "failed to capture baseline default route ($ORIG_EGRESS_IF / $ORIG_GW)"
+
+OFFLINE_CONF="$TMP/rfor-offline.yaml"
+cat >"$OFFLINE_CONF" <<YAML
+debug: true
+udp-enabled: true
+udp-timeout: 15
+traffic-intercept:
+  mode: auto
+  local-traffic: true
+  egress-interface: "$ORIG_EGRESS_IF"
+  ports: [80, 443, 53]
+  bypass-cidrs:
+    - "1.0.0.1/32"
+outbounds:
+  - name: DIRECT
+  - name: PROXY
+    url: socks5://127.0.0.1:11081
+rules:
+  - DEFAULT,,DIRECT
+  - DOMAIN,one.one.one.one,PROXY
+YAML
+
+OFFLINE_AUTO_CONF="$TMP/rfor-offline-auto.yaml"
+cat >"$OFFLINE_AUTO_CONF" <<'YAML'
+debug: true
+udp-enabled: true
+udp-timeout: 15
+traffic-intercept:
+  mode: auto
+  local-traffic: true
+  ports: [80, 443, 53]
+  bypass-cidrs:
+    - "1.0.0.1/32"
+outbounds:
+  - name: DIRECT
+  - name: PROXY
+    url: socks5://127.0.0.1:11081
+rules:
+  - DEFAULT,,DIRECT
+  - DOMAIN,one.one.one.one,PROXY
+YAML
+
+check_low_cpu() {
+    local pid="$1"
+    local phase="$2"
+    local cpu_int
+    cpu_int=$(ps -p "$pid" -o %cpu= 2>/dev/null | awk '{printf "%d", ($1 + 0.5)}')
+    [ -n "$cpu_int" ] || fail "failed to read CPU% for rfor pid=$pid during $phase"
+    [ "$cpu_int" -lt 25 ] || fail "rfor CPU too high during $phase (${cpu_int}%)"
+}
+
+start_offline_rfor() {
+    local conf="$1"
+    : >"$LOG"
+    RUST_LOG="rfor=debug" "$RFOR_BIN" -c "$conf" -w "$TMP" >"$LOG" 2>&1 &
+    PID=$!
+    local j=0
+    while [ "$j" -lt 32 ]; do
+        kill -0 "$PID" 2>/dev/null || fail "rfor exited when started offline ($conf)"
+        grep -q 'utun listen:' "$LOG" 2>/dev/null && return 0
+        sleep 0.25
+        j=$((j + 1))
+    done
+    fail "rfor did not start utun listener when offline ($conf)"
+}
+
+wait_for_routes_active() {
+    local expect_gw="$1"
+    local expect_if="$2"
+    local k=0
+    while [ "$k" -lt 32 ]; do
+        local r_if scoped_gw
+        r_if=$(route -n get 1.0.0.0 2>/dev/null | awk '/interface:/ {print $2; exit}' || true)
+        scoped_gw=$(route -n get -ifscope "$expect_if" default 2>/dev/null | awk '/gateway:/ {print $2; exit}' || true)
+        case "$r_if" in
+            utun*)
+                if [ "$scoped_gw" = "$expect_gw" ]; then
+                    return 0
+                fi
+                ;;
+        esac
+        sleep 0.25
+        k=$((k + 1))
+    done
+    return 1
+}
+
+wait_for_routes_withdrawn() {
+    local k=0
+    while [ "$k" -lt 20 ]; do
+        local r_if
+        r_if=$(route -n get 1.0.0.0 2>/dev/null | awk '/interface:/ {print $2; exit}' || true)
+        case "$r_if" in
+            utun*) ;;
+            *) return 0 ;;
+        esac
+        sleep 0.25
+        k=$((k + 1))
+    done
+    return 1
+}
+
+assert_no_unreachable_since() {
+    local mark="$1"
+    local label="$2"
+    if tail -n +"$((mark + 1))" "$LOG" | grep -q 'Network is unreachable'; then
+        fail "unexpected Network is unreachable after $label"
+    fi
+}
+
+# 9a. Offline startup with egress-interface -> traffic probes + low CPU -> recover -> all protocols
+route -n delete default >/dev/null || fail "failed to delete default route for offline startup test"
+start_offline_rfor "$OFFLINE_CONF"
+
+curl -4 -sS --noproxy '*' --max-time 2 -o /dev/null "$TCP_URL" >/dev/null 2>&1 || true
+ping -n -c 1 -t 1 1.1.1.1 >/dev/null 2>&1 || true
+sleep 2
+kill -0 "$PID" 2>/dev/null || fail "rfor died while idle offline"
+OFFLINE_IF=$(route -n get 1.0.0.0 2>/dev/null | awk '/interface:/ {print $2; exit}' || true)
+case "$OFFLINE_IF" in
+    utun*) fail "1.0.0.0 unexpectedly routed into $OFFLINE_IF while offline" ;;
+esac
+check_low_cpu "$PID" "offline idle (egress-interface)"
+pass "offline startup (egress-interface) deferred split-default routes and stayed low-CPU"
+
+route -n add default "$ORIG_GW" >/dev/null || fail "failed to restore default route $ORIG_GW"
+wait_for_routes_active "$ORIG_GW" "$ORIG_EGRESS_IF" || fail "rfor did not reconcile routes after network recovery"
+RECOVER_MARK=$(wc -l <"$LOG" | tr -d ' ')
+
+RECOVER_BYPASS_IF=$(route -n get 1.0.0.1 2>/dev/null | awk '/interface:/ {print $2; exit}' || true)
+[ "$RECOVER_BYPASS_IF" = "$ORIG_EGRESS_IF" ] || fail "expected recovered bypass route 1.0.0.1 via $ORIG_EGRESS_IF, got '$RECOVER_BYPASS_IF'"
+RECOVER_CODE=$(curl -4 -sS --noproxy '*' --max-time 10 -o /dev/null -w '%{http_code}' "$TCP_URL") || RECOVER_CODE="000"
+case "$RECOVER_CODE" in
+    2*|3*) ;;
+    *) fail "DIRECT HTTPS through utun failed after network recovery ($RECOVER_CODE)" ;;
+esac
+RECOVER_PROXY_CODE=$(curl -4 --resolve one.one.one.one:443:1.1.1.1 -sS --noproxy '*' --max-time 10 -o /dev/null -w '%{http_code}' https://one.one.one.one/) || RECOVER_PROXY_CODE="000"
+case "$RECOVER_PROXY_CODE" in
+    2*|3*) ;;
+    *) fail "PROXY TLS SNI through utun failed after network recovery ($RECOVER_PROXY_CODE)" ;;
+esac
+"$PYTHON_BIN" "$DNS_HELPER" check "$DNS_SERVER" "$DNS_NAME" 0 >/dev/null || fail "DIRECT UDP DNS failed after network recovery"
+RECOVER_PING_OUT=$(ping -n -c 2 -t 4 1.1.1.1 2>&1) || fail "DIRECT ICMP failed after network recovery: $RECOVER_PING_OUT"
+assert_no_unreachable_since "$RECOVER_MARK" "offline recovery"
+pass "network recovery installed bypass/scoped routes and restored DIRECT TCP/UDP/ICMP + PROXY TCP ($RECOVER_CODE/$RECOVER_PROXY_CODE)"
+
+# 9b. Running online -> disconnect -> auto withdraw + low CPU -> reconnect -> auto recover
+route -n delete default >/dev/null 2>&1 || true
+route -n delete -inet -ifscope "$ORIG_EGRESS_IF" default "$ORIG_GW" >/dev/null 2>&1 || true
+wait_for_routes_withdrawn || fail "rfor did not withdraw split-default routes after disconnect"
+curl -4 -sS --noproxy '*' --max-time 2 -o /dev/null "$TCP_URL" >/dev/null 2>&1 || true
+sleep 1.5
+check_low_cpu "$PID" "post-disconnect idle"
+pass "disconnect withdrew split-default routes and kept CPU low"
+
+route -n add default "$ORIG_GW" >/dev/null || fail "failed to restore default route after disconnect"
+wait_for_routes_active "$ORIG_GW" "$ORIG_EGRESS_IF" || fail "rfor did not re-install routes after reconnect"
+RECONNECT_MARK=$(wc -l <"$LOG" | tr -d ' ')
+RECOVER2_CODE=$(curl -4 -sS --noproxy '*' --max-time 10 -o /dev/null -w '%{http_code}' "$TCP_URL") || RECOVER2_CODE="000"
+case "$RECOVER2_CODE" in
+    2*|3*) ;;
+    *) fail "HTTPS through utun failed after reconnect ($RECOVER2_CODE)" ;;
+esac
+RECONNECT_PING_OUT=$(ping -n -c 2 -t 4 1.1.1.1 2>&1) || fail "DIRECT ICMP failed after reconnect: $RECONNECT_PING_OUT"
+assert_no_unreachable_since "$RECONNECT_MARK" "reconnect"
+pass "reconnect restored routes, TCP, and ICMP cleanly ($RECOVER2_CODE)"
+
+stop_and_verify_clean 1
+
+# 9c. Offline startup WITHOUT egress-interface (mode: auto pure auto-detect) -> recover
+route -n delete default >/dev/null || fail "failed to delete default route for auto-detect offline test"
+start_offline_rfor "$OFFLINE_AUTO_CONF"
+
+sleep 2
+kill -0 "$PID" 2>/dev/null || fail "rfor (auto-detect) died while idle offline"
+AUTO_OFFLINE_IF=$(route -n get 1.0.0.0 2>/dev/null | awk '/interface:/ {print $2; exit}' || true)
+case "$AUTO_OFFLINE_IF" in
+    utun*) fail "1.0.0.0 unexpectedly routed into $AUTO_OFFLINE_IF while offline (auto-detect)" ;;
+esac
+check_low_cpu "$PID" "offline idle (auto-detect)"
+pass "offline startup (auto-detect) deferred split-default routes and stayed low-CPU"
+
+route -n add default "$ORIG_GW" >/dev/null || fail "failed to restore default route for auto-detect recovery"
+wait_for_routes_active "$ORIG_GW" "$ORIG_EGRESS_IF" || fail "rfor (auto-detect) did not reconcile routes after recovery"
+AUTO_RECOVER_CODE=$(curl -4 -sS --noproxy '*' --max-time 10 -o /dev/null -w '%{http_code}' "$TCP_URL") || AUTO_RECOVER_CODE="000"
+case "$AUTO_RECOVER_CODE" in
+    2*|3*) ;;
+    *) fail "HTTPS through utun failed after auto-detect recovery ($AUTO_RECOVER_CODE)" ;;
+esac
+pass "offline startup (auto-detect) recovered routes and HTTPS cleanly ($AUTO_RECOVER_CODE)"
+
+stop_and_verify_clean 1
+ORIG_GW=""
+pass "offline-recovery lifecycle cleaned up to baseline"
 
 echo "all macOS local-traffic integration tests passed"

@@ -18,7 +18,8 @@ use std::ffi::CStr;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Command, Output, Stdio};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
+use std::time::Duration;
 
 use crate::settings::BypassCidrs;
 
@@ -166,6 +167,8 @@ impl InstalledRoute {
 #[derive(Debug, Default)]
 struct ActiveState {
     local_traffic: bool,
+    utun_name: String,
+    egress: Option<EgressInfo>,
     egress_v4_ifindex: Option<u32>,
     egress_v6_ifindex: Option<u32>,
     installed_routes: Vec<InstalledRoute>,
@@ -174,6 +177,7 @@ struct ActiveState {
 }
 
 static ACTIVE_STATE: RwLock<Option<ActiveState>> = RwLock::new(None);
+static ROUTE_OP_LOCK: Mutex<()> = Mutex::new(());
 
 /// Return the egress interface index to bind outbound sockets onto when
 /// `local-traffic: true` split-default routes are active.
@@ -192,6 +196,20 @@ pub(crate) fn egress_ifindex(is_ipv4: bool) -> Option<u32> {
     }
 }
 
+/// Return both IPv4 and IPv6 egress interface indices currently configured for `local-traffic: true`.
+pub(crate) fn current_egress_ifindices() -> (Option<u32>, Option<u32>) {
+    let guard = ACTIVE_STATE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(state) = guard.as_ref() else {
+        return (None, None);
+    };
+    if !state.local_traffic {
+        return (None, None);
+    }
+    (state.egress_v4_ifindex, state.egress_v6_ifindex)
+}
+
 /// Pin outbound sockets to `iface_name` via `IP_BOUND_IF`/`IPV6_BOUND_IF`
 /// when running without `utun` (for example, a local upstream SOCKS5
 /// instance running alongside `local-traffic: true` split-default routes).
@@ -200,6 +218,8 @@ pub(crate) fn configure_manual_egress(iface_name: &str) -> Result<()> {
         .with_context(|| format!("failed to resolve egress interface '{}'", iface_name))?;
     let state = ActiveState {
         local_traffic: true,
+        utun_name: String::new(),
+        egress: None,
         egress_v4_ifindex: Some(ifindex),
         egress_v6_ifindex: Some(ifindex),
         installed_routes: Vec::new(),
@@ -433,7 +453,7 @@ fn parse_route_get_output(output: &str) -> RouteGetInfo {
     info
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct EgressInfo {
     v4_ifname: String,
     v4_ifindex: u32,
@@ -454,53 +474,120 @@ fn route_get(args: &[&str]) -> Result<Option<RouteGetInfo>> {
     ))))
 }
 
-fn detect_egress(
+fn is_usable_v4_gateway(gw: &str) -> bool {
+    gw.parse::<Ipv4Addr>().is_ok()
+}
+
+fn is_usable_v6_gateway(gw: &str) -> bool {
+    !gw.is_empty() && !gw.starts_with("link#")
+}
+
+fn interface_is_online_v4(ifname: &str) -> bool {
+    use nix::net::if_::InterfaceFlags;
+    use nix::sys::socket::{AddressFamily, SockaddrLike};
+
+    let Ok(addrs) = nix::ifaddrs::getifaddrs() else {
+        return false;
+    };
+    for interface in addrs {
+        if interface.interface_name != ifname {
+            continue;
+        }
+        if !interface
+            .flags
+            .contains(InterfaceFlags::IFF_UP | InterfaceFlags::IFF_RUNNING)
+        {
+            continue;
+        }
+        let Some(address) = interface.address else {
+            continue;
+        };
+        if address.family() == Some(AddressFamily::Inet) {
+            if let Some(addr) = address.as_sockaddr_in() {
+                let ip = addr.ip();
+                if !ip.is_unspecified()
+                    && !ip.is_link_local()
+                    && (!ip.is_loopback() || ifname == "lo0")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn detect_egress_optional(
     override_if: Option<&str>,
     utun_name: &str,
     disable_ipv6: bool,
-) -> Result<EgressInfo> {
-    let v4_query = match override_if {
-        Some(ifname) => route_get(&["-n", "get", "-ifscope", ifname, "default"])?
-            .or(route_get(&["-n", "get", "default"])?),
-        None => route_get(&["-n", "get", "default"])?,
-    };
-
+) -> Result<Option<EgressInfo>> {
     let (v4_ifname, v4_gateway) = match override_if {
         Some(ifname) => {
-            let gw = v4_query.and_then(|q| {
-                if q.interface.as_deref() == Some(ifname) {
-                    q.gateway
-                } else {
-                    None
+            if ifname == utun_name {
+                return Err(anyhow!(
+                    "egress interface '{}' cannot be the rfor utun device itself",
+                    ifname
+                ));
+            }
+            if !interface_is_online_v4(ifname) {
+                return Ok(None);
+            }
+            let scoped = route_get(&["-n", "get", "-ifscope", ifname, "default"])?;
+            let q = match scoped {
+                Some(ref info)
+                    if info.interface.as_deref() == Some(ifname)
+                        && info.gateway.as_deref().is_some_and(is_usable_v4_gateway) =>
+                {
+                    scoped
                 }
-            });
-            (ifname.to_owned(), gw)
+                _ => route_get(&["-n", "get", "default"])?,
+            };
+            let Some(info) = q else {
+                return Ok(None);
+            };
+            if info.interface.as_deref() != Some(ifname) {
+                return Ok(None);
+            }
+            let Some(gw) = info.gateway.filter(|g| is_usable_v4_gateway(g)) else {
+                return Ok(None);
+            };
+            (ifname.to_owned(), Some(gw))
         }
         None => {
-            let q = v4_query.ok_or_else(|| {
-                anyhow!("failed to determine default IPv4 route; set traffic-intercept.egress-interface explicitly")
-            })?;
-            let iface = q.interface.ok_or_else(|| {
-                anyhow!("default IPv4 route has no interface; set traffic-intercept.egress-interface explicitly")
-            })?;
-            (iface, q.gateway)
+            let Some(info) = route_get(&["-n", "get", "default"])? else {
+                return Ok(None);
+            };
+            let Some(iface) = info.interface else {
+                return Ok(None);
+            };
+            if iface == utun_name || !interface_is_online_v4(&iface) {
+                return Ok(None);
+            }
+            let Some(gw) = info.gateway.filter(|g| is_usable_v4_gateway(g)) else {
+                return Ok(None);
+            };
+            (iface, Some(gw))
         }
     };
 
-    if v4_ifname == utun_name {
-        return Err(anyhow!(
-            "egress interface '{}' cannot be the rfor utun device itself",
-            v4_ifname
-        ));
-    }
-
-    let v4_ifindex = nix::net::if_::if_nametoindex(v4_ifname.as_str())
-        .with_context(|| format!("failed to resolve interface index for '{}'", v4_ifname))?;
+    let Ok(v4_ifindex) = nix::net::if_::if_nametoindex(v4_ifname.as_str()) else {
+        return Ok(None);
+    };
 
     let (v6_ifname, v6_ifindex, v6_gateway) = if !disable_ipv6 {
         let v6_query = match override_if {
-            Some(ifname) => route_get(&["-n", "get", "-inet6", "-ifscope", ifname, "default"])?
-                .or(route_get(&["-n", "get", "-inet6", "default"])?),
+            Some(ifname) => {
+                match route_get(&["-n", "get", "-inet6", "-ifscope", ifname, "default"])? {
+                    Some(q)
+                        if q.interface.as_deref() == Some(ifname)
+                            && q.gateway.as_deref().is_some_and(is_usable_v6_gateway) =>
+                    {
+                        Some(q)
+                    }
+                    _ => route_get(&["-n", "get", "-inet6", "default"])?,
+                }
+            }
             None => route_get(&["-n", "get", "-inet6", "default"])?,
         };
         match v6_query {
@@ -510,13 +597,14 @@ fn detect_egress(
                     None => q.interface.clone(),
                 };
                 if let Some(iface) = candidate_if.filter(|name| name != utun_name) {
-                    if let Ok(idx) = nix::net::if_::if_nametoindex(iface.as_str()) {
-                        let gw = if q.interface.as_deref() == Some(iface.as_str()) {
-                            q.gateway
+                    if q.interface.as_deref() == Some(iface.as_str())
+                        && q.gateway.as_deref().is_some_and(is_usable_v6_gateway)
+                    {
+                        if let Ok(idx) = nix::net::if_::if_nametoindex(iface.as_str()) {
+                            (Some(iface), Some(idx), q.gateway)
                         } else {
-                            None
-                        };
-                        (Some(iface), Some(idx), gw)
+                            (None, None, None)
+                        }
                     } else {
                         (None, None, None)
                     }
@@ -530,14 +618,14 @@ fn detect_egress(
         (None, None, None)
     };
 
-    Ok(EgressInfo {
+    Ok(Some(EgressInfo {
         v4_ifname,
         v4_ifindex,
         v4_gateway,
         v6_ifname,
         v6_ifindex,
         v6_gateway,
-    })
+    }))
 }
 
 fn is_already_exists_error(output: &Output) -> bool {
@@ -1140,6 +1228,347 @@ fn setup_forwarded_pf(
     Ok((anchor, token))
 }
 
+fn route_points_to_iface(args: &[&str], expected_iface: &str) -> bool {
+    route_get(args)
+        .ok()
+        .flatten()
+        .and_then(|q| q.interface)
+        .is_some_and(|iface| iface == expected_iface)
+}
+
+fn local_routes_healthy(utun_name: &str, egress: &EgressInfo) -> bool {
+    let v4_scoped_ok = route_get(&["-n", "get", "-ifscope", &egress.v4_ifname, "default"])
+        .ok()
+        .flatten()
+        .is_some_and(|q| {
+            q.interface.as_deref() == Some(egress.v4_ifname.as_str())
+                && q.gateway == egress.v4_gateway
+        });
+    if !v4_scoped_ok
+        || !route_points_to_iface(&["-n", "get", "1.0.0.0"], utun_name)
+        || !route_points_to_iface(&["-n", "get", "128.0.0.1"], utun_name)
+    {
+        return false;
+    }
+
+    if egress.v6_ifindex.is_some() {
+        if let (Some(if6), Some(gw6)) =
+            (egress.v6_ifname.as_deref(), egress.v6_gateway.as_deref())
+        {
+            let v6_scoped_ok = route_get(&["-n", "get", "-inet6", "-ifscope", if6, "default"])
+                .ok()
+                .flatten()
+                .is_some_and(|q| {
+                    q.interface.as_deref() == Some(if6) && q.gateway.as_deref() == Some(gw6)
+                });
+            if !v6_scoped_ok {
+                return false;
+            }
+        }
+        if !route_points_to_iface(&["-n", "get", "-inet6", "2000::1"], utun_name)
+            || !route_points_to_iface(&["-n", "get", "-inet6", "8000::1"], utun_name)
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn reconcile_local_routes(
+    utun_name: &str,
+    override_if: Option<&str>,
+    disable_ipv6: bool,
+    bypass_cidrs: &BypassCidrs,
+) -> (bool, (Option<u32>, Option<u32>), bool) {
+    let _op_guard = ROUTE_OP_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let (active_match, cur_egress, cur_routes, cur_ifindices) = {
+        let guard = ACTIVE_STATE
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(state) = guard.as_ref() else {
+            return (false, (None, None), false);
+        };
+        if !state.local_traffic || state.utun_name != utun_name {
+            return (false, (None, None), false);
+        }
+        (
+            true,
+            state.egress.clone(),
+            state.installed_routes.clone(),
+            (state.egress_v4_ifindex, state.egress_v6_ifindex),
+        )
+    };
+    if !active_match {
+        return (false, (None, None), false);
+    }
+
+    match detect_egress_optional(override_if, utun_name, disable_ipv6) {
+        Ok(None) => {
+            let changed = cur_egress.is_some() || !cur_routes.is_empty();
+            if changed {
+                tracing::warn!(
+                    "physical IPv4 egress lost; withdrawing {} split-default routes until network recovers",
+                    utun_name
+                );
+                delete_routes(&cur_routes);
+                let mut guard = ACTIVE_STATE
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(state) = guard.as_mut() {
+                    if state.utun_name == utun_name {
+                        state.egress = None;
+                        state.egress_v4_ifindex = None;
+                        state.egress_v6_ifindex = None;
+                        state.installed_routes.clear();
+                    }
+                }
+            }
+            (false, (None, None), changed)
+        }
+        Ok(Some(new_egress)) => {
+            if cur_egress.as_ref() == Some(&new_egress)
+                && local_routes_healthy(utun_name, &new_egress)
+            {
+                return (
+                    true,
+                    (Some(new_egress.v4_ifindex), new_egress.v6_ifindex),
+                    false,
+                );
+            }
+
+            if !cur_routes.is_empty() {
+                delete_routes(&cur_routes);
+            }
+            match setup_local_routes(utun_name, &new_egress, bypass_cidrs) {
+                Ok(new_routes) => {
+                    let ifindices = (Some(new_egress.v4_ifindex), new_egress.v6_ifindex);
+                    let log_v4 = new_egress.v4_ifname.clone();
+                    let log_gw4 = new_egress.v4_gateway.clone();
+                    let log_v6 = new_egress.v6_ifname.clone();
+                    let mut guard = ACTIVE_STATE
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(state) = guard.as_mut() {
+                        if state.utun_name == utun_name {
+                            state.egress = Some(new_egress);
+                            state.egress_v4_ifindex = ifindices.0;
+                            state.egress_v6_ifindex = ifindices.1;
+                            state.installed_routes = new_routes;
+                        }
+                    }
+                    tracing::info!(
+                        "macOS utun routes reconciled: utun={}, egress_v4={} (gw={:?}), egress_v6={:?}",
+                        utun_name,
+                        log_v4,
+                        log_gw4,
+                        log_v6
+                    );
+                    (true, ifindices, true)
+                }
+                Err(err) => {
+                    tracing::warn!("failed to reconcile macOS utun routes: {:#}", err);
+                    let mut guard = ACTIVE_STATE
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(state) = guard.as_mut() {
+                        if state.utun_name == utun_name {
+                            state.egress = None;
+                            state.egress_v4_ifindex = None;
+                            state.egress_v6_ifindex = None;
+                            state.installed_routes.clear();
+                        }
+                    }
+                    (false, (None, None), true)
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                "failed to probe macOS egress during route reconcile: {:#}",
+                err
+            );
+            (cur_egress.is_some(), cur_ifindices, false)
+        }
+    }
+}
+
+fn is_relevant_rtm_type(rtm_type: u8) -> bool {
+    matches!(rtm_type, 0x1 | 0x2 | 0x3 | 0xc | 0xd | 0xe | 0x12)
+}
+
+fn open_pf_route_socket() -> Result<tokio::io::unix::AsyncFd<OwnedFd>> {
+    let raw_fd = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, 0) };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to open PF_ROUTE socket");
+    }
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    set_nonblocking_cloexec(owned_fd.as_raw_fd())
+        .context("failed to configure PF_ROUTE socket flags")?;
+    // SAFETY: `owned_fd` remains open and uniquely owned by the returned `AsyncFd`.
+    unsafe { tokio::io::unix::AsyncFd::register(owned_fd) }
+        .context("failed to register PF_ROUTE socket with tokio")
+}
+
+fn drain_pf_route_ready(
+    guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, OwnedFd>,
+    buf: &mut [u8],
+) -> (bool, bool) {
+    let mut relevant = false;
+    for _ in 0..256 {
+        match guard.try_io(|inner| {
+            let ret = unsafe { libc::read(inner.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if ret < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(ret as usize)
+            }
+        }) {
+            Ok(Ok(0)) => {
+                guard.clear_ready();
+                return (relevant, true);
+            }
+            Ok(Ok(n)) => {
+                if n >= 4 && is_relevant_rtm_type(buf[3]) {
+                    relevant = true;
+                }
+            }
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(Err(e)) => {
+                tracing::debug!("PF_ROUTE read failed: {}", e);
+                guard.clear_ready();
+                return (relevant, true);
+            }
+            Err(_would_block) => break,
+        }
+    }
+    (relevant, false)
+}
+
+fn drain_pf_route_after_reconcile(
+    rt_sock: &tokio::io::unix::AsyncFd<OwnedFd>,
+    buf: &mut [u8],
+) {
+    for _ in 0..256 {
+        match rt_sock.try_io(tokio::io::Interest::READABLE, |inner| {
+            let ret = unsafe { libc::read(inner.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if ret < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(ret as usize)
+            }
+        }) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+/// Monitor macOS `PF_ROUTE` events and reconcile `utun` split-default and scoped
+/// egress routes across offline startups, disconnects, sleep/wake transitions, and recoveries.
+pub(crate) async fn route_monitor_loop(
+    utun_name: String,
+    override_if: Option<String>,
+    disable_ipv6: bool,
+    bypass_cidrs: BypassCidrs,
+    egress_tx: tokio::sync::watch::Sender<(Option<u32>, Option<u32>)>,
+) -> Result<()> {
+    let rt_sock = match open_pf_route_socket() {
+        Ok(sock) => Some(sock),
+        Err(err) => {
+            tracing::warn!(
+                "PF_ROUTE monitor unavailable ({:#}); falling back to 5s offline/route polling",
+                err
+            );
+            None
+        }
+    };
+
+    let mut buf = [0u8; 4096];
+    let mut is_online = current_egress_ifindices().0.is_some();
+
+    loop {
+        if let Some(ref sock) = rt_sock {
+            tokio::select! {
+                res = sock.readable() => {
+                    let mut guard = match res {
+                        Ok(g) => g,
+                        Err(err) => {
+                            tracing::warn!("PF_ROUTE wait readable failed: {:#}", err);
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
+                    };
+                    let (relevant, hit_err) = drain_pf_route_ready(&mut guard, &mut buf);
+                    drop(guard);
+                    if hit_err {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    if !relevant {
+                        continue;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(5)), if !is_online => {}
+            }
+
+            let debounce_deadline =
+                tokio::time::Instant::now() + Duration::from_millis(350);
+            loop {
+                if tokio::time::Instant::now() >= debounce_deadline {
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep_until(debounce_deadline) => break,
+                    res = sock.readable() => {
+                        match res {
+                            Ok(mut guard) => {
+                                let (_rel, hit_err) = drain_pf_route_ready(&mut guard, &mut buf);
+                                drop(guard);
+                                if hit_err {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        } else {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+
+        let mon_utun = utun_name.clone();
+        let mon_if = override_if.clone();
+        let mon_bypass = bypass_cidrs.clone();
+        let (online, ifindices, routes_changed) = tokio::task::spawn_blocking(move || {
+            reconcile_local_routes(&mon_utun, mon_if.as_deref(), disable_ipv6, &mon_bypass)
+        })
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!("route reconcile task failed: {}", err);
+            (is_online, current_egress_ifindices(), false)
+        });
+
+        if let Some(ref sock) = rt_sock {
+            drain_pf_route_after_reconcile(sock, &mut buf);
+        }
+        is_online = online;
+        egress_tx.send_if_modified(|cur| {
+            if routes_changed || *cur != ifindices {
+                *cur = ifindices;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
 /// Create and configure `utun` along with either split-default local routes
 /// (`local_traffic: true`) or PF `route-to` anchor rules (`local_traffic: false`).
 pub async fn setup(
@@ -1162,20 +1591,47 @@ pub async fn setup(
     configure_utun_interface(&utun_name, disable_ipv6)?;
 
     if local_traffic {
-        let egress = detect_egress(egress_interface, &utun_name, disable_ipv6)?;
-        let installed_routes = setup_local_routes(&utun_name, &egress, bypass_cidrs)?;
-        let state = ActiveState {
-            local_traffic: true,
-            egress_v4_ifindex: Some(egress.v4_ifindex),
-            egress_v6_ifindex: egress.v6_ifindex,
-            installed_routes,
-            pf_anchor: None,
-            pf_token: None,
+        let _op_guard = ROUTE_OP_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = match detect_egress_optional(egress_interface, &utun_name, disable_ipv6)? {
+            Some(egress) => {
+                let installed_routes = setup_local_routes(&utun_name, &egress, bypass_cidrs)?;
+                ActiveState {
+                    local_traffic: true,
+                    utun_name: utun_name.clone(),
+                    egress_v4_ifindex: Some(egress.v4_ifindex),
+                    egress_v6_ifindex: egress.v6_ifindex,
+                    egress: Some(egress),
+                    installed_routes,
+                    pf_anchor: None,
+                    pf_token: None,
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "no active physical IPv4 egress route at startup; keeping {} split-default routes inactive until network becomes available",
+                    utun_name
+                );
+                ActiveState {
+                    local_traffic: true,
+                    utun_name: utun_name.clone(),
+                    egress: None,
+                    egress_v4_ifindex: None,
+                    egress_v6_ifindex: None,
+                    installed_routes: Vec::new(),
+                    pf_anchor: None,
+                    pf_token: None,
+                }
+            }
         };
         *ACTIVE_STATE
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(state);
     } else {
+        let _op_guard = ROUTE_OP_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (anchor, token) = setup_forwarded_pf(
             &utun_name,
             ports,
@@ -1186,6 +1642,8 @@ pub async fn setup(
         )?;
         let state = ActiveState {
             local_traffic: false,
+            utun_name: utun_name.clone(),
+            egress: None,
             egress_v4_ifindex: None,
             egress_v6_ifindex: None,
             installed_routes: Vec::new(),
@@ -1202,6 +1660,9 @@ pub async fn setup(
 
 /// Remove installed routes and PF anchor/reference token idempotently.
 pub async fn cleanup() -> Result<()> {
+    let _op_guard = ROUTE_OP_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let state = ACTIVE_STATE
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1514,5 +1975,34 @@ destination: default
             &with_gw_bypass,
             &[]
         ));
+    }
+
+    #[test]
+    fn relevant_rtm_types_filter_routing_and_interface_events() {
+        for rtm in [0x1u8, 0x2, 0x3, 0xc, 0xd, 0xe, 0x12] {
+            assert!(is_relevant_rtm_type(rtm), "expected rtm type {:#x} relevant", rtm);
+        }
+        for noise in [0x0u8, 0x4, 0x5, 0x7, 0xb, 0xf, 0x10, 0x14, 0xff] {
+            assert!(
+                !is_relevant_rtm_type(noise),
+                "expected rtm type {:#x} ignored",
+                noise
+            );
+        }
+    }
+
+    #[test]
+    fn usable_gateway_filters_link_layer_and_invalid_strings() {
+        assert!(is_usable_v4_gateway("192.168.1.1"));
+        assert!(is_usable_v4_gateway("10.0.0.1"));
+        assert!(!is_usable_v4_gateway(""));
+        assert!(!is_usable_v4_gateway("link#4"));
+        assert!(!is_usable_v4_gateway("en0"));
+        assert!(!is_usable_v4_gateway("fe80::1%en0"));
+
+        assert!(is_usable_v6_gateway("fe80::1%en0"));
+        assert!(is_usable_v6_gateway("2001:db8::1"));
+        assert!(!is_usable_v6_gateway(""));
+        assert!(!is_usable_v6_gateway("link#14"));
     }
 }

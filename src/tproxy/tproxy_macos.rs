@@ -1,8 +1,6 @@
-//! macOS transparent interception data plane backed by `utun` + `netstack-smoltcp`.
+//! macOS transparent interception data plane backed by `utun` + `smoltcp`.
 
 use anyhow::{anyhow, Context, Result};
-use futures::{SinkExt, StreamExt};
-use netstack_smoltcp::{StackBuilder, TcpListener, TcpStream as StackTcpStream, UdpSocket as StackUdpSocket};
 use socket2::SockRef;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -21,6 +19,7 @@ use crate::stats::UDP_STATS;
 use crate::utils::transfer_stream_with_initial_data;
 
 use super::common;
+use super::netstack_macos::{self, NetStackConfig, StackTcpStream, TcpListener, UdpPacketMsg};
 use super::utun_macos;
 
 const UDP_REPLY_CHANNEL_SIZE: usize = 1024;
@@ -138,52 +137,76 @@ pub async fn tproxy_worker() -> Result<()> {
                 .map_err(|e| anyhow!("failed to register utun descriptor with tokio: {}", e))?,
         );
 
-        let (stack, runner, udp_socket, tcp_listener) = StackBuilder::default()
-            .stack_buffer_size(4096)
-            .tcp_buffer_size(4096)
-            .udp_buffer_size(4096)
-            .enable_tcp(true)
-            .enable_udp(true)
-            .enable_icmp(false)
-            .mtu(utun_macos::UTUN_MTU as usize)
-            .build()
-            .context("failed to build netstack-smoltcp stack")?;
-
-        let (mut stack_sink, mut stack_stream) = stack.split();
-        let tcp_listener = tcp_listener.ok_or_else(|| anyhow!("netstack TCP listener missing"))?;
-        let udp_socket = udp_socket.ok_or_else(|| anyhow!("netstack UDP socket missing"))?;
-
-        let mut tasks = tokio::task::JoinSet::new();
-
-        if let Some(runner) = runner {
-            tasks.spawn(async move {
-                runner
-                    .await
-                    .map_err(|e| anyhow!("netstack runner failed: {}", e))
-            });
-        }
-
+        const UDP_CHANNEL_SIZE: usize = 4096;
         const ICMP_CHANNEL_SIZE: usize = 256;
+        let stack_config = NetStackConfig {
+            mtu: utun_macos::UTUN_MTU as usize,
+            ..Default::default()
+        };
+        let (tcp_out_tx, tcp_out_rx) =
+            mpsc::channel::<Vec<u8>>(stack_config.tcp_out_channel_size());
+        let (udp_in_tx, udp_in_rx) = mpsc::channel::<UdpPacketMsg>(UDP_CHANNEL_SIZE);
+        let (udp_out_tx, udp_out_rx) = mpsc::channel::<Vec<u8>>(UDP_CHANNEL_SIZE);
         let (icmp_req_tx, icmp_req_rx) = mpsc::channel::<Vec<u8>>(ICMP_CHANNEL_SIZE);
         let (icmp_reply_tx, icmp_reply_rx) = mpsc::channel::<Vec<u8>>(ICMP_CHANNEL_SIZE);
 
-        tasks.spawn(async move { super::icmp_macos::icmp_worker(icmp_req_rx, icmp_reply_tx).await });
+        let (tcp_stacks, tcp_router, tcp_listener) =
+            netstack_macos::create_sharded_tcp_stack(stack_config.clone(), tcp_out_tx)?;
+
+        info!(
+            "utun TCP stack initialized: shards={}, shard_in_cap={}, shard_egress_cap={}, tcp_out_cap={}, max_sockets={}",
+            tcp_router.shard_count(),
+            stack_config.shard_in_channel_size(),
+            stack_config.shard_max_pending_egress(),
+            stack_config.tcp_out_channel_size(),
+            stack_config.max_tcp_sockets,
+        );
+
+        let (egress_tx, egress_rx) =
+            tokio::sync::watch::channel(utun_macos::current_egress_ifindices());
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for tcp_stack in tcp_stacks {
+            tasks.spawn(async move { tcp_stack.run().await });
+        }
+        tasks.spawn(async move {
+            super::icmp_macos::icmp_worker(icmp_req_rx, icmp_reply_tx, local_traffic, egress_rx)
+                .await
+        });
+        if local_traffic {
+            let mon_utun = utun_ifname.clone();
+            let mon_egress = egress_interface.clone();
+            let mon_bypass = bypass_cidrs.clone();
+            tasks.spawn(async move {
+                utun_macos::route_monitor_loop(
+                    mon_utun,
+                    mon_egress,
+                    disable_ipv6,
+                    mon_bypass,
+                    egress_tx,
+                )
+                .await
+            });
+        }
 
         let utun_reader = Arc::clone(&utun_async);
         tasks.spawn(async move {
-            utun_read_loop(utun_reader, &mut stack_sink, icmp_req_tx).await
+            utun_read_loop(utun_reader, tcp_router, udp_in_tx, icmp_req_tx).await
         });
 
         let utun_writer = Arc::clone(&utun_async);
         tasks.spawn(async move {
-            utun_write_loop(utun_writer, &mut stack_stream, icmp_reply_rx).await
+            utun_write_loop(utun_writer, tcp_out_rx, udp_out_rx, icmp_reply_rx).await
         });
 
         let tcp_ports = Arc::clone(&port_filter);
-        tasks.spawn(async move { tcp_accept_loop(tcp_listener, tcp_ports).await });
+        let max_concurrent_tcp = stack_config.max_tcp_sockets;
+        tasks.spawn(async move {
+            tcp_accept_loop(tcp_listener, tcp_ports, max_concurrent_tcp).await
+        });
 
         let udp_ports = Arc::clone(&port_filter);
-        tasks.spawn(async move { udp_loop(udp_socket, udp_ports, udp_enable).await });
+        tasks.spawn(async move { udp_loop(udp_in_rx, udp_out_tx, udp_ports, udp_enable).await });
 
         let outcome = tokio::select! {
             res = async {
@@ -217,23 +240,82 @@ pub async fn tproxy_worker() -> Result<()> {
     result
 }
 
-async fn utun_read_loop<S>(
+struct RateLimitedLog {
+    interval: Duration,
+    last_log: Option<Instant>,
+    suppressed: u64,
+}
+
+impl RateLimitedLog {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last_log: None,
+            suppressed: 0,
+        }
+    }
+
+    fn warn(&mut self, msg: &str) {
+        let now = Instant::now();
+        let should_log = match self.last_log {
+            None => true,
+            Some(prev) => now.saturating_duration_since(prev) >= self.interval,
+        };
+        if should_log {
+            if self.suppressed > 0 {
+                warn!("{} ({} suppressed)", msg, self.suppressed);
+                self.suppressed = 0;
+            } else {
+                warn!("{}", msg);
+            }
+            self.last_log = Some(now);
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+        }
+    }
+}
+
+struct EnobufsBackoff {
+    backoff: Duration,
+    log: RateLimitedLog,
+}
+
+impl EnobufsBackoff {
+    fn new() -> Self {
+        Self {
+            backoff: Duration::from_millis(2),
+            log: RateLimitedLog::new(Duration::from_secs(5)),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.backoff = Duration::from_millis(2);
+    }
+
+    async fn on_event(&mut self, label: &str) {
+        self.log.warn(label);
+        tokio::time::sleep(self.backoff).await;
+        self.backoff = (self.backoff * 2).min(Duration::from_millis(50));
+    }
+}
+
+async fn utun_read_loop(
     utun: Arc<AsyncFd<OwnedFd>>,
-    stack_sink: &mut S,
+    tcp_router: netstack_macos::TcpIngressRouter,
+    udp_in_tx: mpsc::Sender<UdpPacketMsg>,
     icmp_req_tx: mpsc::Sender<Vec<u8>>,
-) -> Result<()>
-where
-    S: futures::Sink<Vec<u8>, Error = std::io::Error> + Unpin,
-{
+) -> Result<()> {
     const MAX_BATCH: usize = 64;
     let af_inet = nix::libc::AF_INET as u32;
     let af_inet6 = nix::libc::AF_INET6 as u32;
     let mut buf = vec![0u8; 65536];
+    let mut enobufs = EnobufsBackoff::new();
+    let mut full_log = RateLimitedLog::new(Duration::from_secs(5));
 
     loop {
         let mut guard = utun.readable().await?;
         let mut drained = 0usize;
-        let mut fed = false;
+        let mut hit_enobufs = false;
         while drained < MAX_BATCH {
             match guard.try_io(|inner| {
                 let ret = unsafe {
@@ -249,8 +331,13 @@ where
                     Ok(ret as usize)
                 }
             }) {
+                Ok(Ok(0)) => {
+                    hit_enobufs = true;
+                    break;
+                }
                 Ok(Ok(n)) => {
                     drained += 1;
+                    enobufs.reset();
                     if n <= 4 {
                         continue;
                     }
@@ -263,32 +350,48 @@ where
                         let _ = icmp_req_tx.try_send(pkt.to_vec());
                         continue;
                     }
-                    if let Err(err) = stack_sink.feed(pkt.to_vec()).await {
-                        return Err(anyhow!("failed to inject utun packet into stack: {}", err));
+                    if netstack_macos::is_udp_packet(pkt) {
+                        if let Some(msg) = netstack_macos::parse_udp_packet(pkt) {
+                            let _ = udp_in_tx.try_send(msg);
+                        }
+                        continue;
                     }
-                    fed = true;
+                    if netstack_macos::is_tcp_packet(pkt) {
+                        match tcp_router.try_dispatch(pkt) {
+                            netstack_macos::DispatchOutcome::Sent
+                            | netstack_macos::DispatchOutcome::Ignored => {}
+                            netstack_macos::DispatchOutcome::Full => {
+                                full_log.warn("utun TCP shard queue full, dropping packet");
+                            }
+                            netstack_macos::DispatchOutcome::Closed => {
+                                return Err(anyhow!("TCP stack ingress channel closed"));
+                            }
+                        }
+                    }
                 }
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Ok(Err(e)) if e.raw_os_error() == Some(nix::libc::ENOBUFS) => {
-                    warn!("utun read ENOBUFS, dropping packet");
+                    hit_enobufs = true;
                     break;
                 }
                 Ok(Err(e)) => return Err(anyhow!("utun read error: {}", e)),
                 Err(_would_block) => break,
             }
         }
-        if fed {
-            if let Err(err) = stack_sink.flush().await {
-                return Err(anyhow!("failed to flush utun packets into stack: {}", err));
-            }
-        }
-        if drained == MAX_BATCH {
+        drop(guard);
+        if hit_enobufs {
+            enobufs.on_event("utun read ENOBUFS, backing off").await;
+        } else if drained == MAX_BATCH {
             tokio::task::yield_now().await;
         }
     }
 }
 
-async fn write_utun_packet(utun: &AsyncFd<OwnedFd>, af_hdr: &[u8; 4], pkt: &[u8]) -> Result<()> {
+async fn write_utun_packet(
+    utun: &AsyncFd<OwnedFd>,
+    af_hdr: &[u8; 4],
+    pkt: &[u8],
+) -> Result<bool> {
     loop {
         let mut guard = utun.writable().await?;
         match guard.try_io(|inner| {
@@ -309,12 +412,9 @@ async fn write_utun_packet(utun: &AsyncFd<OwnedFd>, af_hdr: &[u8; 4], pkt: &[u8]
                 Ok(ret as usize)
             }
         }) {
-            Ok(Ok(_)) => return Ok(()),
+            Ok(Ok(_)) => return Ok(true),
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Ok(Err(e)) if e.raw_os_error() == Some(nix::libc::ENOBUFS) => {
-                tokio::task::yield_now().await;
-                return Ok(());
-            }
+            Ok(Err(e)) if e.raw_os_error() == Some(nix::libc::ENOBUFS) => return Ok(false),
             Ok(Err(e)) => return Err(anyhow!("utun writev error: {}", e)),
             Err(_would_block) => continue,
         }
@@ -326,59 +426,85 @@ async fn write_ip_packet(
     af_inet: &[u8; 4],
     af_inet6: &[u8; 4],
     pkt: &[u8],
-) -> Result<()> {
+) -> Result<bool> {
     let Some(&first) = pkt.first() else {
-        return Ok(());
+        return Ok(true);
     };
     let af_hdr = match first >> 4 {
         4 => af_inet,
         6 => af_inet6,
-        _ => return Ok(()),
+        _ => return Ok(true),
     };
     write_utun_packet(utun, af_hdr, pkt).await
 }
 
-async fn utun_write_loop<S>(
+async fn utun_write_loop(
     utun: Arc<AsyncFd<OwnedFd>>,
-    stack_stream: &mut S,
+    mut tcp_out_rx: mpsc::Receiver<Vec<u8>>,
+    mut udp_out_rx: mpsc::Receiver<Vec<u8>>,
     mut icmp_reply_rx: mpsc::Receiver<Vec<u8>>,
-) -> Result<()>
-where
-    S: futures::Stream<Item = std::io::Result<Vec<u8>>> + Unpin,
-{
+) -> Result<()> {
     let af_inet = (nix::libc::AF_INET as u32).to_be_bytes();
     let af_inet6 = (nix::libc::AF_INET6 as u32).to_be_bytes();
     let mut icmp_open = true;
+    let mut enobufs = EnobufsBackoff::new();
 
     loop {
-        tokio::select! {
-            item = stack_stream.next() => {
-                let Some(item) = item else { break };
-                let pkt = item.map_err(|err| anyhow!("stack egress stream failed: {}", err))?;
-                write_ip_packet(&utun, &af_inet, &af_inet6, &pkt).await?;
+        let wrote = tokio::select! {
+            maybe_tcp = tcp_out_rx.recv() => {
+                let Some(pkt) = maybe_tcp else { break };
+                write_ip_packet(&utun, &af_inet, &af_inet6, &pkt).await?
+            }
+            maybe_udp = udp_out_rx.recv() => {
+                let Some(pkt) = maybe_udp else { break };
+                write_ip_packet(&utun, &af_inet, &af_inet6, &pkt).await?
             }
             maybe_icmp = icmp_reply_rx.recv(), if icmp_open => {
                 match maybe_icmp {
                     Some(pkt) => write_ip_packet(&utun, &af_inet, &af_inet6, &pkt).await?,
-                    None => icmp_open = false,
+                    None => {
+                        icmp_open = false;
+                        true
+                    }
                 }
             }
+        };
+        if wrote {
+            enobufs.reset();
+        } else {
+            enobufs.on_event("utun write ENOBUFS, backing off").await;
         }
     }
 
     Ok(())
 }
 
-async fn tcp_accept_loop(mut listener: TcpListener, port_filter: Arc<PortFilter>) -> Result<()> {
-    while let Some((mut stream, client_addr, orig_dst)) = listener.next().await {
+async fn tcp_accept_loop(
+    mut listener: TcpListener,
+    port_filter: Arc<PortFilter>,
+    max_concurrent: usize,
+) -> Result<()> {
+    let limiter = Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1)));
+    let mut overload_log = RateLimitedLog::new(Duration::from_secs(5));
+    while let Some((mut stream, client_addr, orig_dst)) = listener.accept().await {
+        let Ok(permit) = Arc::clone(&limiter).try_acquire_owned() else {
+            stream.abort();
+            overload_log.warn(&format!(
+                "TCP concurrency limit ({}) reached, resetting {} -> {}",
+                max_concurrent, client_addr, orig_dst
+            ));
+            continue;
+        };
         let port_filter = Arc::clone(&port_filter);
         tokio::spawn(async move {
+            let _permit = permit;
             let res = if port_filter.matches(orig_dst.port()) {
                 handle_tcp(&mut stream, client_addr, orig_dst).await
             } else {
                 bypass_tcp(&mut stream, orig_dst).await
             };
             if let Err(err) = res {
+                stream.abort();
                 error!(
                     "TCP connection failed: {} -> {}, error: {:#}",
                     client_addr, orig_dst, err
@@ -419,17 +545,19 @@ async fn handle_tcp(
 }
 
 async fn udp_loop(
-    udp_socket: StackUdpSocket,
+    mut udp_in_rx: mpsc::Receiver<UdpPacketMsg>,
+    udp_out_tx: mpsc::Sender<Vec<u8>>,
     port_filter: Arc<PortFilter>,
     udp_enable: bool,
 ) -> Result<()> {
-    let (mut udp_rx, mut udp_tx) = udp_socket.split();
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReplyMsg>(UDP_REPLY_CHANNEL_SIZE);
 
     let writer_task = tokio::spawn(async move {
-        while let Some(msg) = reply_rx.recv().await {
-            if let Err(err) = udp_tx.send(msg).await {
-                return Err(anyhow!("utun UDP writer failed: {}", err));
+        while let Some((payload, src, dst)) = reply_rx.recv().await {
+            if let Some(pkt) = netstack_macos::build_udp_packet(&payload, src, dst) {
+                if udp_out_tx.send(pkt).await.is_err() {
+                    return Err(anyhow!("utun UDP writer failed: egress channel closed"));
+                }
             }
         }
         Ok(())
@@ -438,7 +566,7 @@ async fn udp_loop(
     let max_sessions = get_settings().read().await.udp_max_sessions;
 
     let read_result: Result<()> = async {
-        while let Some((payload, source_sockaddr, target_sockaddr)) = udp_rx.next().await {
+        while let Some((payload, source_sockaddr, target_sockaddr)) = udp_in_rx.recv().await {
             let source_sockaddr = common::unmap_ipv4_mapped(source_sockaddr);
             let target_sockaddr = common::unmap_ipv4_mapped(target_sockaddr);
             let intercept = udp_enable && port_filter.matches(target_sockaddr.port());
@@ -765,20 +893,14 @@ mod tests {
 
     #[tokio::test]
     async fn netstack_tcp_and_udp_preserve_client_and_destination_endpoints() {
-        let (stack, runner, udp_socket, tcp_listener) = StackBuilder::default()
-            .enable_tcp(true)
-            .enable_udp(true)
-            .enable_icmp(false)
-            .mtu(1500)
-            .build()
-            .unwrap();
+        let (tcp_in_tx, tcp_in_rx) = mpsc::channel(64);
+        let (tcp_out_tx, mut tcp_out_rx) = mpsc::channel(64);
+        let (tcp_stack, mut tcp_listener) =
+            netstack_macos::create_tcp_stack(NetStackConfig::default(), tcp_in_rx, tcp_out_tx)
+                .unwrap();
+        let stack_handle = tokio::spawn(tcp_stack.run());
 
-        let runner_handle = tokio::spawn(runner.unwrap());
-        let (mut stack_sink, mut stack_stream) = stack.split();
-        let mut tcp_listener = tcp_listener.unwrap();
-        let (mut udp_rx, mut udp_tx) = udp_socket.unwrap().split();
-
-        // Inject a raw UDP/IPv4 packet from client 198.19.254.1:51000 to 8.8.8.8:53
+        // Parse a raw UDP/IPv4 packet from client 198.19.254.1:51000 to 8.8.8.8:53
         let client_udp: SocketAddr = "198.19.254.1:51000".parse().unwrap();
         let target_udp: SocketAddr = "8.8.8.8:53".parse().unwrap();
         let payload = b"dns-probe";
@@ -789,32 +911,20 @@ mod tests {
             53,
             payload,
         );
-        stack_sink.send(udp_pkt).await.unwrap();
-
         let (recv_payload, got_client, got_target) =
-            tokio::time::timeout(Duration::from_secs(2), udp_rx.next())
-                .await
-                .unwrap()
-                .unwrap();
+            netstack_macos::parse_udp_packet(&udp_pkt).unwrap();
         assert_eq!(recv_payload, payload);
         assert_eq!(got_client, client_udp);
         assert_eq!(got_target, target_udp);
 
-        // Reply via WriteHalf using (payload, target, client)
-        udp_tx
-            .send((b"dns-reply".to_vec(), got_target, got_client))
-            .await
-            .unwrap();
-        let raw_reply = tokio::time::timeout(Duration::from_secs(2), stack_stream.next())
-            .await
-            .unwrap()
-            .unwrap()
+        // Encode reply packet using (payload, target, client)
+        let raw_reply = netstack_macos::build_udp_packet(b"dns-reply", got_target, got_client)
             .unwrap();
         assert_eq!(raw_reply[0] >> 4, 4);
         assert_eq!(&raw_reply[12..16], &[8, 8, 8, 8]);
         assert_eq!(&raw_reply[16..20], &[198, 19, 254, 1]);
 
-        // Test TCP via smoltcp Interface -> Stack -> TcpListener
+        // Test TCP via smoltcp Interface -> TcpStack -> TcpListener
         let client_tcp: SocketAddr = "198.19.254.1:52000".parse().unwrap();
         let target_tcp: SocketAddr = "1.1.1.1:80".parse().unwrap();
         let syn_pkt = build_ipv4_tcp_syn(
@@ -824,10 +934,10 @@ mod tests {
             80,
             1000,
         );
-        stack_sink.send(syn_pkt).await.unwrap();
+        tcp_in_tx.send(syn_pkt).await.unwrap();
 
         let (mut accepted_stream, accepted_client, accepted_dst) =
-            tokio::time::timeout(Duration::from_secs(2), tcp_listener.next())
+            tokio::time::timeout(Duration::from_secs(2), tcp_listener.accept())
                 .await
                 .unwrap()
                 .unwrap();
@@ -835,9 +945,8 @@ mod tests {
         assert_eq!(accepted_dst, target_tcp);
 
         // Stack emits SYN-ACK back toward client
-        let syn_ack = tokio::time::timeout(Duration::from_secs(2), stack_stream.next())
+        let syn_ack = tokio::time::timeout(Duration::from_secs(2), tcp_out_rx.recv())
             .await
-            .unwrap()
             .unwrap()
             .unwrap();
         assert_eq!(syn_ack[0] >> 4, 4);
@@ -855,7 +964,7 @@ mod tests {
             server_seq + 1,
             b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
         );
-        stack_sink.send(ack_data).await.unwrap();
+        tcp_in_tx.send(ack_data).await.unwrap();
 
         let mut buf = [0u8; 64];
         let n = tokio::time::timeout(Duration::from_secs(2), accepted_stream.read(&mut buf))
@@ -868,9 +977,8 @@ mod tests {
 
         accepted_stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
         let data_pkt = loop {
-            let pkt = tokio::time::timeout(Duration::from_secs(2), stack_stream.next())
+            let pkt = tokio::time::timeout(Duration::from_secs(2), tcp_out_rx.recv())
                 .await
-                .unwrap()
                 .unwrap()
                 .unwrap();
             let ihl = ((pkt[0] & 0x0f) * 4) as usize;
@@ -882,7 +990,7 @@ mod tests {
         assert_eq!(&data_pkt, b"HTTP/1.1 200 OK\r\n\r\n");
 
         drop(accepted_stream);
-        runner_handle.abort();
+        stack_handle.abort();
     }
 
     fn ipv4_checksum(hdr: &[u8]) -> u16 {
@@ -1115,44 +1223,19 @@ mod tests {
 
     #[tokio::test]
     async fn netstack_ipv6_udp_preserves_client_and_destination_endpoints() {
-        let (stack, runner, udp_socket, _tcp_listener) = StackBuilder::default()
-            .enable_tcp(false)
-            .enable_udp(true)
-            .enable_icmp(false)
-            .mtu(1500)
-            .build()
-            .unwrap();
-
-        let runner_handle = runner.map(tokio::spawn);
-        let (mut stack_sink, mut stack_stream) = stack.split();
-        let (mut udp_rx, mut udp_tx) = udp_socket.unwrap().split();
-
         let src_v6: std::net::Ipv6Addr = "fd72:666f:7200::1".parse().unwrap();
         let dst_v6: std::net::Ipv6Addr = "2001:db8:50::1".parse().unwrap();
         let client_v6 = SocketAddr::new(src_v6.into(), 51000);
         let target_v6 = SocketAddr::new(dst_v6.into(), 9001);
 
         let pkt = build_ipv6_udp_packet(src_v6, 51000, dst_v6, 9001, b"udp6-probe");
-        stack_sink.send(pkt).await.unwrap();
-
-        let (recv_payload, got_client, got_target) =
-            tokio::time::timeout(Duration::from_secs(2), udp_rx.next())
-                .await
-                .unwrap()
-                .unwrap();
+        let (recv_payload, got_client, got_target) = netstack_macos::parse_udp_packet(&pkt).unwrap();
         assert_eq!(recv_payload, b"udp6-probe");
         assert_eq!(got_client, client_v6);
         assert_eq!(got_target, target_v6);
 
-        udp_tx
-            .send((b"udp6-reply".to_vec(), got_target, got_client))
-            .await
-            .unwrap();
-        let raw_reply = tokio::time::timeout(Duration::from_secs(2), stack_stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let raw_reply =
+            netstack_macos::build_udp_packet(b"udp6-reply", got_target, got_client).unwrap();
         assert_eq!(raw_reply[0] >> 4, 6);
         assert_eq!(raw_reply[6], 17);
         assert_eq!(&raw_reply[8..24], &dst_v6.octets());
@@ -1160,9 +1243,5 @@ mod tests {
         assert_eq!(u16::from_be_bytes([raw_reply[40], raw_reply[41]]), 9001);
         assert_eq!(u16::from_be_bytes([raw_reply[42], raw_reply[43]]), 51000);
         assert_eq!(&raw_reply[48..], b"udp6-reply");
-
-        if let Some(handle) = runner_handle {
-            handle.abort();
-        }
     }
 }

@@ -16,6 +16,9 @@ pub(crate) mod pf_openbsd;
 mod icmp_macos;
 
 #[cfg(target_os = "macos")]
+mod netstack_macos;
+
+#[cfg(target_os = "macos")]
 pub(crate) mod utun_macos;
 
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]

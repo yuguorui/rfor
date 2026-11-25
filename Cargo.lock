@@ -515,15 +515,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "etherparse"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8d8a704b617484e9d867a0423cd45f7577f008c4068e2e33378f8d3860a6d73"
-dependencies = [
- "arrayvec",
-]
-
-[[package]]
 name = "fast-socks5"
 version = "1.0.0-rc.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1186,22 +1177,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "netstack-smoltcp"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5abcddf2ae2d1642c492c1043041548200a176a3b5c3db6e5169ab1ed8d62b8"
-dependencies = [
- "etherparse",
- "futures",
- "rand",
- "smoltcp",
- "spin 0.9.9",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "nix"
 version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1495,7 +1470,7 @@ dependencies = [
  "nix 0.26.4",
  "once_cell",
  "smallvec",
- "spin 0.10.0",
+ "spin",
  "symbolic-demangle",
  "tempfile",
  "thiserror 2.0.17",
@@ -1749,7 +1724,6 @@ dependencies = [
  "itertools",
  "maxminddb",
  "netlink-packet-route",
- "netstack-smoltcp",
  "nix 0.29.0",
  "nom",
  "once_cell",
@@ -1761,6 +1735,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_yaml",
+ "smoltcp",
  "socket2 0.5.10",
  "thiserror 2.0.17",
  "tls-parser",
@@ -2059,7 +2034,6 @@ dependencies = [
  "cfg-if",
  "defmt",
  "heapless",
- "log",
  "managed",
 ]
 
@@ -2081,15 +2055,6 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "spin"
-version = "0.9.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
-dependencies = [
- "lock_api",
 ]
 
 [[package]]
@@ -2322,19 +2287,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eca58d7bba4a75707817a2c44174253f9236b2d5fbd055602e9d5c07c139a047"
 dependencies = [
  "futures-core",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
-name = "tokio-util"
-version = "0.7.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
-dependencies = [
- "bytes",
- "futures-core",
- "futures-sink",
  "pin-project-lite",
  "tokio",
 ]

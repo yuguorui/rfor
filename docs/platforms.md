@@ -45,7 +45,7 @@ Automated Linux integration suite: [tests/integration/README.md](../tests/integr
 
 ## macOS
 
-On macOS, `traffic-intercept.mode: auto` (aliases `tproxy`, `utun`, `tun`) creates a native `utun` interface backed by userspace `netstack-smoltcp`. `redirect`, `ipfw`, and `pf` modes are rejected at startup; use `auto`/`utun` or `manual`. Requires `root`. Source IP preservation (`bind_range`) is not supported on macOS `utun`.
+On macOS, `traffic-intercept.mode: auto` (aliases `tproxy`, `utun`, `tun`) creates a native `utun` interface backed by userspace `smoltcp`. `redirect`, `ipfw`, and `pf` modes are rejected at startup; use `auto`/`utun` or `manual`. Requires `root`. Source IP preservation (`bind_range`) is not supported on macOS `utun`.
 
 ```yaml
 traffic-intercept:

@@ -547,7 +547,7 @@ fn sendto_icmp(sock: &AsyncFd<OwnedFd>, dst: IpAddr, payload: &[u8]) {
         if err.kind() == std::io::ErrorKind::Interrupted {
             continue;
         }
-        debug!("icmp sendto {} failed: {}", dst, err);
+        warn!("icmp sendto {} failed: {}", dst, err);
         return;
     }
 }
@@ -624,12 +624,18 @@ fn decode_and_forward_reply(
         }
         let proxy_id = u16::from_be_bytes([icmp[4], icmp[5]]);
         let seq = u16::from_be_bytes([icmp[6], icmp[7]]);
-        if let (IpAddr::V4(from_v4), Some((IpAddr::V4(orig_src), orig_id))) =
-            (from_ip, nat.lookup_reply(from_ip, proxy_id, now))
-        {
-            let reply =
-                build_inbound_ipv4_echo_reply(from_v4, orig_src, ttl, orig_id, seq, &icmp[8..]);
-            let _ = reply_tx.try_send(reply);
+        match (from_ip, nat.lookup_reply(from_ip, proxy_id, now)) {
+            (IpAddr::V4(from_v4), Some((IpAddr::V4(orig_src), orig_id))) => {
+                let reply =
+                    build_inbound_ipv4_echo_reply(from_v4, orig_src, ttl, orig_id, seq, &icmp[8..]);
+                let _ = reply_tx.try_send(reply);
+            }
+            _ => {
+                debug!(
+                    "icmp v4 reply did not match active flow: from={}, proxy_id={}, seq={}",
+                    from_ip, proxy_id, seq
+                );
+            }
         }
     } else {
         // macOS SOCK_DGRAM IPPROTO_ICMPV6 strips the IPv6 header and echoes back Type 128 requests.
@@ -638,12 +644,18 @@ fn decode_and_forward_reply(
         }
         let proxy_id = u16::from_be_bytes([pkt[4], pkt[5]]);
         let seq = u16::from_be_bytes([pkt[6], pkt[7]]);
-        if let (IpAddr::V6(from_v6), Some((IpAddr::V6(orig_src), orig_id))) =
-            (from_ip, nat.lookup_reply(from_ip, proxy_id, now))
-        {
-            let reply =
-                build_inbound_ipv6_echo_reply(from_v6, orig_src, orig_id, seq, &pkt[8..]);
-            let _ = reply_tx.try_send(reply);
+        match (from_ip, nat.lookup_reply(from_ip, proxy_id, now)) {
+            (IpAddr::V6(from_v6), Some((IpAddr::V6(orig_src), orig_id))) => {
+                let reply =
+                    build_inbound_ipv6_echo_reply(from_v6, orig_src, orig_id, seq, &pkt[8..]);
+                let _ = reply_tx.try_send(reply);
+            }
+            _ => {
+                debug!(
+                    "icmp v6 reply did not match active flow: from={}, proxy_id={}, seq={}",
+                    from_ip, proxy_id, seq
+                );
+            }
         }
     }
 }
@@ -654,43 +666,83 @@ fn drain_icmp_replies(
     nat: &mut IcmpNatTable,
     reply_tx: &mpsc::Sender<Vec<u8>>,
     buf: &mut [u8],
-) {
+) -> bool {
     for _ in 0..ICMP_BATCH {
         match guard.try_io(|inner| recvfrom_icmp(inner.as_raw_fd(), buf)) {
+            Ok(Ok((0, _))) => {
+                guard.clear_ready();
+                return true;
+            }
             Ok(Ok((n, from_ip))) => {
                 decode_and_forward_reply(&buf[..n], from_ip, is_ipv4, nat, reply_tx);
             }
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Ok(Err(e)) => {
                 debug!("icmp recvfrom failed: {}", e);
-                break;
+                guard.clear_ready();
+                return true;
             }
             Err(_would_block) => break,
         }
     }
+    false
+}
+
+async fn open_outbound_sockets(
+    local_traffic: bool,
+    v4_if: Option<u32>,
+    v6_if: Option<u32>,
+) -> (Option<AsyncFd<OwnedFd>>, Option<AsyncFd<OwnedFd>>) {
+    let v4_sock = if local_traffic && v4_if.is_none() {
+        None
+    } else {
+        match open_icmp_socket(true).await {
+            Ok(sock) => Some(sock),
+            Err(err) => {
+                warn!("failed to open outbound IPv4 ICMP socket: {:#}", err);
+                None
+            }
+        }
+    };
+    let v6_sock = if local_traffic && v6_if.is_none() {
+        None
+    } else {
+        match open_icmp_socket(false).await {
+            Ok(sock) => Some(sock),
+            Err(err) => {
+                warn!("failed to open outbound IPv6 ICMP socket: {:#}", err);
+                None
+            }
+        }
+    };
+    debug!(
+        "icmp outbound sockets updated: local_traffic={}, v4_if={:?} (open={}), v6_if={:?} (open={})",
+        local_traffic,
+        v4_if,
+        v4_sock.is_some(),
+        v6_if,
+        v6_sock.is_some(),
+    );
+    (v4_sock, v6_sock)
 }
 
 pub(crate) async fn icmp_worker(
     mut req_rx: mpsc::Receiver<Vec<u8>>,
     reply_tx: mpsc::Sender<Vec<u8>>,
+    local_traffic: bool,
+    mut egress_rx: tokio::sync::watch::Receiver<(Option<u32>, Option<u32>)>,
 ) -> Result<()> {
-    let v4_sock = match open_icmp_socket(true).await {
-        Ok(sock) => Some(sock),
-        Err(err) => {
-            warn!("failed to open outbound IPv4 ICMP socket: {:#}", err);
-            None
-        }
-    };
-    let v6_sock = match open_icmp_socket(false).await {
-        Ok(sock) => Some(sock),
-        Err(err) => {
-            warn!("failed to open outbound IPv6 ICMP socket: {:#}", err);
-            None
-        }
-    };
+    const MIN_ERR_BACKOFF: Duration = Duration::from_millis(5);
+    const MAX_ERR_BACKOFF: Duration = Duration::from_millis(50);
+
+    let (v4_if, v6_if) = *egress_rx.borrow_and_update();
+    let (mut v4_sock, mut v6_sock) = open_outbound_sockets(local_traffic, v4_if, v6_if).await;
 
     let mut nat = IcmpNatTable::new();
     let mut recv_buf = vec![0u8; 65536];
+    let mut v4_err_backoff = MIN_ERR_BACKOFF;
+    let mut v6_err_backoff = MIN_ERR_BACKOFF;
+    let mut egress_watch_open = true;
 
     loop {
         tokio::select! {
@@ -717,12 +769,22 @@ pub(crate) async fn icmp_worker(
                                 if let Some(ref sock) = v4_sock {
                                     let out = build_outbound_icmpv4_echo(proxy_id, req.seq, &req.payload);
                                     sendto_icmp(sock, req.dst, &out);
+                                } else {
+                                    warn!(
+                                        "icmp relay dropped for {} -> {}: outbound IPv4 ICMP socket unavailable",
+                                        req.src, req.dst
+                                    );
                                 }
                             }
                             IpAddr::V6(_) => {
                                 if let Some(ref sock) = v6_sock {
                                     let out = build_outbound_icmpv6_echo(proxy_id, req.seq, &req.payload);
                                     sendto_icmp(sock, req.dst, &out);
+                                } else {
+                                    warn!(
+                                        "icmp relay dropped for {} -> {}: outbound IPv6 ICMP socket unavailable",
+                                        req.src, req.dst
+                                    );
                                 }
                             }
                         }
@@ -747,10 +809,30 @@ pub(crate) async fn icmp_worker(
                 }
             }
             res = wait_readable(v4_sock.as_ref()) => {
-                drain_icmp_replies(res?, true, &mut nat, &reply_tx, &mut recv_buf);
+                if drain_icmp_replies(res?, true, &mut nat, &reply_tx, &mut recv_buf) {
+                    tokio::time::sleep(v4_err_backoff).await;
+                    v4_err_backoff = (v4_err_backoff * 2).min(MAX_ERR_BACKOFF);
+                } else {
+                    v4_err_backoff = MIN_ERR_BACKOFF;
+                }
             }
             res = wait_readable(v6_sock.as_ref()) => {
-                drain_icmp_replies(res?, false, &mut nat, &reply_tx, &mut recv_buf);
+                if drain_icmp_replies(res?, false, &mut nat, &reply_tx, &mut recv_buf) {
+                    tokio::time::sleep(v6_err_backoff).await;
+                    v6_err_backoff = (v6_err_backoff * 2).min(MAX_ERR_BACKOFF);
+                } else {
+                    v6_err_backoff = MIN_ERR_BACKOFF;
+                }
+            }
+            changed = egress_rx.changed(), if egress_watch_open => {
+                if changed.is_ok() {
+                    let (v4_if, v6_if) = *egress_rx.borrow_and_update();
+                    (v4_sock, v6_sock) = open_outbound_sockets(local_traffic, v4_if, v6_if).await;
+                    v4_err_backoff = MIN_ERR_BACKOFF;
+                    v6_err_backoff = MIN_ERR_BACKOFF;
+                } else {
+                    egress_watch_open = false;
+                }
             }
         }
     }

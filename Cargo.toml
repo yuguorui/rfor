@@ -48,7 +48,7 @@ rtnetlink = "0.14"
 netlink-packet-route = "0.19"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-netstack-smoltcp = "0.2.5"
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
 
 [build-dependencies]
 protobuf-codegen = "3"
