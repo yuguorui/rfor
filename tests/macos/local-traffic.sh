@@ -257,6 +257,8 @@ outbounds:
     url: drop://0.0.0.0
 rules:
   - DEFAULT,,DIRECT
+  - IP-CIDR,203.0.113.10/32,PROXY
+  - IP-CIDR,203.0.113.20/32,DROP
   - DOMAIN,one.one.one.one,PROXY
   - DOMAIN,quic-v1.test,PROXY
   - DOMAIN,quic-v2.test,PROXY
@@ -389,6 +391,21 @@ pass "DNS query sniffed and relayed via SOCKS5 UDP ASSOCIATE"
 "$PYTHON_BIN" "$DNS_HELPER" check "$DNS_SERVER" "blocked.test" 3 >/dev/null || fail "dropped DNS query did not return NXDOMAIN"
 grep -q 'blocked.test:53 (8.8.8.8:53) \[dns\] -> Outbound(DROP)' "$LOG" || fail "DNS routing to DROP not observed"
 pass "DROP outbound answered blocked.test with NXDOMAIN"
+
+# 4a. Route-aware ICMP handling (DIRECT forward, PROXY error, DROP error)
+ping -n -c 2 -t 4 1.1.1.1 >/dev/null || fail "DIRECT ICMP ping to 1.1.1.1 failed"
+grep -q 'icmp relay: .* -> 1\.1\.1\.1 -> Outbound(DIRECT)' "$LOG" || fail "DIRECT ICMP log missing"
+pass "DIRECT ICMP Echo forwarded via physical egress interface"
+
+PING_PROXY_OUT=$(ping -n -c 1 -t 2 203.0.113.10 2>&1 || true)
+printf '%s\n' "$PING_PROXY_OUT" | grep -Eqi 'Protocol|198\.19\.254\.2' || fail "PROXY ICMP did not return Protocol Unreachable: $PING_PROXY_OUT"
+grep -q 'icmp: .* -> 203\.0\.113\.10 -> Outbound(PROXY)' "$LOG" || fail "PROXY ICMP log missing"
+pass "PROXY ICMP returned Protocol Unreachable without leaking direct traffic"
+
+PING_DROP_OUT=$(ping -n -c 1 -t 2 203.0.113.20 2>&1 || true)
+printf '%s\n' "$PING_DROP_OUT" | grep -qi 'prohibited' || fail "DROP ICMP did not return Administratively Prohibited: $PING_DROP_OUT"
+grep -q 'icmp: .* -> 203\.0\.113\.20 -> Outbound(DROP)' "$LOG" || fail "DROP ICMP log missing"
+pass "DROP ICMP returned Administratively Prohibited"
 
 # 5. QUIC v1 & v2 SNI sniffing
 if [ -n "$QUIC_SNI_PY" ] && "$PYTHON_BIN" -c "import cryptography" >/dev/null 2>&1; then

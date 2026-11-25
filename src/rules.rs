@@ -220,6 +220,14 @@ impl Display for RouteContext {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IcmpRouteAction {
+    Direct { outbound: String },
+    Proxy { outbound: String },
+    Drop { outbound: String },
+}
+
 impl RouteTable {
     pub fn new() -> Self {
         Self {
@@ -311,6 +319,33 @@ impl RouteTable {
         self.default_outbound.ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "no default route configured")
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn resolve_icmp_action(
+        &self,
+        dst_ip: std::net::IpAddr,
+    ) -> tokio::io::Result<IcmpRouteAction> {
+        let context = RouteContext {
+            src_addr: SocketAddr::new(dst_ip, 0),
+            dst_addr: TargetAddr::Ip(SocketAddr::new(dst_ip, 0)),
+            inbound_proto: Some(InboundProtocol::TPROXY),
+            socket_type: SocketType::DGRAM,
+            sniffed_proto: None,
+        };
+        let outbound_index = self.match_route(&context)?;
+        let outbound = &self.outbounds[outbound_index as usize];
+        match outbound.url.as_ref().map(|u| u.scheme()) {
+            None => Ok(IcmpRouteAction::Direct {
+                outbound: outbound.name.clone(),
+            }),
+            Some("drop") => Ok(IcmpRouteAction::Drop {
+                outbound: outbound.name.clone(),
+            }),
+            Some(_) => Ok(IcmpRouteAction::Proxy {
+                outbound: outbound.name.clone(),
+            }),
+        }
     }
 
     pub async fn get_tcp_sock(&self, context: &RouteContext) -> tokio::io::Result<TcpStream> {
@@ -1009,5 +1044,91 @@ impl ProxyDgram for fast_socks5::client::Socks5Datagram<tokio::net::TcpStream> {
             TargetAddr::Domain(domain, port, _) => self.send_to(buf, (domain.as_str(), port)).await,
         }
         .map_err(to_io_err)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn insert_cidr(cond: &mut Condition, net: ipnet::IpNet) {
+        let v6 = match net {
+            ipnet::IpNet::V4(v4) => {
+                Ipv6Net::new(v4.addr().to_ipv6_mapped(), 96 + v4.prefix_len()).unwrap()
+            }
+            ipnet::IpNet::V6(v6) => v6,
+        };
+        cond.dst_ip_table
+            .insert(v6.addr(), v6.prefix_len() as u32, v6.prefix_len());
+    }
+
+    #[test]
+    fn resolve_icmp_action_handles_direct_proxy_drop_and_default() {
+        let mut rt = RouteTable::new();
+        rt.add_empty_rule("DIRECT", None, None);
+        rt.add_empty_rule("PROXY", Some("socks5://127.0.0.1:1080".parse().unwrap()), None);
+        rt.add_empty_rule("DROP", Some("drop://0.0.0.0".parse().unwrap()), None);
+        rt.set_default_route(0);
+
+        insert_cidr(&mut rt.rules[1], "203.0.113.0/24".parse().unwrap());
+        insert_cidr(&mut rt.rules[0], "203.0.113.1/32".parse().unwrap());
+        insert_cidr(&mut rt.rules[2], "203.0.113.20/32".parse().unwrap());
+        insert_cidr(&mut rt.rules[1], "2001:db8:cafe::/48".parse().unwrap());
+        insert_cidr(&mut rt.rules[2], "2001:db8:dead::/48".parse().unwrap());
+
+        assert_eq!(
+            rt.resolve_icmp_action(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
+                .unwrap(),
+            IcmpRouteAction::Direct {
+                outbound: "DIRECT".to_string()
+            }
+        );
+        // Longest prefix /32 overrides /24
+        assert_eq!(
+            rt.resolve_icmp_action(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)))
+                .unwrap(),
+            IcmpRouteAction::Direct {
+                outbound: "DIRECT".to_string()
+            }
+        );
+        assert_eq!(
+            rt.resolve_icmp_action(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)))
+                .unwrap(),
+            IcmpRouteAction::Proxy {
+                outbound: "PROXY".to_string()
+            }
+        );
+        assert_eq!(
+            rt.resolve_icmp_action(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20)))
+                .unwrap(),
+            IcmpRouteAction::Drop {
+                outbound: "DROP".to_string()
+            }
+        );
+        assert_eq!(
+            rt.resolve_icmp_action(IpAddr::V6("2001:db8:cafe::1".parse::<Ipv6Addr>().unwrap()))
+                .unwrap(),
+            IcmpRouteAction::Proxy {
+                outbound: "PROXY".to_string()
+            }
+        );
+        assert_eq!(
+            rt.resolve_icmp_action(IpAddr::V6("2001:db8:dead::1".parse::<Ipv6Addr>().unwrap()))
+                .unwrap(),
+            IcmpRouteAction::Drop {
+                outbound: "DROP".to_string()
+            }
+        );
+
+        // When DEFAULT is PROXY, unmatched destination resolves to Proxy
+        rt.set_default_route(1);
+        assert_eq!(
+            rt.resolve_icmp_action(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))
+                .unwrap(),
+            IcmpRouteAction::Proxy {
+                outbound: "PROXY".to_string()
+            }
+        );
     }
 }

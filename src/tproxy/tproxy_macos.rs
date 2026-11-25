@@ -163,14 +163,20 @@ pub async fn tproxy_worker() -> Result<()> {
             });
         }
 
+        const ICMP_CHANNEL_SIZE: usize = 256;
+        let (icmp_req_tx, icmp_req_rx) = mpsc::channel::<Vec<u8>>(ICMP_CHANNEL_SIZE);
+        let (icmp_reply_tx, icmp_reply_rx) = mpsc::channel::<Vec<u8>>(ICMP_CHANNEL_SIZE);
+
+        tasks.spawn(async move { super::icmp_macos::icmp_worker(icmp_req_rx, icmp_reply_tx).await });
+
         let utun_reader = Arc::clone(&utun_async);
         tasks.spawn(async move {
-            utun_read_loop(utun_reader, &mut stack_sink).await
+            utun_read_loop(utun_reader, &mut stack_sink, icmp_req_tx).await
         });
 
         let utun_writer = Arc::clone(&utun_async);
         tasks.spawn(async move {
-            utun_write_loop(utun_writer, &mut stack_stream).await
+            utun_write_loop(utun_writer, &mut stack_stream, icmp_reply_rx).await
         });
 
         let tcp_ports = Arc::clone(&port_filter);
@@ -211,7 +217,11 @@ pub async fn tproxy_worker() -> Result<()> {
     result
 }
 
-async fn utun_read_loop<S>(utun: Arc<AsyncFd<OwnedFd>>, stack_sink: &mut S) -> Result<()>
+async fn utun_read_loop<S>(
+    utun: Arc<AsyncFd<OwnedFd>>,
+    stack_sink: &mut S,
+    icmp_req_tx: mpsc::Sender<Vec<u8>>,
+) -> Result<()>
 where
     S: futures::Sink<Vec<u8>, Error = std::io::Error> + Unpin,
 {
@@ -248,7 +258,12 @@ where
                     if af != af_inet && af != af_inet6 {
                         continue;
                     }
-                    if let Err(err) = stack_sink.feed(buf[4..n].to_vec()).await {
+                    let pkt = &buf[4..n];
+                    if super::icmp_macos::is_icmp_packet(pkt) {
+                        let _ = icmp_req_tx.try_send(pkt.to_vec());
+                        continue;
+                    }
+                    if let Err(err) = stack_sink.feed(pkt.to_vec()).await {
                         return Err(anyhow!("failed to inject utun packet into stack: {}", err));
                     }
                     fed = true;
@@ -306,27 +321,49 @@ async fn write_utun_packet(utun: &AsyncFd<OwnedFd>, af_hdr: &[u8; 4], pkt: &[u8]
     }
 }
 
-async fn utun_write_loop<S>(utun: Arc<AsyncFd<OwnedFd>>, stack_stream: &mut S) -> Result<()>
+async fn write_ip_packet(
+    utun: &AsyncFd<OwnedFd>,
+    af_inet: &[u8; 4],
+    af_inet6: &[u8; 4],
+    pkt: &[u8],
+) -> Result<()> {
+    let Some(&first) = pkt.first() else {
+        return Ok(());
+    };
+    let af_hdr = match first >> 4 {
+        4 => af_inet,
+        6 => af_inet6,
+        _ => return Ok(()),
+    };
+    write_utun_packet(utun, af_hdr, pkt).await
+}
+
+async fn utun_write_loop<S>(
+    utun: Arc<AsyncFd<OwnedFd>>,
+    stack_stream: &mut S,
+    mut icmp_reply_rx: mpsc::Receiver<Vec<u8>>,
+) -> Result<()>
 where
     S: futures::Stream<Item = std::io::Result<Vec<u8>>> + Unpin,
 {
     let af_inet = (nix::libc::AF_INET as u32).to_be_bytes();
     let af_inet6 = (nix::libc::AF_INET6 as u32).to_be_bytes();
+    let mut icmp_open = true;
 
-    while let Some(item) = stack_stream.next().await {
-        let pkt = match item {
-            Ok(pkt) => pkt,
-            Err(err) => return Err(anyhow!("stack egress stream failed: {}", err)),
-        };
-        let Some(&first) = pkt.first() else {
-            continue;
-        };
-        let af_hdr = match first >> 4 {
-            4 => af_inet,
-            6 => af_inet6,
-            _ => continue,
-        };
-        write_utun_packet(&utun, &af_hdr, &pkt).await?;
+    loop {
+        tokio::select! {
+            item = stack_stream.next() => {
+                let Some(item) = item else { break };
+                let pkt = item.map_err(|err| anyhow!("stack egress stream failed: {}", err))?;
+                write_ip_packet(&utun, &af_inet, &af_inet6, &pkt).await?;
+            }
+            maybe_icmp = icmp_reply_rx.recv(), if icmp_open => {
+                match maybe_icmp {
+                    Some(pkt) => write_ip_packet(&utun, &af_inet, &af_inet6, &pkt).await?,
+                    None => icmp_open = false,
+                }
+            }
+        }
     }
 
     Ok(())

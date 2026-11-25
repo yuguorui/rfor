@@ -15,7 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use ipnet::{Ipv4Net, Ipv6Net};
 use nix::libc;
 use std::ffi::CStr;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Command, Output, Stdio};
 use std::sync::RwLock;
@@ -27,6 +27,8 @@ const UTUN_V4_LOCAL: &str = "198.19.254.1";
 const UTUN_V4_PEER: &str = "198.19.254.2";
 const UTUN_V6_LOCAL: &str = "fd72:666f:7200::1";
 const UTUN_V6_PEER: &str = "fd72:666f:7200::2";
+pub(crate) const UTUN_V4_PEER_ADDR: Ipv4Addr = Ipv4Addr::new(198, 19, 254, 2);
+pub(crate) const UTUN_V6_PEER_ADDR: Ipv6Addr = Ipv6Addr::new(0xfd72, 0x666f, 0x7200, 0, 0, 0, 0, 2);
 
 const ANCHOR_PARENT: &str = "rfor";
 
@@ -255,7 +257,7 @@ fn parse_utun_unit(name: &str) -> Result<u32> {
         .ok_or_else(|| anyhow!("utun unit number overflow in '{}'", name))
 }
 
-fn set_nonblocking_cloexec(fd: i32) -> std::io::Result<()> {
+pub(crate) fn set_nonblocking_cloexec(fd: i32) -> std::io::Result<()> {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         if flags < 0 {

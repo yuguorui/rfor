@@ -60,6 +60,7 @@ traffic-intercept:
 ```
 
 - `tproxy-listen` is not required when using the `utun` backend.
+- **ICMP / `ping` handling**: `DIRECT` ICMP/ICMPv6 Echo Requests are forwarded over non-blocking `SOCK_DGRAM` ICMP sockets bound to the physical egress interface so real Echo Replies return through `utun`. Requests matching a proxy outbound receive ICMP Protocol Unreachable (IPv4 Type 3 Code 2) or Parameter Problem / Unrecognized Next Header (IPv6 Type 4 Code 1) immediately without leaking direct packets; requests matching `DROP` receive Administratively Prohibited (IPv4 Type 3 Code 13 / IPv6 Type 1 Code 1). Non-Echo ICMP packets, fragments, and multicast/broadcast traffic are dropped silently.
 - **Non-intercepted ports & `bypass-cidrs`**: Traffic on ports outside `traffic-intercept.ports` (or UDP when `udp-enabled: false`) is forwarded directly over the egress interface without evaluating `rules`. Custom `bypass-cidrs` entries skip `/0` (always rejected) and `/1` in `local-traffic: true` mode (to avoid colliding with split-default routes), as well as any subnet already covered by a kernel on-link route.
 - **`local-traffic: true` (host-local + forwarded)**:
   - Creates a `utun` device, detects the default egress interface (`route -n get default`), installs private/interface-scoped bypass routes plus split-default routes (`0.0.0.0/1`, `128.0.0.0/1`, and `::/1`, `8000::/1` when IPv6 egress exists), and binds outbound sockets via `IP_BOUND_IF`/`IPV6_BOUND_IF` (skipping loopback upstreams).
