@@ -440,12 +440,7 @@ impl RouteTable {
                 ))
             }
             "socks" | "socks5" => {
-                let socks_host = proxy_url.host_str().ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing proxy host")
-                })?;
-                let socks_port = proxy_url.port_or_known_default().ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing proxy port")
-                })?;
+                let socks_target = proxy_target_addr(proxy_url)?;
 
                 // TPROXY hands us IPv4-mapped IPv6 addresses
                 // (::ffff:1.2.3.4). Normalize them back to plain IPv4 so
@@ -484,19 +479,13 @@ impl RouteTable {
                         password: proxy_url.password().unwrap_or("").to_string(),
                     })
                 };
-                let socks_host = socks_host.to_owned();
 
                 // Build the TCP socket to the SOCKS5 server ourselves so we
                 // can set SO_MARK before connect(). Otherwise the SYN to the
                 // proxy server can be caught by our own REDIRECT/TPROXY rules
                 // in the OUTPUT chain and loop back into rfor.
                 let connect_and_handshake = async {
-                    let socks_sock_addr = resolve_target_addr(TargetAddr::Domain(
-                        socks_host,
-                        socks_port,
-                        None,
-                    ))
-                    .await?;
+                    let socks_sock_addr = resolve_target_addr(socks_target).await?;
                     let use_ipv4 = if cfg!(any(
                         target_os = "freebsd",
                         target_os = "openbsd",
@@ -693,23 +682,8 @@ impl RouteTable {
 
                 #[cfg(any(target_os = "openbsd", target_os = "macos"))]
                 let (backing_socket, socks_udp_bind, socks_ip) = {
-                    let socks_addr = resolve_target_addr(TargetAddr::Domain(
-                        proxy_url
-                            .host_str()
-                            .ok_or_else(|| std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                "missing proxy host",
-                            ))?
-                            .to_owned(),
-                        proxy_url.port_or_known_default().ok_or_else(|| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                "missing proxy port",
-                            )
-                        })?,
-                        None,
-                    ))
-                    .await?;
+                    let socks_addr =
+                        resolve_target_addr(proxy_target_addr(proxy_url)?).await?;
                     let socks_udp_bind = if socks_addr.is_ipv4() {
                         "0.0.0.0:0".to_owned()
                     } else {
@@ -796,6 +770,53 @@ impl RouteTable {
     }
 }
 
+fn parse_ip_literal(host: &str) -> Option<std::net::IpAddr> {
+    let stripped = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    stripped.parse::<std::net::IpAddr>().ok()
+}
+
+fn proxy_target_addr(proxy_url: &Url) -> tokio::io::Result<TargetAddr> {
+    let port = proxy_url.port_or_known_default().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing proxy port")
+    })?;
+    match proxy_url.host() {
+        Some(url::Host::Ipv4(v4)) => Ok(TargetAddr::Ip(SocketAddr::new(
+            std::net::IpAddr::V4(v4),
+            port,
+        ))),
+        Some(url::Host::Ipv6(v6)) => Ok(TargetAddr::Ip(SocketAddr::new(
+            std::net::IpAddr::V6(v6),
+            port,
+        ))),
+        Some(url::Host::Domain(domain)) => match parse_ip_literal(domain) {
+            Some(ip) => Ok(TargetAddr::Ip(SocketAddr::new(ip, port))),
+            None => Ok(TargetAddr::Domain(domain.to_owned(), port, None)),
+        },
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing proxy host",
+        )),
+    }
+}
+
+async fn resolve_host_port(host: &str, port: u16) -> tokio::io::Result<SocketAddr> {
+    if let Some(ip) = parse_ip_literal(host) {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    tokio::net::lookup_host((host, port))
+        .await?
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("DNS lookup returned no results for {}:{}", host, port),
+            )
+        })
+}
+
 async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr> {
     let address = match target {
         TargetAddr::Ip(addr) => {
@@ -811,15 +832,7 @@ async fn resolve_target_addr(target: TargetAddr) -> tokio::io::Result<SocketAddr
         TargetAddr::Domain(domain, port, osock) => match osock {
             Some(sock) => sock,
             None => {
-                let sock = tokio::net::lookup_host((domain.as_str(), port))
-                    .await?
-                    .next()
-                    .ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("DNS lookup returned no results for {}:{}", domain, port),
-                        )
-                    })?;
+                let sock = resolve_host_port(domain.as_str(), port).await?;
                 if cfg!(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos")) {
                     sock
                 } else {
@@ -984,15 +997,7 @@ impl ProxyDgram for UdpSocket {
             TargetAddr::Domain(domain, port, osock) => match osock {
                 Some(sock) => sock,
                 None => {
-                    let sock = tokio::net::lookup_host((domain.as_str(), port))
-                        .await?
-                        .next()
-                        .ok_or_else(|| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                format!("DNS lookup returned no results for {}:{}", domain, port),
-                            )
-                        })?;
+                    let sock = resolve_host_port(domain.as_str(), port).await?;
                     match get_settings().read().await.disable_ipv6 {
                         false => sock.to_ipv6_sockaddr(),
                         true => sock,
@@ -1129,6 +1134,70 @@ mod tests {
             IcmpRouteAction::Proxy {
                 outbound: "PROXY".to_string()
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn proxy_target_addr_avoids_domain_variant_for_ip_literals() {
+        let v4_url: Url = "socks5://127.0.0.1:1080".parse().unwrap();
+        match proxy_target_addr(&v4_url).unwrap() {
+            TargetAddr::Ip(addr) => {
+                assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1080))
+            }
+            other => panic!("expected TargetAddr::Ip, got {:?}", other),
+        }
+
+        let v6_url: Url = "socks5://[::1]:1080".parse().unwrap();
+        match proxy_target_addr(&v6_url).unwrap() {
+            TargetAddr::Ip(addr) => {
+                assert_eq!(addr, SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 1080))
+            }
+            other => panic!("expected TargetAddr::Ip, got {:?}", other),
+        }
+
+        let domain_url: Url = "socks5://proxy.example.com:1080".parse().unwrap();
+        match proxy_target_addr(&domain_url).unwrap() {
+            TargetAddr::Domain(host, port, None) => {
+                assert_eq!(host, "proxy.example.com");
+                assert_eq!(port, 1080);
+            }
+            other => panic!("expected TargetAddr::Domain, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_ip_literal_and_resolve_host_port_handle_v4_and_v6_literals() {
+        assert_eq!(
+            parse_ip_literal("127.0.0.1"),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(
+            parse_ip_literal("::1"),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(
+            parse_ip_literal("[::1]"),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(parse_ip_literal("proxy.example.com"), None);
+
+        assert_eq!(
+            resolve_host_port("127.0.0.1", 1080).await.unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1080)
+        );
+        assert_eq!(
+            resolve_host_port("::1", 1080).await.unwrap(),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 1080)
+        );
+        assert_eq!(
+            resolve_host_port("[::1]", 1080).await.unwrap(),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 1080)
         );
     }
 }
